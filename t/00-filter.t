@@ -2127,3 +2127,34 @@ Accept-Encoding: zstd;foo="unterminated
 Content-Encoding: zstd
 --- no_error_log
 [error]
+
+
+=== TEST 85: Content-Encoding is emitted exactly once on the wire
+# nginx >= 1.23 links same-name response headers via ngx_table_elt_t.next
+# and expects every producer to NULL-terminate the chain it starts, as
+# core's own gzip filter and gzip_static do. The stale pointer is not
+# reachable through plain HTTP with current core, and there is no
+# in-harness readback either: add_header ($sent_http_*) evaluates before
+# this module's header filter by deliberate module order (filter/config
+# places ngx_http_headers_filter_module after this module, mirroring
+# core's gzip placement), so headers_out holds no Content-Encoding at
+# evaluation time. This test therefore pins the wire contract only; see
+# the sibling static-module TEST 29, where the content-phase handler
+# runs early enough for the $sent_http_* readback to observe the entry.
+--- config
+    location /filter {
+        zstd on;
+        zstd_types text/plain;
+        proxy_pass http://127.0.0.1:$TEST_NGINX_SERVER_PORT/test;
+    }
+    location /test {
+        root $TEST_NGINX_PERL_PATH/suite/;
+    }
+--- request
+GET /filter
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]

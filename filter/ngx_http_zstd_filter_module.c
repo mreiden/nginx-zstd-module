@@ -451,6 +451,9 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
         }
 
         v->hash = 1;
+#if (nginx_version >= 1023000)
+        v->next = NULL;
+#endif
         ngx_str_set(&v->key, "Vary");
         v->value = zlcf->bypass_vary;
     }
@@ -496,6 +499,9 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
     }
 
     h->hash = 1;
+#if (nginx_version >= 1023000)
+    h->next = NULL;
+#endif
     ngx_str_set(&h->key, "Content-Encoding");
     ngx_str_set(&h->value, "zstd");
     r->headers_out.content_encoding = h;
