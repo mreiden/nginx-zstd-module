@@ -1,0 +1,110 @@
+name: Build & Test
+
+# Third-party actions are pinned to commit SHAs for supply-chain safety.
+# actions/checkout@v5 -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+env:
+  # Resolved at run time by the `resolve` job; nginx.org only keeps the
+  # newest mainline tarball, so a hardcoded version eventually 404s.
+  NGINX_VERSION: ""
+
+on:
+  push:
+    branches: [master, main, hardening]
+  pull_request:
+    branches: [master, main]
+  schedule:
+    # Weekly Monday 05:23 UTC — catches nginx API drift against new
+    # releases even when nothing is pushed.
+    - cron: "23 5 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve nginx version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      nginx_version: ${{ steps.v.outputs.nginx_version }}
+    steps:
+      - name: Resolve latest mainline nginx
+        id: v
+        run: |
+          set -euo pipefail
+          ver=$(curl -fsSL https://nginx.org/en/download.html \
+            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+            | sort -V | tail -1)
+          if [ -z "$ver" ]; then
+            echo "::error::could not resolve mainline nginx version"
+            exit 1
+          fi
+          echo "Resolved nginx mainline: $ver"
+          echo "nginx_version=$ver" >> "$GITHUB_OUTPUT"
+
+  # ── System-first path: link the distro libbrotli via pkg-config ────────
+  build-system:
+    name: Build & smoke (system libbrotli)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: resolve
+    env:
+      NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
+    steps:
+      - name: Checkout module (no submodule — system mode must not need it)
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config wget \
+            libpcre2-dev zlib1g-dev libbrotli-dev brotli python3
+
+      - name: Build against PGP-verified nginx
+        run: |
+          bash tools/ci-build.sh system "$NGINX_VERSION"
+          echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/.build/nginx-$NGINX_VERSION/objs/nginx" >> "$GITHUB_ENV"
+
+      - name: Roundtrip smoke test
+        run: |
+          python3 tools/test_encoding.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18180
+          echo "✓ system-libbrotli roundtrip passed"
+
+  # ── Bundled fallback path: cmake-built submodule at the pinned tag ─────
+  build-bundled:
+    name: Build & smoke (bundled brotli v1.2.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: resolve
+    env:
+      NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
+    steps:
+      - name: Checkout module with submodule
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          submodules: true
+
+      # no libbrotli-dev on purpose — the fallback must build without it
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config wget cmake \
+            libpcre2-dev zlib1g-dev brotli python3
+
+      - name: Build against PGP-verified nginx
+        run: |
+          bash tools/ci-build.sh bundled "$NGINX_VERSION"
+          echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/.build/nginx-$NGINX_VERSION/objs/nginx" >> "$GITHUB_ENV"
+
+      - name: Roundtrip smoke test
+        run: |
+          python3 tools/test_encoding.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18181
+          echo "✓ bundled-brotli roundtrip passed"
