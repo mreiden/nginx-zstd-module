@@ -2,6 +2,7 @@ name: Build & Test
 
 # Third-party actions are pinned to commit SHAs for supply-chain safety.
 # actions/checkout@v5 -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/cache@v4    -> 0057852bfaa89a56745cba8c7296529d2fc39830
 
 env:
   # Resolved at run time by the `resolve` job; nginx.org only keeps the
@@ -64,7 +65,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config wget \
-            libpcre2-dev zlib1g-dev libbrotli-dev brotli python3
+            libpcre2-dev zlib1g-dev libbrotli-dev brotli python3 \
+            libperl-dev cpanminus
 
       - name: Build against PGP-verified nginx
         run: |
@@ -76,6 +78,25 @@ jobs:
           python3 tools/test_encoding.py \
             --nginx-binary "$TEST_NGINX_BINARY" --port 18180
           echo "✓ system-libbrotli roundtrip passed"
+
+      - name: Cache Perl modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/perl5
+          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket
+
+      - name: Install Test::Nginx::Socket
+        run: |
+          cpanm -l ~/perl5 --notest Test::Nginx::Socket
+          echo "PERL5LIB=$HOME/perl5/lib/perl5" >> "$GITHUB_ENV"
+
+      - name: Run regression suite
+        run: |
+          export TEST_NGINX_SERVROOT=/tmp/nginx-servroot-brotli
+          mkdir -p "$TEST_NGINX_SERVROOT"
+          perl t/00-brotli.t 2>&1 | tee t/brotli-tests.log
+          if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "❌ regression suite FAILED"; exit 1; fi
+          echo "✓ regression suite passed"
 
   # ── Bundled fallback path: cmake-built submodule at the pinned tag ─────
   build-bundled:

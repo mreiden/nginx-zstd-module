@@ -41,10 +41,22 @@ against current nginx. Differences from upstream:
   `gzip_static` response. The latch now fires only once the `.br` file is
   confirmed.
 
-Planned next (tracked in issues): request-size caps, bypass predicates,
-`BROTLI_PARAM_SIZE_HINT`, a ported regression-test suite, and RFC 9842
-`dcb` shared-dictionary compression (the bundled/required brotli already
-ships the encoder API for it).
+- **Hardening additions:** `brotli_max_length` (a declared-length gate
+  plus a running input cap in the body filter, so a chunked or
+  misdeclaring upstream cannot feed the encoder unbounded input);
+  `brotli_bypass` / `brotli_bypass_vary` per-request bypass predicates
+  (the operator lever for BREACH-style exposures, with the cache key the
+  bypass decision varies on declared explicitly);
+  `BROTLI_PARAM_SIZE_HINT` set from the declared content length.
+- **Tests:** a Test::Nginx regression suite (`t/`) covering the
+  negotiation matrix, bypass, caps, and the static-module fallback
+  regression, run in CI alongside the roundtrip smoke tool and the fuzz
+  harness.
+
+Planned next: RFC 9842 `dcb` shared-dictionary compression (the
+bundled/required brotli already ships the encoder API for it; the
+negotiation design and SHA-256 plumbing exist in nginx-zstd-module's dcz
+implementation).
 
 
 ## Table of Contents
