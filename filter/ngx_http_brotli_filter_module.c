@@ -14,6 +14,8 @@
 #include <brotli/encode.h>
 #endif
 
+#include "../ngx_http_brotli_common.h"
+
 /* Brotli and GZip modules never stack, i.e. when one of them sets
    "Content-Encoding" the other becomes a pass-through filter. Consequently,
    it is almost legal to reuse this "buffered" bit.
@@ -198,60 +200,12 @@ static ngx_str_t ngx_http_brotli_ratio = ngx_string("brotli_ratio");
 static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt ngx_http_next_body_filter;
 
-static /* const */ char kEncoding[] = "br";
-static const size_t kEncodingLen = 2;
-
-static ngx_int_t check_accept_encoding(ngx_http_request_t* req) {
-  ngx_table_elt_t* accept_encoding_entry;
-  ngx_str_t* accept_encoding;
-  u_char* cursor;
-  u_char* end;
-  u_char before;
-  u_char after;
-
-  accept_encoding_entry = req->headers_in.accept_encoding;
-  if (accept_encoding_entry == NULL) return NGX_DECLINED;
-  accept_encoding = &accept_encoding_entry->value;
-
-  if (accept_encoding->len < kEncodingLen) return NGX_DECLINED;
-
-  cursor = accept_encoding->data;
-  end = cursor + accept_encoding->len;
-  while (1) {
-    u_char digit;
-    /* It would be an idiotic idea to rely on compiler to produce performant
-       binary, that is why we just do -1 at every call site. */
-    cursor = ngx_strcasestrn(cursor, kEncoding, kEncodingLen - 1);
-    if (cursor == NULL) return NGX_DECLINED;
-    before = (cursor == accept_encoding->data) ? ' ' : cursor[-1];
-    cursor += kEncodingLen;
-    after = (cursor >= end) ? ' ' : *cursor;
-    if (before != ',' && before != ' ') continue;
-    if (after != ',' && after != ' ' && after != ';') continue;
-
-    /* Check for ";q=0[.[0[0[0]]]]" */
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != ';') break;
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != 'q') break;
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != '=') break;
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != '0') break;
-    if (*(cursor++) != '.') return NGX_DECLINED; /* ;q=0, */
-    digit = *(cursor++);
-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0., */
-    if (digit > '0') break;
-    digit = *(cursor++);
-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0.0, */
-    if (digit > '0') break;
-    digit = *(cursor++);
-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0.00, */
-    if (digit > '0') break;
-    return NGX_DECLINED; /* ;q=0.000 */
-  }
-  return NGX_OK;
-}
+/* The Accept-Encoding decision lives in ngx_http_brotli_common.h — a
+   length-bounded RFC 9110 walker shared with the static module and
+   continuously fuzzed (see fuzz/). It replaces the substring scan that
+   previously lived here, which missed the "*" wildcard, fabricated br
+   tokens out of quoted parameter values, ignored ";Q=0" refusals, and
+   treated malformed weights as acceptance. */
 
 /* Process headers and decide if request is eligible for brotli compression. */
 static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
@@ -639,11 +593,9 @@ static void ngx_http_brotli_filter_close(ngx_http_brotli_ctx_t* ctx) {
 }
 
 static ngx_int_t ngx_http_brotli_check_request(ngx_http_request_t* req) {
-  if (req != req->main) return NGX_DECLINED;
-  if (check_accept_encoding(req) != NGX_OK) return NGX_DECLINED;
-  req->gzip_tested = 1;
-  req->gzip_ok = 0;
-  return NGX_OK;
+  /* Commits to a br response (the caller sets Content-Encoding right
+     after), so the latching variant is correct here. */
+  return ngx_http_brotli_ok(req);
 }
 
 static ngx_int_t ngx_http_brotli_add_variables(ngx_conf_t* cf) {

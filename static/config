@@ -42,7 +42,9 @@ fi
 ngx_module_type=HTTP
 ngx_module_name=ngx_http_brotli_static_module
 ngx_module_incs=
-ngx_module_deps=
+# Shared Accept-Encoding parser header; a build dependency so edits to it
+# rebuild this module's object.
+ngx_module_deps="$BROTLI_MODULE_SRC_DIR/../ngx_http_brotli_common.h"
 ngx_module_srcs="$BROTLI_MODULE_SRC_DIR/ngx_http_brotli_static_module.c"
 ngx_module_libs=
 ngx_module_order=

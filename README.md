@@ -11,6 +11,41 @@ ngx_brotli is a set of two nginx modules:
 - ngx_brotli filter module - used to compress responses on-the-fly,
 - ngx_brotli static module - used to serve pre-compressed files.
 
+## About this fork
+
+This is a maintained, hardened fork of
+[google/ngx_brotli](https://github.com/google/ngx_brotli), following the
+same approach as
+[nginx-zstd-module](https://github.com/myguard-labs/nginx-zstd-module):
+reproducible builds, a continuously fuzzed request-parsing path, and CI
+against current nginx. Differences from upstream:
+
+- **Build:** system-first brotli detection via `pkg-config libbrotlienc`
+  with the bundled submodule as fallback (restores pre-`63ca02a`
+  packaging behaviour, by Mikel Olasagasti); the bundled submodule is
+  pinned to the released brotli v1.2.0 tag instead of floating; sh-sourced
+  files are pinned to LF so Windows checkouts build under WSL.
+- **Accept-Encoding parsing** is a shared, length-bounded RFC 9110
+  walker (ported from nginx-zstd-module, where it is continuously fuzzed
+  with an independent differential oracle), replacing two hand-maintained
+  copies of a substring scan. Five deliberate behaviour changes, all
+  toward the RFC: the `*` wildcard now matches `br`; a coding name inside
+  a quoted parameter value (e.g. `gzip;x="a, br"`) no longer fabricates a
+  phantom `br` token; `;Q=0` refusals are honored (the weight name is
+  case-insensitive); malformed weights make an element non-matching
+  instead of defaulting to accept; and a later duplicate explicit token
+  wins (`br;q=0, br` now accepts).
+- **`brotli_static` gzip fallback fix:** the old code latched gzip off
+  before knowing whether a `.br` file exists, so a client accepting
+  `br, gzip` with only a `.gz` file on disk got identity instead of the
+  `gzip_static` response. The latch now fires only once the `.br` file is
+  confirmed.
+
+Planned next (tracked in issues): request-size caps, bypass predicates,
+`BROTLI_PARAM_SIZE_HINT`, a ported regression-test suite, and RFC 9842
+`dcb` shared-dictionary compression (the bundled/required brotli already
+ships the encoder API for it).
+
 
 ## Table of Contents
 

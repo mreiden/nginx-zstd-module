@@ -9,6 +9,8 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#include "../ngx_http_brotli_common.h"
+
 /* >> Configuration */
 
 #define NGX_HTTP_BROTLI_STATIC_OFF 0
@@ -78,67 +80,21 @@ ngx_module_t ngx_http_brotli_static_module = {
 
 static const u_char kContentEncoding[] = "Content-Encoding";
 static /* const */ char kEncoding[] = "br";
-static const size_t kEncodingLen = 2;
 static /* const */ u_char kSuffix[] = ".br";
 static const size_t kSuffixLen = 3;
 
-static ngx_int_t check_accept_encoding(ngx_http_request_t* req) {
-  ngx_table_elt_t* accept_encoding_entry;
-  ngx_str_t* accept_encoding;
-  u_char* cursor;
-  u_char* end;
-  u_char before;
-  u_char after;
+/* The Accept-Encoding decision lives in ngx_http_brotli_common.h — a
+   length-bounded RFC 9110 walker shared with the filter module and
+   continuously fuzzed (see fuzz/), replacing the hand-maintained copy
+   of the filter module's substring scan that previously lived here.
 
-  accept_encoding_entry = req->headers_in.accept_encoding;
-  if (accept_encoding_entry == NULL) return NGX_DECLINED;
-  accept_encoding = &accept_encoding_entry->value;
-
-  cursor = accept_encoding->data;
-  end = cursor + accept_encoding->len;
-  while (1) {
-    u_char digit;
-    /* It would be an idiotic idea to rely on compiler to produce performant
-       binary, that is why we just do -1 at every call site. */
-    cursor = ngx_strcasestrn(cursor, kEncoding, kEncodingLen - 1);
-    if (cursor == NULL) return NGX_DECLINED;
-    before = (cursor == accept_encoding->data) ? ' ' : cursor[-1];
-    cursor += kEncodingLen;
-    after = (cursor >= end) ? ' ' : *cursor;
-    if (before != ',' && before != ' ') continue;
-    if (after != ',' && after != ' ' && after != ';') continue;
-
-    /* Check for ";q=0[.[0[0[0]]]]" */
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != ';') break;
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != 'q') break;
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != '=') break;
-    while (*cursor == ' ') cursor++;
-    if (*(cursor++) != '0') break;
-    if (*(cursor++) != '.') return NGX_DECLINED; /* ;q=0, */
-    digit = *(cursor++);
-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0., */
-    if (digit > '0') break;
-    digit = *(cursor++);
-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0.0, */
-    if (digit > '0') break;
-    digit = *(cursor++);
-    if (digit < '0' || digit > '9') return NGX_DECLINED; /* ;q=0.00, */
-    if (digit > '0') break;
-    return NGX_DECLINED; /* ;q=0.000 */
-  }
-  return NGX_OK;
-}
-
-/* Test if this request is allowed to have the brotli response. */
+   Deliberately the SIDE-EFFECT-FREE predicate: the old code latched
+   r->gzip_ok = 0 here, before knowing whether a .br file exists — so a
+   client accepting "br, gzip" with only a .gz file on disk lost the
+   gzip_static fallback and got identity. The latch now fires in
+   handler() only once the .br file is confirmed. */
 static ngx_int_t check_eligility(ngx_http_request_t* req) {
-  if (req != req->main) return NGX_DECLINED;
-  if (check_accept_encoding(req) != NGX_OK) return NGX_DECLINED;
-  req->gzip_tested = 1;
-  req->gzip_ok = 0;
-  return NGX_OK;
+  return ngx_http_brotli_accepts(req);
 }
 
 static ngx_int_t handler(ngx_http_request_t* req) {
@@ -243,6 +199,15 @@ static ngx_int_t handler(ngx_http_request_t* req) {
     return NGX_HTTP_NOT_FOUND;
   }
 #endif
+
+  /* The .br file exists and will be served: NOW suppress a later gzip
+     filter/handler (moved from check_eligility — latching before the
+     file was known to exist killed the gzip_static fallback). ALWAYS
+     mode never consulted Accept-Encoding, so it never latched. */
+  if (cfg->enable == NGX_HTTP_BROTLI_STATIC_ON) {
+    req->gzip_tested = 1;
+    req->gzip_ok = 0;
+  }
 
   /* Prepare request push the body. */
   req->root_tested = !req->error_page;

@@ -72,10 +72,15 @@ fi
 
 ngx_module_srcs="$BROTLI_MODULE_SRC_DIR/ngx_http_brotli_filter_module.c"
 
+# Shared inline header included by both module sources: declare it as a
+# build dependency so incremental builds rebuild the objects when it
+# changes instead of leaving stale .o files behind.
+BROTLI_COMMON_H="$BROTLI_MODULE_SRC_DIR/../ngx_http_brotli_common.h"
+
 if [ "$use_system_brotli" = yes ]; then
     ngx_module_incs="$(pkg-config --cflags-only-I libbrotlienc)"
     ngx_module_libs="$(pkg-config --libs libbrotlienc) -lm"
-    ngx_module_deps=""
+    ngx_module_deps="$BROTLI_COMMON_H"
 else
     BROTLI_OUTPUT_DIRECTORY="$brotli/../out"
     BROTLI_ENC_H="$brotli/include/brotli/encode.h \
@@ -83,7 +88,7 @@ else
                   $brotli/include/brotli/types.h"
 
     ngx_module_incs="$brotli/include"
-    ngx_module_deps="$BROTLI_ENC_H"
+    ngx_module_deps="$BROTLI_ENC_H $BROTLI_COMMON_H"
     ngx_module_libs="-L$BROTLI_OUTPUT_DIRECTORY -lbrotlienc -lbrotlicommon -lm"
 fi
 
