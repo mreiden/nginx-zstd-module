@@ -98,6 +98,20 @@ jobs:
           if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "❌ regression suite FAILED"; exit 1; fi
           echo "✓ regression suite passed"
 
+      - name: Run dcb negotiation suite
+        run: |
+          export TEST_NGINX_SERVROOT=/tmp/nginx-servroot-dcb
+          mkdir -p "$TEST_NGINX_SERVROOT"
+          perl t/01-dcb.t 2>&1 | tee t/dcb-tests.log
+          if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "❌ dcb suite FAILED"; exit 1; fi
+          echo "✓ dcb negotiation suite passed"
+
+      - name: Run dcb wire-format test
+        run: |
+          python3 tools/test_dcb.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18190
+          echo "✓ dcb wire-format test passed"
+
   # ── Bundled fallback path: cmake-built submodule at the pinned tag ─────
   build-bundled:
     name: Build & smoke (bundled brotli v1.2.0)
@@ -129,3 +143,9 @@ jobs:
           python3 tools/test_encoding.py \
             --nginx-binary "$TEST_NGINX_BINARY" --port 18181
           echo "✓ bundled-brotli roundtrip passed"
+
+      - name: dcb wire-format test (bundled brotli)
+        run: |
+          python3 tools/test_dcb.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18191
+          echo "✓ dcb wire-format test passed (bundled)"

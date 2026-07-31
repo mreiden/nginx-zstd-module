@@ -53,10 +53,33 @@ against current nginx. Differences from upstream:
   regression, run in CI alongside the roundtrip smoke tool and the fuzz
   harness.
 
-Planned next: RFC 9842 `dcb` shared-dictionary compression (the
-bundled/required brotli already ships the encoder API for it; the
-negotiation design and SHA-256 plumbing exist in nginx-zstd-module's dcz
-implementation).
+- **RFC 9842 `dcb` shared-dictionary compression** via the repeatable
+  `brotli_dcb_dict_file` directive (`http`/`server`/`location`). Each
+  occurrence loads one dictionary — typically a previous version of the
+  resource — and registers its SHA-256 as the negotiation key. A request
+  whose `Available-Dictionary` matches a loaded dictionary and whose
+  `Accept-Encoding` lists `dcb` explicitly (the `*` wildcard deliberately
+  does not match) gets the response compressed against that dictionary
+  as `Content-Encoding: dcb`: the 36-byte header (`FF 44 43 42` + the
+  dictionary SHA-256) followed by a brotli stream using it as a raw
+  shared dictionary. Chrome 130+ negotiates this automatically for
+  same-origin resources; requests with `Sec-Fetch-Site` other than
+  `same-origin`/`none` fall back to plain `br`, as does every other gate
+  miss. `Vary: Available-Dictionary` is emitted on every variant
+  (including the identity fallback) whenever dictionaries are
+  configured. Advertise the dictionary with one header on the resource
+  itself — `add_header Use-As-Dictionary 'match="/app/main-*.js"';` —
+  and register the previous build's file at deploy time; see
+  [nginx-zstd-module's `zstd_dcz_dict_file` docs](https://github.com/myguard-labs/nginx-zstd-module#zstd_dcz_dict_file)
+  for the full deployment pattern (locale layouts, dedupe, rotation) —
+  the two directives are deliberate twins, and serving both `dcb` and
+  `dcz` from the same locations works (clients pick one). Requires
+  brotli ≥ 1.1 (the shared-dictionary encoder API — the pinned
+  submodule and any current distro libbrotli qualify); building against
+  an older library rejects the directive at config load. Empty,
+  oversized (>10 MB) and duplicate-content dictionaries are config-load
+  errors. Verify end-to-end: strip the first 36 bytes of a response and
+  `brotli -d -D <dict>` — byte-exact against origin.
 
 
 ## Table of Contents

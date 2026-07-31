@@ -14,13 +14,50 @@
 #include <brotli/encode.h>
 #endif
 
+/* RFC 9842 dcb needs the shared-dictionary encoder API, public since
+   brotli 1.1.0. brotli installs no version header, so probe for the
+   header that appeared alongside the API. Without it the module builds
+   fine and the brotli_dcb_dict_file directive is rejected at config
+   load with an actionable error. */
+#if defined(__has_include)
+#if __has_include(<brotli/shared_dictionary.h>)
+#include <brotli/shared_dictionary.h>
+#define NGX_HTTP_BROTLI_HAVE_DCB 1
+#endif
+#endif
+#ifndef NGX_HTTP_BROTLI_HAVE_DCB
+#define NGX_HTTP_BROTLI_HAVE_DCB 0
+#endif
+
 #include "../ngx_http_brotli_common.h"
+#include "../ngx_http_brotli_sha256.h"
+
+#define NGX_HTTP_BROTLI_MAX_DICT_SIZE (10 * 1024 * 1024) /* 10 MB limit */
+
+/* RFC 9842 §2.1 dcb framing: the 4-byte magic 0xFF 0x44 0x43 0x42
+   followed by the 32-byte SHA-256 of the dictionary, prepended to an
+   ordinary brotli stream. Unlike dcz's zstd skippable frame, a plain
+   brotli decoder does NOT skip this header — clients negotiate dcb
+   explicitly and strip it. */
+#define NGX_HTTP_BROTLI_DCB_HEADER_LEN (4 + NGX_HTTP_BROTLI_SHA256_DIGEST_LEN)
 
 /* Brotli and GZip modules never stack, i.e. when one of them sets
    "Content-Encoding" the other becomes a pass-through filter. Consequently,
    it is almost legal to reuse this "buffered" bit.
    IIUC, buffered == some data passed to filter has not been pushed further. */
 #define NGX_HTTP_BROTLI_BUFFERED NGX_HTTP_GZIP_BUFFERED
+
+/* One RFC 9842 dictionary, loaded at config parse. `bytes` is the raw
+   file content in cf->pool (worker-lifetime; old workers keep their
+   forked copy across a reload until they drain), prepared per request
+   as a BROTLI_SHARED_DICTIONARY_RAW dictionary. The SHA-256 is the
+   negotiation key: what a client's Available-Dictionary header carries
+   and what the dcb frame header must embed. */
+typedef struct {
+  ngx_str_t file;  /* resolved path, for logs */
+  ngx_str_t bytes; /* raw dictionary contents */
+  u_char hash[NGX_HTTP_BROTLI_SHA256_DIGEST_LEN];
+} ngx_http_brotli_dcb_dict_t;
 
 /* Module configuration. */
 typedef struct {
@@ -40,6 +77,9 @@ typedef struct {
   ngx_array_t* bypass;
   /* Extra Vary field naming the header a bypass predicate varies on. */
   ngx_str_t bypass_vary;
+
+  /* RFC 9842 dictionaries (ngx_http_brotli_dcb_dict_t). */
+  ngx_array_t* dcb_dicts;
 
   ngx_bufs_t deprecated_unused_bufs;
 
@@ -90,6 +130,14 @@ typedef struct {
   unsigned end_of_input : 1;
   unsigned end_of_block : 1;
 
+  /* the 36-byte dcb frame header has been sent downstream. */
+  unsigned dcb_header_sent : 1;
+
+  /* dictionary negotiated via Available-Dictionary; NULL = plain br.
+     Points into the loc conf's dcb_dicts array (config-pool lifetime,
+     outlives the request). */
+  ngx_http_brotli_dcb_dict_t* dcb_dict;
+
   ngx_http_request_t* request;
 } ngx_http_brotli_ctx_t;
 
@@ -120,6 +168,15 @@ static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf);
 
 static char* ngx_http_brotli_parse_wbits(ngx_conf_t* cf, void* post,
                                          void* data);
+
+static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
+                                           void* conf);
+static ngx_table_elt_t* ngx_http_brotli_find_request_header(
+    ngx_http_request_t* r, const char* name, size_t len);
+static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
+    ngx_http_request_t* r, ngx_http_brotli_conf_t* conf);
+static ngx_int_t ngx_http_brotli_emit_dcb_header(ngx_http_request_t* r,
+                                                 ngx_http_brotli_ctx_t* ctx);
 
 /* Configuration literals. */
 
@@ -187,6 +244,11 @@ static ngx_command_t ngx_http_brotli_filter_commands[] = {
      ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_brotli_conf_t, bypass_vary), NULL},
 
+    {ngx_string("brotli_dcb_dict_file"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
+         NGX_CONF_TAKE1,
+     ngx_http_brotli_dcb_dict_file, NGX_HTTP_LOC_CONF_OFFSET, 0, NULL},
+
     ngx_null_command};
 
 /* Module context hooks. */
@@ -238,6 +300,7 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
   ngx_table_elt_t* h;
   ngx_http_brotli_ctx_t* ctx;
   ngx_http_brotli_conf_t* conf;
+  ngx_http_brotli_dcb_dict_t* dcb;
 
   conf = ngx_http_get_module_loc_conf(r, ngx_http_brotli_filter_module);
 
@@ -319,8 +382,44 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
 
   r->gzip_vary = 1;
 
-  /* Check if client support brotli encoding. */
-  if (ngx_http_brotli_check_request(r) != NGX_OK) {
+  /* With dictionaries configured, WHICH encoding this location serves
+     depends on the request's Available-Dictionary header — the dcb
+     variant, the plain br variant a dictionary-less client receives, and
+     the identity fallback (a client sending "Accept-Encoding: dcb" only,
+     with a hash we do not hold, gets identity NOW but dcb once it
+     acquires a dictionary we do hold). A shared cache must key all of
+     them on that header. This push therefore sits ABOVE the acceptance
+     gate: every earlier return declines for reasons invariant in
+     Available-Dictionary; the paths below are not invariant. (This exact
+     ordering was a review finding on the sibling dcz implementation —
+     nginx-zstd-module PR #92 — baked in here from the start.) */
+  if (conf->dcb_dicts != NULL && conf->dcb_dicts->nelts > 0) {
+    ngx_table_elt_t* v;
+
+    v = ngx_list_push(&r->headers_out.headers);
+    if (v == NULL) {
+      return NGX_ERROR;
+    }
+
+    v->hash = 1;
+#if nginx_version >= 1023000
+    v->next = NULL;
+#endif
+    ngx_str_set(&v->key, "Vary");
+    ngx_str_set(&v->value, "Available-Dictionary");
+  }
+
+  /* RFC 9842 dcb negotiation first: a client that advertises a
+     dictionary we hold and accepts the dcb coding gets dictionary
+     compression; everything else falls through to plain br unchanged. */
+  dcb = ngx_http_brotli_dcb_negotiate(r, conf);
+
+  if (dcb != NULL) {
+    /* Commitment to encode is made below; latch gzip off exactly as
+       ngx_http_brotli_check_request() would. */
+    r->gzip_tested = 1;
+    r->gzip_ok = 0;
+  } else if (ngx_http_brotli_check_request(r) != NGX_OK) {
     return ngx_http_next_header_filter(r);
   }
 
@@ -331,6 +430,7 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
   }
   ctx->request = r;
   ctx->content_length = r->headers_out.content_length_n;
+  ctx->dcb_dict = dcb;
   ngx_http_set_ctx(r, ctx, ngx_http_brotli_filter_module);
 
   /* Prepare response headers, so that following filters in the chain will
@@ -345,7 +445,11 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
   h->next = NULL;
 #endif
   ngx_str_set(&h->key, "Content-Encoding");
-  ngx_str_set(&h->value, "br");
+  if (dcb != NULL) {
+    ngx_str_set(&h->value, "dcb");
+  } else {
+    ngx_str_set(&h->value, "br");
+  }
   r->headers_out.content_encoding = h;
 
   r->main_filter_need_in_memory = 1;
@@ -387,6 +491,17 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
   if (ngx_http_brotli_filter_ensure_stream_initialized(r, ctx) != NGX_OK) {
     ngx_http_brotli_filter_close(ctx);
     return NGX_ERROR;
+  }
+
+  /* dcb responses start with the fixed 36-byte frame header (RFC 9842
+     §2.1), pushed downstream before any compressed output. NGX_AGAIN
+     from the next filter just means the bytes are buffered there —
+     the header still counts as sent. */
+  if (ctx->dcb_dict != NULL && !ctx->dcb_header_sent) {
+    if (ngx_http_brotli_emit_dcb_header(r, ctx) == NGX_ERROR) {
+      ngx_http_brotli_filter_close(ctx);
+      return NGX_ERROR;
+    }
   }
 
   /* If more input is provided - append it to our input chain. */
@@ -643,6 +758,39 @@ static ngx_int_t ngx_http_brotli_filter_ensure_stream_initialized(
     }
   }
 
+#if NGX_HTTP_BROTLI_HAVE_DCB
+  /* Attach the negotiated RFC 9842 dictionary as raw shared-dictionary
+     content. Prepared per request at the location's quality — the
+     deliberate MVP trade against caching a prepared dictionary per
+     (dictionary, quality) pair; preparation costs roughly a compression
+     pass over the dictionary (~ms/MB), and the allocation goes through
+     the request-pool hooks so it is reclaimed with the request. Unlike
+     zstd's window-bounded prefix, a brotli shared dictionary stays fully
+     referenceable regardless of lg_win, so no window math is needed. */
+  if (ctx->dcb_dict != NULL) {
+    BrotliEncoderPreparedDictionary* prepared;
+
+    prepared = BrotliEncoderPrepareDictionary(
+        BROTLI_SHARED_DICTIONARY_RAW, ctx->dcb_dict->bytes.len,
+        ctx->dcb_dict->bytes.data, (int)conf->quality,
+        ngx_http_brotli_filter_alloc, ngx_http_brotli_filter_free, r->pool);
+    if (prepared == NULL) {
+      ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                    "BrotliEncoderPrepareDictionary(\"%V\", %uz bytes) failed",
+                    &ctx->dcb_dict->file, ctx->dcb_dict->bytes.len);
+      return NGX_ERROR;
+    }
+
+    ok = BrotliEncoderAttachPreparedDictionary(ctx->encoder, prepared);
+    if (!ok) {
+      ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                    "BrotliEncoderAttachPreparedDictionary(\"%V\") failed",
+                    &ctx->dcb_dict->file);
+      return NGX_ERROR;
+    }
+  }
+#endif
+
   ctx->out_buf = ngx_calloc_buf(r->pool);
   if (ctx->out_buf == NULL) {
     return NGX_ERROR;
@@ -707,6 +855,172 @@ static ngx_int_t ngx_http_brotli_check_request(ngx_http_request_t* req) {
   /* Commits to a br response (the caller sets Content-Encoding right
      after), so the latching variant is correct here. */
   return ngx_http_brotli_ok(req);
+}
+
+/* Case-insensitive lookup of a request header nginx keeps no dedicated
+   headers_in slot for (Available-Dictionary, Sec-Fetch-Site). Plain list
+   walk — both appear at most once and only on dictionary-aware
+   requests. */
+static ngx_table_elt_t* ngx_http_brotli_find_request_header(
+    ngx_http_request_t* r, const char* name, size_t len) {
+  ngx_uint_t i;
+  ngx_list_part_t* part;
+  ngx_table_elt_t* h;
+
+  part = &r->headers_in.headers.part;
+  h = part->elts;
+
+  for (i = 0; /* void */; i++) {
+    if (i >= part->nelts) {
+      if (part->next == NULL) {
+        break;
+      }
+      part = part->next;
+      h = part->elts;
+      i = 0;
+    }
+
+    if (h[i].key.len == len &&
+        ngx_strncasecmp(h[i].key.data, (u_char*)name, len) == 0) {
+      return &h[i];
+    }
+  }
+
+  return NULL;
+}
+
+/* RFC 9842 dcb negotiation. Returns the configured dictionary this
+   response must be compressed against, or NULL for the plain br path.
+   Every requirement is a hard gate — on any miss the response falls back
+   to ordinary negotiation, never to a broken dcb:
+
+     - the location has brotli_dcb_dict_file dictionaries;
+     - the request carries Available-Dictionary, an RFC 8941 byte
+       sequence (":base64:") decoding to exactly 32 bytes, matching one
+       of ours;
+     - Accept-Encoding lists dcb explicitly with q>0 ("*" deliberately
+       does NOT match: only a client that actually holds the dictionary
+       can decode dcb);
+     - Sec-Fetch-Site, when present, is "same-origin" or "none" (§8.3:
+       dictionaries are same-origin-partitioned secrets). Browsers
+       always send it; absence means a non-browser client, where the
+       cross-origin read model does not apply.
+
+   Dictionary-ID is intentionally not parsed: the hash alone is a
+   complete, collision-free key. */
+static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
+    ngx_http_request_t* r, ngx_http_brotli_conf_t* conf) {
+  u_char buf[48];
+  ngx_str_t b64;
+  ngx_str_t decoded;
+  ngx_uint_t i;
+  ngx_table_elt_t* h;
+  ngx_table_elt_t* ae;
+  ngx_http_brotli_dcb_dict_t* dicts;
+
+  if (conf->dcb_dicts == NULL || conf->dcb_dicts->nelts == 0) {
+    return NULL;
+  }
+
+  if (r != r->main) {
+    return NULL;
+  }
+
+  ae = r->headers_in.accept_encoding;
+  if (ae == NULL) {
+    return NULL;
+  }
+
+  h = ngx_http_brotli_find_request_header(
+      r, "available-dictionary", sizeof("available-dictionary") - 1);
+  if (h == NULL) {
+    return NULL;
+  }
+
+  /* RFC 8941 byte sequence: colon-delimited standard base64. 32 bytes
+     encode to 44 characters with padding (43 without); anything longer
+     cannot be a SHA-256 and is rejected before decoding. */
+  if (h->value.len < 2 || h->value.data[0] != ':' ||
+      h->value.data[h->value.len - 1] != ':' || h->value.len - 2 > 44) {
+    return NULL;
+  }
+
+  b64.data = h->value.data + 1;
+  b64.len = h->value.len - 2;
+
+  decoded.data = buf;
+
+  if (ngx_decode_base64(&decoded, &b64) != NGX_OK ||
+      decoded.len != NGX_HTTP_BROTLI_SHA256_DIGEST_LEN) {
+    return NULL;
+  }
+
+  h = ngx_http_brotli_find_request_header(r, "sec-fetch-site",
+                                          sizeof("sec-fetch-site") - 1);
+  if (h != NULL &&
+      !(h->value.len == sizeof("same-origin") - 1 &&
+        ngx_strncasecmp(h->value.data, (u_char*)"same-origin",
+                        sizeof("same-origin") - 1) == 0) &&
+      !(h->value.len == sizeof("none") - 1 &&
+        ngx_strncasecmp(h->value.data, (u_char*)"none",
+                        sizeof("none") - 1) == 0)) {
+    return NULL;
+  }
+
+  if (ngx_http_brotli_coding_weight(&ae->value, "dcb", sizeof("dcb") - 1,
+                                    0) <= 0) {
+    return NULL;
+  }
+
+  dicts = conf->dcb_dicts->elts;
+
+  for (i = 0; i < conf->dcb_dicts->nelts; i++) {
+    if (ngx_memcmp(dicts[i].hash, decoded.data,
+                   NGX_HTTP_BROTLI_SHA256_DIGEST_LEN) == 0) {
+      ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                     "brotli dcb: dictionary \"%V\" negotiated",
+                     &dicts[i].file);
+      return &dicts[i];
+    }
+  }
+
+  return NULL;
+}
+
+/* Push the 36-byte dcb frame header (RFC 9842 §2.1) downstream: the
+   magic 0xFF 0x44 0x43 0x42 then the dictionary's SHA-256. Sent as its
+   own chain link straight to the next filter, ahead of any encoder
+   output. */
+static ngx_int_t ngx_http_brotli_emit_dcb_header(ngx_http_request_t* r,
+                                                 ngx_http_brotli_ctx_t* ctx) {
+  static const u_char magic[4] = {0xff, 0x44, 0x43, 0x42};
+
+  ngx_int_t rc;
+  ngx_buf_t* b;
+  ngx_chain_t out;
+
+  b = ngx_create_temp_buf(r->pool, NGX_HTTP_BROTLI_DCB_HEADER_LEN);
+  if (b == NULL) {
+    return NGX_ERROR;
+  }
+
+  b->last = ngx_cpymem(b->last, magic, sizeof(magic));
+  b->last = ngx_cpymem(b->last, ctx->dcb_dict->hash,
+                       NGX_HTTP_BROTLI_SHA256_DIGEST_LEN);
+
+  out.buf = b;
+  out.next = NULL;
+
+  rc = ngx_http_next_body_filter(r, &out);
+  if (rc == NGX_ERROR) {
+    return NGX_ERROR;
+  }
+
+  /* NGX_OK or NGX_AGAIN: the header is in flight either way. */
+  ctx->bytes_out += NGX_HTTP_BROTLI_DCB_HEADER_LEN;
+  ctx->dcb_header_sent = 1;
+
+  return NGX_OK;
 }
 
 static ngx_int_t ngx_http_brotli_add_variables(ngx_conf_t* cf) {
@@ -783,6 +1097,7 @@ static void* ngx_http_brotli_create_conf(ngx_conf_t* cf) {
   conf->min_length = NGX_CONF_UNSET;
   conf->max_length = NGX_CONF_UNSET;
   conf->bypass = NGX_CONF_UNSET_PTR;
+  conf->dcb_dicts = NGX_CONF_UNSET_PTR;
 
   return conf;
 }
@@ -801,6 +1116,10 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
   ngx_conf_merge_value(conf->max_length, prev->max_length, NGX_CONF_UNSET);
   ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
   ngx_conf_merge_str_value(conf->bypass_vary, prev->bypass_vary, "");
+
+  /* a location declaring its own brotli_dcb_dict_file list replaces the
+     inherited one wholesale (standard nginx array-directive semantics) */
+  ngx_conf_merge_ptr_value(conf->dcb_dicts, prev->dcb_dicts, NULL);
 
   /* brotli_bypass_vary names the header a brotli_bypass decision varies
      on; set alone it emits a Vary field no response varies on (silent
@@ -832,6 +1151,139 @@ static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf) {
   ngx_http_top_body_filter = ngx_http_brotli_body_filter;
 
   return NGX_OK;
+}
+
+/* brotli_dcb_dict_file <path> — load one RFC 9842 dictionary. The file
+   is read and hashed here at config parse (nginx -t validates it), into
+   cf->pool so the raw bytes live exactly as long as the configuration
+   that references them. Preparation for the encoder happens per request
+   (see ensure_stream_initialized) because it bakes in the location's
+   quality. */
+static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
+                                           void* conf) {
+#if !(NGX_HTTP_BROTLI_HAVE_DCB)
+  (void)cf;
+  (void)cmd;
+  (void)conf;
+  return "requires brotli >= 1.1.0 (the shared-dictionary encoder API); "
+         "rebuild against a newer libbrotli";
+#else
+  ngx_http_brotli_conf_t* blcf = conf;
+
+  size_t size;
+  ssize_t n;
+  ngx_fd_t fd;
+  ngx_str_t* value;
+  ngx_str_t path;
+  ngx_uint_t i;
+  ngx_file_info_t info;
+  ngx_http_brotli_dcb_dict_t* dict;
+  ngx_http_brotli_dcb_dict_t* dicts;
+
+  (void)cmd;
+
+  value = cf->args->elts;
+  path = value[1];
+
+  if (ngx_conf_full_name(cf->cycle, &path, 1) != NGX_OK) {
+    return NGX_CONF_ERROR;
+  }
+
+  if (blcf->dcb_dicts == NGX_CONF_UNSET_PTR) {
+    blcf->dcb_dicts =
+        ngx_array_create(cf->pool, 2, sizeof(ngx_http_brotli_dcb_dict_t));
+    if (blcf->dcb_dicts == NULL) {
+      return NGX_CONF_ERROR;
+    }
+  }
+
+  fd = ngx_open_file(path.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+  if (fd == NGX_INVALID_FILE) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                       ngx_open_file_n " \"%V\" failed", &path);
+    return NGX_CONF_ERROR;
+  }
+
+  if (ngx_fd_info(fd, &info) == NGX_FILE_ERROR) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                       ngx_fd_info_n " \"%V\" failed", &path);
+    goto failed;
+  }
+
+  size = ngx_file_size(&info);
+
+  if (size == 0) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "dcb dictionary \"%V\" is empty",
+                       &path);
+    goto failed;
+  }
+
+  if (size > NGX_HTTP_BROTLI_MAX_DICT_SIZE) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "dcb dictionary \"%V\" too large: %uz bytes "
+                       "(limit: %d bytes)",
+                       &path, size, NGX_HTTP_BROTLI_MAX_DICT_SIZE);
+    goto failed;
+  }
+
+  dict = ngx_array_push(blcf->dcb_dicts);
+  if (dict == NULL) {
+    goto failed;
+  }
+
+  dict->file = path;
+  dict->bytes.len = size;
+  dict->bytes.data = ngx_palloc(cf->pool, size);
+  if (dict->bytes.data == NULL) {
+    goto failed;
+  }
+
+  n = ngx_read_fd(fd, (void*)dict->bytes.data, size);
+  if (n < 0) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                       ngx_read_fd_n " \"%V\" failed", &path);
+    goto failed;
+  } else if ((size_t)n != size) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       ngx_read_fd_n " \"%V\" incomplete read", &path);
+    goto failed;
+  }
+
+  if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                       ngx_close_file_n " \"%V\" failed", &path);
+    return NGX_CONF_ERROR;
+  }
+
+  ngx_http_brotli_sha256(dict->bytes.data, size, dict->hash);
+
+  /* Two entries with identical content make the negotiation lookup
+     ambiguous — almost certainly a copy meant to be a new version. Fail
+     loudly at load rather than silently matching the first. */
+  dicts = blcf->dcb_dicts->elts;
+
+  for (i = 0; i + 1 < blcf->dcb_dicts->nelts; i++) {
+    if (ngx_memcmp(dicts[i].hash, dict->hash,
+                   NGX_HTTP_BROTLI_SHA256_DIGEST_LEN) == 0) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                         "dcb dictionary \"%V\" has the same content as "
+                         "\"%V\"",
+                         &path, &dicts[i].file);
+      return NGX_CONF_ERROR;
+    }
+  }
+
+  return NGX_CONF_OK;
+
+failed:
+
+  if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                       ngx_close_file_n " \"%V\" failed", &path);
+  }
+
+  return NGX_CONF_ERROR;
+#endif
 }
 
 /* Translate "window size" to window bits (log2), and check bounds. */
