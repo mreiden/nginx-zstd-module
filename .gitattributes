@@ -1,0 +1,9 @@
+# Files that are executed or sourced by POSIX sh on Linux (including WSL
+# builds from a Windows checkout) must stay LF: nginx's ./configure
+# sources `config`/`filter/config`/`static/config` with sh, which treats
+# a CR as part of the line and fails with "$'\r': command not found"
+# when core.autocrlf=true has smudged the checkout to CRLF.
+config text eol=lf
+*/config text eol=lf
+*.sh text eol=lf
+script/* text eol=lf
