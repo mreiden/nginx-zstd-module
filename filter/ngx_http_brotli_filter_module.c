@@ -33,6 +33,14 @@ typedef struct {
   /* Minimal required length for compression (if known). */
   ssize_t min_length;
 
+  /* Maximal input length (declared AND running; see body filter). */
+  ssize_t max_length;
+
+  /* Per-request bypass predicates (ngx_http_complex_value_t). */
+  ngx_array_t* bypass;
+  /* Extra Vary field naming the header a bypass predicate varies on. */
+  ngx_str_t bypass_vary;
+
   ngx_bufs_t deprecated_unused_bufs;
 
   /* Brotli encoder parameter: quality */
@@ -161,6 +169,24 @@ static ngx_command_t ngx_http_brotli_filter_commands[] = {
      ngx_conf_set_size_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_brotli_conf_t, min_length), NULL},
 
+    {ngx_string("brotli_max_length"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
+         NGX_CONF_TAKE1,
+     ngx_conf_set_size_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_brotli_conf_t, max_length), NULL},
+
+    {ngx_string("brotli_bypass"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
+         NGX_CONF_1MORE,
+     ngx_http_set_predicate_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_brotli_conf_t, bypass), NULL},
+
+    {ngx_string("brotli_bypass_vary"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
+         NGX_CONF_TAKE1,
+     ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_brotli_conf_t, bypass_vary), NULL},
+
     ngx_null_command};
 
 /* Module context hooks. */
@@ -244,8 +270,50 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
     return ngx_http_next_header_filter(r);
   }
 
+  /* If response size is known and exceeds brotli_max_length, do not
+     compress. Responses with no declared length are gated by the running
+     input cap in the body filter instead. */
+  if (conf->max_length != NGX_CONF_UNSET &&
+      r->headers_out.content_length_n != -1 &&
+      r->headers_out.content_length_n > conf->max_length) {
+    return ngx_http_next_header_filter(r);
+  }
+
   /* Compress only certain MIME-typed responses. */
   if (ngx_http_test_content_type(r, &conf->types) == NULL) {
+    return ngx_http_next_header_filter(r);
+  }
+
+  /* Cache-correctness for request-header/cookie-driven bypass: when the
+     decision to compress varies on a request header, a shared cache must
+     key on it or it serves the wrong variant. The module cannot infer
+     which header drove the predicate, so the operator names it via
+     brotli_bypass_vary; emitted on BOTH the bypassed identity response
+     and the compressed one (this runs before the bypass return below).
+     Caches union all Vary lines. */
+  if (conf->bypass_vary.len) {
+    ngx_table_elt_t* v;
+
+    v = ngx_list_push(&r->headers_out.headers);
+    if (v == NULL) {
+      return NGX_ERROR;
+    }
+
+    v->hash = 1;
+#if nginx_version >= 1023000
+    v->next = NULL;
+#endif
+    ngx_str_set(&v->key, "Vary");
+    v->value = conf->bypass_vary;
+  }
+
+  /* Per-request bypass: if any brotli_bypass predicate variable resolves
+     to a non-empty value other than "0", serve identity. The operator
+     lever for endpoints that must not be compressed — e.g. responses
+     mixing a secret with attacker-influenced reflected input (a
+     BREACH-style exposure) — without splitting the location. */
+  if (conf->bypass != NULL &&
+      ngx_http_test_predicates(r, conf->bypass) != NGX_OK) {
     return ngx_http_next_header_filter(r);
   }
 
@@ -294,6 +362,7 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
                                              ngx_chain_t* in) {
   int rc;
   ngx_http_brotli_ctx_t* ctx;
+  ngx_http_brotli_conf_t* conf;
   size_t available_output;
   ptrdiff_t available_busy_output;
   size_t input_size;
@@ -312,6 +381,8 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
   if (ctx == NULL || ctx->closed || r->header_only) {
     return ngx_http_next_body_filter(r, in);
   }
+
+  conf = ngx_http_get_module_loc_conf(r, ngx_http_brotli_filter_module);
 
   if (ngx_http_brotli_filter_ensure_stream_initialized(r, ctx) != NGX_OK) {
     ngx_http_brotli_filter_close(ctx);
@@ -459,6 +530,26 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
     ctx->bytes_in += consumed_input;
     ctx->in->buf->pos += consumed_input;
 
+    /* Length-independent input cap. The header filter rejects responses
+       whose DECLARED length exceeds brotli_max_length, but that gate only
+       sees the declaration: a chunked/streaming response carries none,
+       and a misbehaving upstream can stream more than it declared. Either
+       way a runaway upstream could feed the encoder unbounded input
+       (worker CPU/memory). Compression has already started and the
+       client is receiving a br stream, so the only safe action is to
+       fail the request — protecting the worker beats completing one
+       runaway response. */
+    if (conf->max_length != NGX_CONF_UNSET &&
+        (off_t)ctx->bytes_in > (off_t)conf->max_length) {
+      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                    "brotli: input exceeded brotli_max_length (%z) on a "
+                    "response with no (honest) Content-Length; aborting to "
+                    "protect the worker",
+                    conf->max_length);
+      ngx_http_brotli_filter_close(ctx);
+      return NGX_ERROR;
+    }
+
     if (consumed_input == input_size) {
       if (ctx->in->buf->last_buf) {
         ctx->end_of_input = 1;
@@ -530,6 +621,26 @@ static ngx_int_t ngx_http_brotli_filter_ensure_stream_initialized(
                   "BrotliEncoderSetParameter(LGWIN, %uD) failed",
                   (uint32_t)wbits);
     return NGX_ERROR;
+  }
+
+  /* When the response length is known (declared Content-Length — the
+     common proxied/static case), tell the encoder up front: with a size
+     hint it sizes internal structures to the input instead of the worst
+     case, a small free speed/ratio win. Purely a hint, so a failure to
+     set it is not worth failing the request over — but the API only
+     rejects out-of-contract calls, so log loudly rather than silently. */
+  if (ctx->content_length > 0) {
+    uint32_t hint = (ctx->content_length > (off_t)0xffffffffu)
+                        ? 0xffffffffu
+                        : (uint32_t)ctx->content_length;
+    ok = BrotliEncoderSetParameter(ctx->encoder, BROTLI_PARAM_SIZE_HINT,
+                                   hint);
+    if (!ok) {
+      ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                    "BrotliEncoderSetParameter(SIZE_HINT, %uD) failed",
+                    hint);
+      return NGX_ERROR;
+    }
   }
 
   ctx->out_buf = ngx_calloc_buf(r->pool);
@@ -670,6 +781,8 @@ static void* ngx_http_brotli_create_conf(ngx_conf_t* cf) {
   conf->quality = NGX_CONF_UNSET;
   conf->lg_win = NGX_CONF_UNSET_SIZE;
   conf->min_length = NGX_CONF_UNSET;
+  conf->max_length = NGX_CONF_UNSET;
+  conf->bypass = NGX_CONF_UNSET_PTR;
 
   return conf;
 }
@@ -685,6 +798,20 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
   ngx_conf_merge_value(conf->quality, prev->quality, 6);
   ngx_conf_merge_size_value(conf->lg_win, prev->lg_win, 19);
   ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
+  ngx_conf_merge_value(conf->max_length, prev->max_length, NGX_CONF_UNSET);
+  ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
+  ngx_conf_merge_str_value(conf->bypass_vary, prev->bypass_vary, "");
+
+  /* brotli_bypass_vary names the header a brotli_bypass decision varies
+     on; set alone it emits a Vary field no response varies on (silent
+     cache hit-rate degradation). Warn so the misconfig stays visible. */
+  if (conf->bypass_vary.len && conf->bypass == NULL) {
+    ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                       "\"brotli_bypass_vary\" is set without a "
+                       "\"brotli_bypass\" predicate; it adds a \"Vary: %V\" "
+                       "field no response varies on",
+                       &conf->bypass_vary);
+  }
 
   rc = ngx_http_merge_types(cf, &conf->types_keys, &conf->types,
                             &prev->types_keys, &prev->types,
