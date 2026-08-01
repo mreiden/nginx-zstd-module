@@ -47,7 +47,12 @@ against current nginx. Differences from upstream:
   `brotli_bypass` / `brotli_bypass_vary` per-request bypass predicates
   (the operator lever for BREACH-style exposures, with the cache key the
   bypass decision varies on declared explicitly);
-  `BROTLI_PARAM_SIZE_HINT` set from the declared content length.
+  `BROTLI_PARAM_SIZE_HINT` set from the declared content length; a
+  config-load warning when `brotli`/`brotli_static` is enabled in a
+  location whose effective `gzip_vary` is off (matching the zstd
+  siblings — without `Vary: Accept-Encoding` a shared cache can serve
+  the compressed variant to a client that cannot decode it;
+  `brotli_static always` is exempt since it does not vary).
 - **Tests:** a Test::Nginx regression suite (`t/`) covering the
   negotiation matrix, bypass, caps, and the static-module fallback
   regression, run in CI alongside the roundtrip smoke tool and the fuzz

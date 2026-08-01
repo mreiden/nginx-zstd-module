@@ -296,6 +296,66 @@ Content-Encoding: br
 
 
 
+=== TEST 12a: enabled without gzip_vary warns at config load
+# Whether the response is br or identity depends on Accept-Encoding;
+# without Vary a shared cache can serve the compressed variant to a
+# client that cannot decode it. Same check as the zstd siblings — it
+# catches stale "gzip_vary off" workarounds in old configs.
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        default_type text/html;
+        return 200 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- error_log
+"gzip_vary" is off
+--- no_error_log
+[error]
+
+
+
+=== TEST 12b: enabled WITH gzip_vary does not warn
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        gzip_vary on;
+        default_type text/html;
+        return 200 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- no_error_log eval
+[qr/"gzip_vary" is off/, qr/\[error\]/]
+
+
+
+=== TEST 12c: brotli_static always does not warn without gzip_vary
+# "always" serves .br regardless of Accept-Encoding — the response
+# genuinely does not vary, so the warning must stay quiet. The filter
+# is off here so only the static module's check is in play.
+--- config
+    location /st/ {
+        brotli_static always;
+    }
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- request
+GET /st/hello.js
+--- response_headers
+Content-Encoding: br
+--- no_error_log eval
+[qr/brotli_static is enabled but/, qr/\[error\]/]
+
+
+
 === TEST 13: brotli_static serves the .br sibling
 --- config
     location /st/ {

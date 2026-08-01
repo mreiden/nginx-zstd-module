@@ -273,6 +273,26 @@ static char* merge_conf(ngx_conf_t* root_cfg, void* parent, void* child) {
   configuration_t* cfg = child;
   ngx_conf_merge_uint_value(cfg->enable, prev->enable,
                             NGX_HTTP_BROTLI_STATIC_OFF);
+
+  /* "on" mode picks .br vs the plain file by Accept-Encoding, so the
+     response varies on it and a shared cache must key on it — nginx only
+     emits Vary: Accept-Encoding when the core gzip_vary is on. "always"
+     is deliberately exempt: it serves .br regardless of Accept-Encoding,
+     so the response genuinely does not vary. Same check as the zstd
+     sibling modules. */
+  if (cfg->enable == NGX_HTTP_BROTLI_STATIC_ON) {
+    ngx_http_core_loc_conf_t* clcf =
+        ngx_http_conf_get_module_loc_conf(root_cfg, ngx_http_core_module);
+    if (clcf != NULL && !clcf->gzip_vary) {
+      ngx_conf_log_error(NGX_LOG_WARN, root_cfg, 0,
+                         "brotli_static is enabled but \"gzip_vary\" is off; "
+                         "add \"gzip_vary on\" to emit "
+                         "\"Vary: Accept-Encoding\" so proxies and CDNs "
+                         "cache compressed and uncompressed responses "
+                         "separately");
+    }
+  }
+
   return NGX_CONF_OK;
 }
 

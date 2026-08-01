@@ -1139,6 +1139,25 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
     return NGX_CONF_ERROR;
   }
 
+  /* Whether a response here is br or identity depends on the request's
+     Accept-Encoding; without Vary: Accept-Encoding a shared cache can
+     hand the compressed variant to a client that cannot decode it.
+     nginx only emits that header when the core gzip_vary is on, so warn
+     per merged location — the same check the zstd sibling modules ship,
+     which has caught real stale "gzip_vary off" workarounds in configs
+     predating correct Vary handling in caches. */
+  if (conf->enable) {
+    ngx_http_core_loc_conf_t* clcf =
+        ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    if (clcf != NULL && !clcf->gzip_vary) {
+      ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                         "brotli is enabled but \"gzip_vary\" is off; add "
+                         "\"gzip_vary on\" to emit \"Vary: Accept-Encoding\" "
+                         "so proxies and CDNs cache compressed and "
+                         "uncompressed responses separately");
+    }
+  }
+
   return NGX_CONF_OK;
 }
 
