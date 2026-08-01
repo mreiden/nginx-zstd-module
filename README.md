@@ -85,6 +85,13 @@ against current nginx. Differences from upstream:
   oversized (>10 MB) and duplicate-content dictionaries are config-load
   errors. Verify end-to-end: strip the first 36 bytes of a response and
   `brotli -d -D <dict>` — byte-exact against origin.
+  **Troubleshooting:** if `Vary: Available-Dictionary` appears but dcb
+  never negotiates for hashes you know are right, run
+  `nginx -T | grep dcb_dict_file` and check the loaded entries are your
+  dictionary *files* — a deploy-generated list of directives must be
+  pulled in with `include`, not passed to `brotli_dcb_dict_file` itself
+  (which would loyally load the list file as a one-entry dictionary
+  that matches nothing).
 
 
 ## Table of Contents

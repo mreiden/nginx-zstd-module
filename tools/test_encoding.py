@@ -11,6 +11,7 @@ identity.
 """
 
 import argparse
+import os
 import pathlib
 import shutil
 import socket
@@ -135,6 +136,9 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="ngx-brotli-") as tmp:
         root = pathlib.Path(tmp)
+        # mkdtemp gives 0700: run as root, workers drop to the
+        # compiled-in nginx user and cannot enter it -> 403s
+        os.chmod(root, 0o755)
         (root / "conf").mkdir()
         (root / "logs").mkdir()
         (root / "html").mkdir()
