@@ -83,7 +83,12 @@ against current nginx. Differences from upstream:
   `dcz` from the same locations works (clients pick one). Requires
   brotli ≥ 1.1 (the shared-dictionary encoder API — the pinned
   submodule and any current distro libbrotli qualify); building against
-  an older library rejects the directive at config load. Empty,
+  an older library rejects the directive at config load. Dictionary
+  hashing uses libcrypto's EVP SHA-256 when detected at build time —
+  roughly an order of magnitude faster, which at hundreds of registered
+  dictionaries turns seconds of `nginx -t`/reload time into a blip
+  (`NGX_BROTLI_NO_LIBCRYPTO=1` in the configure environment opts out) —
+  with a portable implementation built in as the fallback. Empty,
   oversized (>10 MB) and duplicate-content dictionaries are config-load
   errors. Verify end-to-end: strip the first 36 bytes of a response and
   `brotli -d -D <dict>` — byte-exact against origin.

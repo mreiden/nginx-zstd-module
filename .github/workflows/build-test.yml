@@ -72,6 +72,12 @@ jobs:
         run: |
           bash tools/ci-build.sh system "$NGINX_VERSION"
           echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/.build/nginx-$NGINX_VERSION/objs/nginx" >> "$GITHUB_ENV"
+          # This job is the accelerated-hash path: libcrypto must have
+          # been detected, or dictionary hashing silently regressed to
+          # the portable fallback (the bundled job covers that one).
+          grep -q 'NGX_HTTP_BROTLI_HAVE_LIBCRYPTO' \
+            ".build/nginx-$NGINX_VERSION/objs/ngx_auto_config.h"
+          echo "✓ libcrypto EVP SHA-256 detected"
 
       - name: Roundtrip smoke test
         run: |
@@ -134,9 +140,19 @@ jobs:
             libpcre2-dev zlib1g-dev brotli python3
 
       - name: Build against PGP-verified nginx
+        env:
+          # Keep the portable SHA-256 fallback covered: this job builds
+          # with libcrypto detection disabled, so its dcb wire-format
+          # test exercises the local implementation end-to-end.
+          NGX_BROTLI_NO_LIBCRYPTO: 1
         run: |
           bash tools/ci-build.sh bundled "$NGINX_VERSION"
           echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/.build/nginx-$NGINX_VERSION/objs/nginx" >> "$GITHUB_ENV"
+          if grep -q 'NGX_HTTP_BROTLI_HAVE_LIBCRYPTO' \
+            ".build/nginx-$NGINX_VERSION/objs/ngx_auto_config.h"; then
+            echo "libcrypto leaked into the portable-fallback job"; exit 1
+          fi
+          echo "✓ portable SHA-256 fallback in use"
 
       - name: Roundtrip smoke test
         run: |
