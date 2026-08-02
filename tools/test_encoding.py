@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import concurrent.futures
+import os
 import pathlib
 import re
 import shutil
@@ -316,7 +317,16 @@ def main() -> int:
         if not module.exists():
             raise FileNotFoundError(f"zstd module not found: {module}")
 
+    # Everything below must stay readable by the workers when run as
+    # root (they drop to the compiled-in nginx user): a restrictive
+    # inherited umask (e.g. 077) would strip group/other bits from
+    # every fixture and subdir created here, 403ing the workers even
+    # with the scratch root itself opened up.
+    os.umask(0o022)
     with tempfile.TemporaryDirectory(prefix="zstd-ci-smoke-") as temp_dir_str:
+        # mkdtemp gives 0700: run as root, workers drop to the
+        # compiled-in nginx user and cannot enter it -> 403s
+        os.chmod(temp_dir_str, 0o755)
         temp_dir = pathlib.Path(temp_dir_str)
         html_dir = temp_dir / "html"
         conf_dir = temp_dir / "conf"

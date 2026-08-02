@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import http.server
+import os
 import pathlib
 import socket
 import socketserver
@@ -196,7 +197,16 @@ def main() -> int:
         if not m.exists():
             raise FileNotFoundError(f"module not found: {m}")
 
+    # Everything below must stay readable by the workers when run as
+    # root (they drop to the compiled-in nginx user): a restrictive
+    # inherited umask (e.g. 077) would strip group/other bits from
+    # every fixture and subdir created here, 403ing the workers even
+    # with the scratch root itself opened up.
+    os.umask(0o022)
     with tempfile.TemporaryDirectory(prefix="zstd-bugb-") as td:
+        # mkdtemp gives 0700: run as root, workers drop to the
+        # compiled-in nginx user and cannot enter it -> 403s
+        os.chmod(td, 0o755)
         root = pathlib.Path(td)
         fixtures = root / "fix"
         logs = root / "logs"
