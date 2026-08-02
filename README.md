@@ -74,9 +74,11 @@ against current nginx. Differences from upstream:
   (including the identity fallback) whenever dictionaries are
   configured. Advertise the dictionary with one header on the resource
   itself — `add_header Use-As-Dictionary 'match="/app/main-*.js"';` —
-  and register the previous build's file at deploy time; see
+  and register the previous build's file at deploy time; a
+  ready-to-adapt config and deploy script live in
+  [`examples/`](examples/), and
   [nginx-zstd-module's `zstd_dcz_dict_file` docs](https://github.com/myguard-labs/nginx-zstd-module#zstd_dcz_dict_file)
-  for the full deployment pattern (locale layouts, dedupe, rotation) —
+  cover the full deployment pattern (locale layouts, dedupe, rotation) —
   the two directives are deliberate twins, and serving both `dcb` and
   `dcz` from the same locations works (clients pick one). Requires
   brotli ≥ 1.1 (the shared-dictionary encoder API — the pinned

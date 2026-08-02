@@ -8,6 +8,7 @@ config text eol=lf
 *.sh text eol=lf
 script/* text eol=lf
 *.t text eol=lf
+examples/*.conf text eol=lf
 
 # Byte-exact fixtures: the static-module suite asserts Content-Length
 # and serves .br frames verbatim — any EOL conversion corrupts them.
