@@ -508,6 +508,162 @@ jobs:
             --nginx-binary "$TEST_NGINX_BINARY" --port 18200
           echo "✓ libzstd 1.4.x fallback paths produce correct output"
 
+  # ── Dynamic-module linkage isolation — the NGX_LD_OPT regression test.
+  #    Builds the zstd modules alongside an unrelated stub dynamic module
+  #    (tools/ci-linkcheck-module) in ONE configure and asserts both
+  #    directions: the zstd .so's DO carry a libzstd DT_NEEDED (positive
+  #    control — proves the per-module ngx_module_libs channel works and
+  #    that the assertions are not vacuously passing) and the stub does
+  #    NOT (the actual fix: an addon appending to build-global NGX_LD_OPT
+  #    signs its neighbours up for its libraries). ─────────────────────────
+  linkage:
+    name: Dynamic-module linkage isolation
+    runs-on: [self-hosted, builder02, lxc]
+    timeout-minutes: 15
+    needs: resolve
+    env:
+      NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
+
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libzstd-dev \
+            libpcre2-dev zlib1g-dev wget binutils
+
+      - name: Cache nginx source tarball
+        id: nginx-tarball
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: nginx-${{ env.NGINX_VERSION }}.tar.gz
+          key: nginx-src-${{ env.NGINX_VERSION }}
+
+      - name: Download nginx source tarball
+        if: steps.nginx-tarball.outputs.cache-hit != 'true'
+        run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+
+      - name: Verify nginx tarball PGP signature
+        run: |
+          set -euo pipefail
+          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
+            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
+          gnupghome="$(mktemp -d)"
+          export GNUPGHOME="$gnupghome"
+          chmod 700 "$gnupghome"
+          for keyfile in tools/keys/*.key; do
+            gpg --quiet --import "$keyfile" 2>/dev/null
+          done
+          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
+          rm -rf "$gnupghome"
+
+      - name: Configure with zstd + stub as dynamic modules, build modules
+        run: |
+          set -euo pipefail
+          tar -xzf "nginx-${NGINX_VERSION}.tar.gz"
+          cd "nginx-${NGINX_VERSION}"
+          ./configure \
+            --with-compat \
+            --add-dynamic-module="$GITHUB_WORKSPACE" \
+            --add-dynamic-module="$GITHUB_WORKSPACE/tools/ci-linkcheck-module" \
+            > /dev/null
+          make -j"$(nproc)" modules
+
+      - name: Assert linkage isolation (both directions)
+        run: |
+          set -euo pipefail
+          cd "nginx-${NGINX_VERSION}"
+
+          # Existence first: a renamed/missing .so must fail here, not
+          # let the negative assertions below pass vacuously.
+          for so in ngx_http_zstd_filter_module.so \
+                    ngx_http_zstd_static_module.so \
+                    ngx_http_linkcheck_module.so; do
+            test -f "objs/$so" || { echo "✗ missing objs/$so"; exit 1; }
+          done
+
+          # PRIMARY assertions target the GENERATED LINK COMMAND, not
+          # the linked artifact: a toolchain defaulting to --as-needed
+          # (the gcc on these runners included) drops an unused libzstd
+          # NEEDED from the stub's .so even when the NGX_LD_OPT leak is
+          # present — a readelf-only negative therefore passes either
+          # way and tests nothing. The Makefile records what nginx's
+          # build system emitted, before the linker gets a vote. Grab
+          # the "$(LINK) -o objs/<so>" recipe line plus its backslash
+          # continuations (a plain target-to-blank-line sed range stops
+          # at the dependency list and never reaches the recipe —
+          # nginx emits a blank line between the two). index() rather
+          # than a regex match, so the dots in "<name>.so" are literal.
+          rule() {
+            awk -v so="objs/$1.so" \
+              'index($0, "-o " so) { grab = 1 }
+               grab { print; if ($0 !~ /\\$/) exit }' objs/Makefile
+          }
+
+          # Every assertion below is only as good as rule() returning
+          # the recipe it was asked for: an empty block makes a
+          # negative grep pass for free. Check extraction itself first,
+          # for both targets, before reading anything into the result.
+          for mod in ngx_http_zstd_filter_module ngx_http_linkcheck_module; do
+            rule "$mod" | grep -q . || {
+              echo "✗ no link rule extracted for $mod — objs/Makefile shape changed?"
+              exit 1
+            }
+          done
+
+          # Positive control: the filter module's rule must carry
+          # -lzstd via ngx_module_libs. Proves the per-module channel
+          # the fix relies on is live, so the negative below is a
+          # statement about NGX_LD_OPT and not about a build that
+          # linked no zstd at all.
+          if ! rule ngx_http_zstd_filter_module | grep -q -- '-lzstd'; then
+            echo "✗ filter module link rule lacks -lzstd (ngx_module_libs broken?)"
+            rule ngx_http_zstd_filter_module
+            exit 1
+          fi
+          echo "✓ filter module link rule carries -lzstd"
+
+          # The fix under test: an unrelated module's link rule must
+          # not mention zstd in any form. Matching bare "zstd" rather
+          # than the "-lzstd" spelling on purpose — pkg-config can hand
+          # back an absolute /usr/lib/.../libzstd.so or -l:libzstd.a,
+          # and a leak wearing either spelling is still a leak. Safe
+          # only for this target: the filter module's own rule names
+          # objs/ngx_http_zstd_filter_module.so, so the same pattern
+          # would match its filename and assert nothing.
+          if rule ngx_http_linkcheck_module | grep -qi zstd; then
+            echo "✗ stub module link rule references zstd (NGX_LD_OPT leak)"
+            rule ngx_http_linkcheck_module
+            exit 1
+          fi
+          echo "✓ stub module link rule free of zstd — no NGX_LD_OPT leak"
+
+          # readelf belt under the Makefile suspenders: the filter's
+          # DT_NEEDED may not be dropped by any toolchain (it references
+          # libzstd symbols), and on toolchains without --as-needed the
+          # stub check additionally guards link inputs that reach the
+          # command line outside the module's own rule text. The static
+          # module is deliberately not asserted either way: it calls no
+          # libzstd function, so its NEEDED reflects the linker default,
+          # not module behaviour.
+          if ! readelf -d objs/ngx_http_zstd_filter_module.so \
+               | grep -E 'NEEDED.*libzstd' > /dev/null; then
+            echo "✗ filter module .so does not link libzstd"
+            readelf -d objs/ngx_http_zstd_filter_module.so | grep NEEDED || true
+            exit 1
+          fi
+          if readelf -d objs/ngx_http_linkcheck_module.so \
+               | grep -E 'NEEDED.*libzstd' > /dev/null; then
+            echo "✗ stub module .so inherited a libzstd DT_NEEDED"
+            readelf -d objs/ngx_http_linkcheck_module.so | grep NEEDED
+            exit 1
+          fi
+          echo "✓ readelf agrees on both"
+
   # ── ASAN + UBSAN build — catches the lifetime/UB bugs in this module's
   #    history (per-request ctx, terminal-frame). Uses valgrind.suppress'd
   #    knowledge; ASAN is faster than valgrind for CI. ───────────────────────
