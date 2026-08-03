@@ -38,6 +38,14 @@ my $dict_raw = do {
 our $dict_b64 = encode_base64(sha256($dict_raw), "");
 our $bad_b64  = encode_base64("\x01" x 32, "");
 
+# For the optional supplied-hash directive argument: the fixture's true
+# hash as hex, and a deliberately different well-formed hash. Supplying
+# the wrong one and negotiating against IT is the only observable proof
+# the module trusts the argument instead of hashing the file.
+our $dict_hex = unpack("H*", sha256($dict_raw));
+our $odd_hex  = "01" x 32;
+our $odd_b64  = encode_base64("\x01" x 32, "");
+
 no_long_string();
 log_level 'warn';
 repeat_each(1);
@@ -344,5 +352,105 @@ GET /t
 --- must_die
 --- error_log
 has the same content as
+--- no_error_log
+[alert]
+
+
+
+=== TEST 15: supplied hash argument — correct value negotiates dcb
+--- config eval
+"    location /t {
+        brotli on;
+        brotli_min_length 8;
+        brotli_dcb_dict_file \$TEST_NGINX_PERL_PATH/suite/hello.js $::dict_hex;
+        default_type text/html;
+        return 200 \"dcb negotiation body: hello widget compute render text\n\";
+    }"
+--- request
+GET /t
+--- more_headers eval
+"Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"
+--- response_headers
+Content-Encoding: dcb
+Vary: Available-Dictionary
+--- no_error_log
+[error]
+
+
+
+=== TEST 16: supplied hash is trusted verbatim, not recomputed
+# The directive declares a hash that is NOT the file's: negotiation must
+# key on the declared value (client presenting it gets dcb) — the only
+# observable proof the load-time hashing pass was actually skipped.
+--- config eval
+"    location /t {
+        brotli on;
+        brotli_min_length 8;
+        brotli_dcb_dict_file \$TEST_NGINX_PERL_PATH/suite/hello.js $::odd_hex;
+        default_type text/html;
+        return 200 \"dcb negotiation body: hello widget compute render text\n\";
+    }"
+--- request
+GET /t
+--- more_headers eval
+"Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::odd_b64:"
+--- response_headers
+Content-Encoding: dcb
+--- no_error_log
+[error]
+
+
+
+=== TEST 17: supplied hash trusted verbatim — the file's true hash no longer matches
+--- config eval
+"    location /t {
+        brotli on;
+        brotli_min_length 8;
+        brotli_dcb_dict_file \$TEST_NGINX_PERL_PATH/suite/hello.js $::odd_hex;
+        default_type text/html;
+        return 200 \"dcb negotiation body: hello widget compute render text\n\";
+    }"
+--- request
+GET /t
+--- more_headers eval
+"Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::dict_b64:"
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]
+
+
+
+=== TEST 18: supplied hash with the wrong length is a config-load error
+--- config
+    location /t {
+        brotli on;
+        brotli_dcb_dict_file $TEST_NGINX_PERL_PATH/suite/hello.js abc123;
+        default_type text/html;
+        return 200 "unreachable\n";
+    }
+--- request
+GET /t
+--- must_die
+--- error_log
+invalid dcb dictionary hash
+--- no_error_log
+[alert]
+
+
+
+=== TEST 19: supplied hash with non-hex characters is a config-load error
+--- config
+    location /t {
+        brotli on;
+        brotli_dcb_dict_file $TEST_NGINX_PERL_PATH/suite/hello.js zz23456789012345678901234567890123456789012345678901234567890123;
+        default_type text/html;
+        return 200 "unreachable\n";
+    }
+--- request
+GET /t
+--- must_die
+--- error_log
+non-hex character
 --- no_error_log
 [alert]

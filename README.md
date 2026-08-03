@@ -61,7 +61,16 @@ against current nginx. Differences from upstream:
 - **RFC 9842 `dcb` shared-dictionary compression** via the repeatable
   `brotli_dcb_dict_file` directive (`http`/`server`/`location`). Each
   occurrence loads one dictionary — typically a previous version of the
-  resource — and registers its SHA-256 as the negotiation key. A request
+  resource — and registers its SHA-256 as the negotiation key. An
+  optional second argument supplies that SHA-256 as 64 hex characters —
+  `brotli_dcb_dict_file /path/main-AAA.js <sha256hex>;` — and is
+  trusted verbatim, skipping the load-time hashing pass entirely; deploy
+  tooling that generates the directive list has usually just computed
+  the hashes anyway (see [`examples/`](examples/)). Only supply hashes
+  for content-hashed immutable assets: a *stale* supplied hash keeps
+  matching and serves responses those clients cannot decode, where a
+  self-computed hash of a changed file simply stops matching (safe
+  fallback to plain `br`). A request
   whose `Available-Dictionary` matches a loaded dictionary and whose
   `Accept-Encoding` lists `dcb` explicitly (the `*` wildcard deliberately
   does not match) gets the response compressed against that dictionary

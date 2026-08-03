@@ -246,7 +246,7 @@ static ngx_command_t ngx_http_brotli_filter_commands[] = {
 
     {ngx_string("brotli_dcb_dict_file"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
-         NGX_CONF_TAKE1,
+         NGX_CONF_TAKE12,
      ngx_http_brotli_dcb_dict_file, NGX_HTTP_LOC_CONF_OFFSET, 0, NULL},
 
     ngx_null_command};
@@ -1195,7 +1195,9 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
   ngx_str_t* value;
   ngx_str_t path;
   ngx_uint_t i;
+  ngx_uint_t have_hash;
   ngx_file_info_t info;
+  u_char hash[NGX_HTTP_BROTLI_SHA256_DIGEST_LEN];
   ngx_http_brotli_dcb_dict_t* dict;
   ngx_http_brotli_dcb_dict_t* dicts;
 
@@ -1206,6 +1208,59 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
 
   if (ngx_conf_full_name(cf->cycle, &path, 1) != NGX_OK) {
     return NGX_CONF_ERROR;
+  }
+
+  /* Optional second argument: the dictionary's SHA-256 as 64 hex chars,
+     trusted VERBATIM in place of hashing the file here — the win is
+     skipping a full read-and-hash pass per dictionary at every config
+     parse (nginx -t, every reload), which dominates parse time at
+     hundreds of registered dictionaries. The deploy tooling that
+     generates the directive list has typically just computed these
+     hashes anyway (deduplication). The trade, and why the argument is
+     opt-in: with a self-computed hash a file that changes on disk after
+     clients stored it simply stops matching (safe fallback to plain
+     br); a stale supplied hash instead keeps matching and serves
+     responses those clients cannot decode. The generator owns hash
+     correctness — content-hashed immutable assets are the intended use.
+
+     Validated before the file is opened so a malformed literal is
+     reported as such, not shadowed by file errors. */
+  have_hash = (cf->args->nelts == 3);
+
+  if (have_hash) {
+    u_char c, hi, lo;
+
+    if (value[2].len != 2 * NGX_HTTP_BROTLI_SHA256_DIGEST_LEN) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                         "invalid dcb dictionary hash \"%V\": want %d hex "
+                         "characters (the file's SHA-256)",
+                         &value[2], 2 * NGX_HTTP_BROTLI_SHA256_DIGEST_LEN);
+      return NGX_CONF_ERROR;
+    }
+
+    for (i = 0; i < NGX_HTTP_BROTLI_SHA256_DIGEST_LEN; i++) {
+      c = value[2].data[2 * i];
+      hi = (c >= '0' && c <= '9')   ? (u_char) (c - '0')
+           : (c >= 'a' && c <= 'f') ? (u_char) (c - 'a' + 10)
+           : (c >= 'A' && c <= 'F') ? (u_char) (c - 'A' + 10)
+                                    : 0xff;
+
+      c = value[2].data[2 * i + 1];
+      lo = (c >= '0' && c <= '9')   ? (u_char) (c - '0')
+           : (c >= 'a' && c <= 'f') ? (u_char) (c - 'a' + 10)
+           : (c >= 'A' && c <= 'F') ? (u_char) (c - 'A' + 10)
+                                    : 0xff;
+
+      if (hi == 0xff || lo == 0xff) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid dcb dictionary hash \"%V\": "
+                           "non-hex character",
+                           &value[2]);
+        return NGX_CONF_ERROR;
+      }
+
+      hash[i] = (u_char) ((hi << 4) | lo);
+    }
   }
 
   if (blcf->dcb_dicts == NGX_CONF_UNSET_PTR) {
@@ -1274,11 +1329,17 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     return NGX_CONF_ERROR;
   }
 
-  ngx_http_brotli_sha256(dict->bytes.data, size, dict->hash);
+  if (have_hash) {
+    ngx_memcpy(dict->hash, hash, NGX_HTTP_BROTLI_SHA256_DIGEST_LEN);
+  } else {
+    ngx_http_brotli_sha256(dict->bytes.data, size, dict->hash);
+  }
 
   /* Two entries with identical content make the negotiation lookup
      ambiguous — almost certainly a copy meant to be a new version. Fail
-     loudly at load rather than silently matching the first. */
+     loudly at load rather than silently matching the first. (With
+     supplied hashes this deduplicates by DECLARED hash — which is also
+     exactly what makes the lookup ambiguous.) */
   dicts = blcf->dcb_dicts->elts;
 
   for (i = 0; i + 1 < blcf->dcb_dicts->nelts; i++) {

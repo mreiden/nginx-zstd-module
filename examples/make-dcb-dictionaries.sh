@@ -57,10 +57,17 @@ for app in "${APPS[@]}"; do
         h=$(sha256sum "$f" | cut -d' ' -f1)
         [ -n "${seen[$h]:-}" ] && continue          # dedupe: identical across locales
         seen[$h]=1
-        printf 'brotli_dcb_dict_file %s;\n' "$f" >> "$CONF.tmp"
+        # The hash we just computed doubles as the directive's optional
+        # second argument: the module trusts it verbatim and skips its
+        # own read-and-hash pass, which dominates nginx -t/reload time
+        # at hundreds of dictionaries. Safe here because these are
+        # content-hashed immutable release files and this script is the
+        # single source of the config — if you edit dictionary files in
+        # place, drop the argument and let the module hash them itself.
+        printf 'brotli_dcb_dict_file %s %s;\n' "$f" "$h" >> "$CONF.tmp"
         # Serving dcz from the same dictionaries (nginx-zstd-module) —
         # clients pick one coding:
-        #printf 'zstd_dcz_dict_file %s;\n'   "$f" >> "$CONF.tmp"
+        #printf 'zstd_dcz_dict_file %s %s;\n'   "$f" "$h" >> "$CONF.tmp"
     done
 done
 
