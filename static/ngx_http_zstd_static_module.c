@@ -22,6 +22,33 @@
 #define NGX_HTTP_ZSTD_STATIC_ON         1
 #define NGX_HTTP_ZSTD_STATIC_ALWAYS     2
 
+/*
+ * The largest decompression window a served .zst frame may declare:
+ * 8 MB, the RFC 8878 §3.1.1.1.2 recommended decoder limit, which web
+ * clients enforce for Content-Encoding: zstd — Firefox and Chromium
+ * reject any frame declaring more WITHOUT decoding a byte
+ * (NS_ERROR_INVALID_CONTENT_ENCODING / ERR_CONTENT_DECODING_FAILED).
+ * The trap that makes this worth checking at serve time: streaming
+ * encoders that were not told the input size stamp the LEVEL's default
+ * window into every frame header (a 93 KB asset compressed by a
+ * Node-based build pipeline can declare 128 MB), so the file decodes
+ * fine with the zstd CLI yet fails in every browser. Matches the
+ * filter module's dcz window cap, which exists for the same client
+ * guarantee.
+ */
+#define NGX_HTTP_ZSTD_STATIC_MAX_WINDOW  (8 * 1024 * 1024)
+
+/*
+ * FLOOR for the probe read size under directio: O_DIRECT requires
+ * buffer, offset and length aligned to the device's logical block
+ * size. Offset 0 is aligned by definition; 4 KB covers 512-byte and
+ * 4K-native devices, and the effective size is raised to the
+ * operator's directio_alignment when that is larger (the same
+ * geometry the core copy filter honours). A short read at EOF is
+ * permitted, so files smaller than the probe work too.
+ */
+#define NGX_HTTP_ZSTD_STATIC_DIO_PROBE   4096
+
 
 typedef struct {
     ngx_uint_t  enable;
@@ -242,7 +269,8 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
      * served with `Content-Encoding: zstd` and the client would get an
      * undecodable body — a confusing outage class that nginx's built-in
      * gzip_static also doesn't defend against. The probe is cheap (one
-     * pread(2) of 4 bytes at offset 0; pread is offset-explicit so it
+     * pread(2) of the frame-header prefix at offset 0 — 18 bytes, or one
+     * aligned block under directio; pread is offset-explicit so it
      * never moves the open_file_cache's shared fd position — using
      * plain read(2) would do exactly that and corrupt subsequent
      * requests serving the same cached fd). On mismatch we decline, so
@@ -260,40 +288,87 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
      * offset. Every modern POSIX target has it; this guard is
      * essentially a build-time tripwire.
      *
-     * Skipped when the file was opened with O_DIRECT (of.is_directio, set by
-     * ngx_open_cached_file when "directio <size>" is configured and the file
-     * meets the threshold). An O_DIRECT read requires the buffer, offset and
-     * length all aligned to the device block size; this deliberately tiny,
-     * unaligned 4-byte pread would fail with EINVAL on every request, wrongly
-     * declining the .zst and spamming NGX_LOG_CRIT. The probe is only a
-     * best-effort corruption guard, so forgoing it under directio is the
-     * correct trade — the file is still served, just without the sanity check.
+     * When the file was opened with O_DIRECT (of.is_directio, set by
+     * ngx_open_cached_file when "directio <size>" is configured and the
+     * file meets the threshold), the read must be block-aligned, so the
+     * probe preads one block of max(NGX_HTTP_ZSTD_STATIC_DIO_PROBE,
+     * directio_alignment) bytes into an equally-aligned pool buffer —
+     * honoring the operator's declared geometry the same way the core
+     * copy filter does. The window check in particular must not be
+     * skipped under directio: oversized declared windows are a
+     * systematic build-pipeline product, not rare corruption, and every
+     * browser rejects them. If the aligned read STILL fails, the file
+     * is DECLINED, not served: for a validation read, falling back to
+     * another encoding is safer than certifying a file we could not
+     * inspect, and the error log tells the operator which knob
+     * (directio_alignment) disagrees with the device.
      */
-    if (!of.is_directio) {
-    if (of.size < 4) {
-        ngx_log_error(NGX_LOG_ERR, log, 0,
-                      "zstd static: \"%s\" too small to be a zstd frame "
-                      "(%O bytes)", path.data, of.size);
-        return NGX_DECLINED;
-    }
-
     {
-        u_char    magic[4];
-        ssize_t   n;
-        uint32_t  mw;
+        /*
+         * 18 bytes covers the largest possible frame header prefix this
+         * check needs: magic(4) + descriptor(1) + window byte(1) for
+         * streaming frames, or magic(4) + descriptor(1) + dictionary
+         * id(<=4) + content size(<=8) for single-segment frames. Short
+         * files return fewer bytes; each parse path checks it got what
+         * that frame layout requires.
+         */
+        u_char     hdrbuf[18];
+        u_char    *hdr;
+        size_t     want;
+        ssize_t    n;
+        uint32_t   mw;
 
-        n = pread(of.fd, magic, sizeof(magic), 0);
-        if (n != (ssize_t) sizeof(magic)) {
+        if (of.size < 4) {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "zstd static: \"%s\" too small to be a zstd frame "
+                          "(%O bytes)", path.data, of.size);
+            return NGX_DECLINED;
+        }
+
+        if (of.is_directio) {
+            want = NGX_HTTP_ZSTD_STATIC_DIO_PROBE;
+            if ((size_t) clcf->directio_alignment > want) {
+                want = (size_t) clcf->directio_alignment;
+            }
+
+            hdr = ngx_pmemalign(r->pool, want, want);
+            if (hdr == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+        } else {
+            hdr = hdrbuf;
+            want = sizeof(hdrbuf);
+        }
+
+        n = pread(of.fd, hdr, want, 0);
+        if (n < 4) {
+            if (of.is_directio) {
+                ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                              "zstd static: %uz-byte aligned probe on "
+                              "directio file \"%s\" returned %z — "
+                              "declining; check directio_alignment "
+                              "against the device geometry",
+                              want, path.data, n);
+                return NGX_DECLINED;
+            }
+
             ngx_log_error(NGX_LOG_CRIT, log, ngx_errno,
-                          "zstd static: pread(\"%s\", 4 bytes) "
+                          "zstd static: pread(\"%s\", frame header) "
                           "returned %z", path.data, n);
             return NGX_DECLINED;
         }
 
-        mw = ((uint32_t) magic[0])
-           | ((uint32_t) magic[1] << 8)
-           | ((uint32_t) magic[2] << 16)
-           | ((uint32_t) magic[3] << 24);
+        if (of.is_directio) {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0,
+                           "zstd static: %uz-byte aligned probe on "
+                           "directio file \"%s\"", want, path.data);
+        }
+
+        mw = ((uint32_t) hdr[0])
+           | ((uint32_t) hdr[1] << 8)
+           | ((uint32_t) hdr[2] << 16)
+           | ((uint32_t) hdr[3] << 24);
 
         if (mw != ZSTD_MAGICNUMBER
             && (mw & ZSTD_MAGIC_SKIPPABLE_MASK)
@@ -303,15 +378,99 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
                           "zstd static: \"%s\" is not a zstd frame "
                           "(leading bytes 0x%02xd%02xd%02xd%02xd)",
                           path.data,
-                          (ngx_uint_t) magic[0], (ngx_uint_t) magic[1],
-                          (ngx_uint_t) magic[2], (ngx_uint_t) magic[3]);
+                          (ngx_uint_t) hdr[0], (ngx_uint_t) hdr[1],
+                          (ngx_uint_t) hdr[2], (ngx_uint_t) hdr[3]);
             return NGX_DECLINED;
         }
-    }
-    } else {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
-                       "zstd static: skipping magic probe on directio "
-                       "file \"%s\" (O_DIRECT alignment)", path.data);
+
+        /*
+         * Declared-window check (RFC 8878 §3.1.1.1) on regular frames —
+         * see NGX_HTTP_ZSTD_STATIC_MAX_WINDOW for why: a frame
+         * declaring more than 8 MB is rejected by every browser before
+         * decoding, so serving it produces a page-breaking decode error
+         * that curl and the zstd CLI do not reproduce. Declining keeps
+         * the site working (the zstd filter, gzip_static or identity
+         * takes over) and puts the actionable cause in the error log.
+         *
+         * The check covers the LEADING frame only. A skippable leading
+         * frame is exempt (the real header sits after a variable-length
+         * skip), and in a concatenation of regular frames only the
+         * first is inspected: a regular frame's header does not declare
+         * its compressed length, so walking the sequence would mean
+         * decoding every block header in every frame — unbounded I/O
+         * for a serve-time guard. Multi-frame .zst web assets are
+         * pathological (no common tooling emits them); the README
+         * documents the leading-frame scope.
+         */
+        if (mw == ZSTD_MAGICNUMBER) {
+            uint64_t    window;
+            ngx_uint_t  i, fhd, fcs_size, off;
+
+            static const ngx_uint_t  did_len[4] = { 0, 1, 2, 4 };
+
+            if (n < 5) {
+                ngx_log_error(NGX_LOG_ERR, log, 0,
+                              "zstd static: \"%s\" frame header truncated",
+                              path.data);
+                return NGX_DECLINED;
+            }
+
+            fhd = hdr[4];
+
+            if (!(fhd & 0x20)) {
+                /* No Single_Segment flag: Window_Descriptor follows. */
+                if (n < 6) {
+                    ngx_log_error(NGX_LOG_ERR, log, 0,
+                                  "zstd static: \"%s\" frame header "
+                                  "truncated", path.data);
+                    return NGX_DECLINED;
+                }
+
+                window = (uint64_t) 1 << (10 + (hdr[5] >> 3));
+                window += (window >> 3) * (hdr[5] & 7);
+
+            } else {
+                /*
+                 * Single_Segment: no Window_Descriptor; the window is
+                 * the frame content size, read from behind the optional
+                 * dictionary id. Frame_Content_Size_flag 0 means a
+                 * 1-byte field here (the flag only means "absent" when
+                 * Single_Segment is unset).
+                 */
+                fcs_size = (fhd >> 6) ? ((ngx_uint_t) 1 << (fhd >> 6)) : 1;
+                off = 5 + did_len[fhd & 3];
+
+                if ((size_t) n < off + fcs_size) {
+                    ngx_log_error(NGX_LOG_ERR, log, 0,
+                                  "zstd static: \"%s\" frame header "
+                                  "truncated", path.data);
+                    return NGX_DECLINED;
+                }
+
+                window = 0;
+                for (i = 0; i < fcs_size; i++) {
+                    window |= (uint64_t) hdr[off + i] << (8 * i);
+                }
+
+                if (fcs_size == 2) {
+                    window += 256;  /* RFC 8878: 2-byte field is offset */
+                }
+            }
+
+            if (window > NGX_HTTP_ZSTD_STATIC_MAX_WINDOW) {
+                ngx_log_error(NGX_LOG_ERR, log, 0,
+                              "zstd static: \"%s\" declares a %uL-byte "
+                              "decompression window, above the 8 MB limit "
+                              "browsers enforce for Content-Encoding: zstd "
+                              "(RFC 8878) — declining so a fallback "
+                              "encoding is used; recompress with a window "
+                              "log <= 23 (streaming encoders default to "
+                              "the compression level's window when not "
+                              "told the input size)",
+                              path.data, window);
+                return NGX_DECLINED;
+            }
+        }
     }
 #endif /* NGX_HAVE_PREAD */
 
