@@ -1335,18 +1335,18 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     ngx_http_brotli_sha256(dict->bytes.data, size, dict->hash);
   }
 
-  /* Two entries with identical content make the negotiation lookup
-     ambiguous — almost certainly a copy meant to be a new version. Fail
-     loudly at load rather than silently matching the first. (With
-     supplied hashes this deduplicates by DECLARED hash — which is also
-     exactly what makes the lookup ambiguous.) */
+  /* Two entries with the same hash make the negotiation lookup
+     ambiguous (for computed hashes that means identical content under
+     two paths — almost certainly a copy meant to be a new version;
+     supplied hashes are compared as declared). Fail loudly at load
+     rather than silently matching the first. */
   dicts = blcf->dcb_dicts->elts;
 
   for (i = 0; i + 1 < blcf->dcb_dicts->nelts; i++) {
     if (ngx_memcmp(dicts[i].hash, dict->hash,
                    NGX_HTTP_BROTLI_SHA256_DIGEST_LEN) == 0) {
       ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                         "dcb dictionary \"%V\" has the same content as "
+                         "dcb dictionary \"%V\" has the same hash as "
                          "\"%V\"",
                          &path, &dicts[i].file);
       return NGX_CONF_ERROR;

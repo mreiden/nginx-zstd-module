@@ -98,8 +98,9 @@ against current nginx. Differences from upstream:
   dictionaries turns seconds of `nginx -t`/reload time into a blip
   (`NGX_BROTLI_NO_LIBCRYPTO=1` in the configure environment opts out) —
   with a portable implementation built in as the fallback. Empty,
-  oversized (>10 MB) and duplicate-content dictionaries are config-load
-  errors. Verify end-to-end: strip the first 36 bytes of a response and
+  oversized (>10 MB) and duplicate-hash dictionaries are config-load
+  errors (supplied hashes are compared as declared; with computed
+  hashes "duplicate" means identical content). Verify end-to-end: strip the first 36 bytes of a response and
   `brotli -d -D <dict>` — byte-exact against origin.
   **Troubleshooting:** if `Vary: Available-Dictionary` appears but dcb
   never negotiates for hashes you know are right, run

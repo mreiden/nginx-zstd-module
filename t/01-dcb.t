@@ -338,7 +338,7 @@ is empty
 
 
 
-=== TEST 14: two dictionaries with identical content are a config-load error
+=== TEST 14: two dictionaries with the same hash are a config-load error
 --- config
     location /t {
         brotli on;
@@ -351,7 +351,7 @@ is empty
 GET /t
 --- must_die
 --- error_log
-has the same content as
+has the same hash as
 --- no_error_log
 [alert]
 
