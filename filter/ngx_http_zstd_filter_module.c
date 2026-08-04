@@ -1631,6 +1631,28 @@ ngx_http_zstd_filter_init_cctx(ngx_http_request_t *r,
             return NGX_ERROR;
         }
 
+        /*
+         * Content checksum on dcz frames — defence in depth against a
+         * mismatched dictionary. Decoding against a wrong same-size
+         * dictionary structurally SUCCEEDS: raw-prefix back-references
+         * stay in range and nothing else ties the output to the
+         * content, so the client gets wrong bytes with a success code
+         * (demonstrated in review of the supplied-hash argument, where
+         * a stale declared hash is the realistic way to get there).
+         * The checksum (XXH64-low32 of the uncompressed content,
+         * verified by libzstd-based clients — i.e. browsers — by
+         * default) turns that into a visible decode error. Four bytes
+         * per response plus an XXH64 pass; negligible next to the
+         * compression itself. Plain responses are unchanged: without a
+         * dictionary there is no mismatch failure mode.
+         */
+        if (ngx_http_zstd_set_param(r, cctx, ZSTD_c_checksumFlag, 1,
+                                    "checksumFlag(dcz)")
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
     } else if (zlcf->dict) {
         rc = ZSTD_CCtx_refCDict(cctx, zlcf->dict);
         if (ZSTD_isError(rc)) {
@@ -2374,11 +2396,12 @@ ngx_http_zstd_dcz_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
      * the argument is opt-in: with a self-computed hash a file that
      * changes on disk after clients stored it simply stops matching
      * (safe fallback to plain zstd); a stale supplied hash instead
-     * keeps matching, and the responses may fail to decode or silently
-     * decode to WRONG content (a same-size stale dictionary decodes
-     * successfully to wrong bytes — dcz frames carry no content
-     * checksum). The generator owns hash correctness — content-hashed
-     * immutable assets are the intended use.
+     * keeps matching and the client decodes against the wrong
+     * dictionary. The frame's content checksum (see checksumFlag in
+     * init_cctx) makes that a visible decode error rather than silent
+     * wrong bytes — visible is still broken, so the generator owns
+     * hash correctness; content-hashed immutable assets are the
+     * intended use.
      *
      * Validated before the file is opened so a malformed literal is
      * reported as such, not shadowed by file errors.

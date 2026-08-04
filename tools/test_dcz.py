@@ -321,6 +321,49 @@ def main() -> int:
                 f"(dcz {len(dcz_body)} vs zstd {len(plain_body)})",
             )
 
+            # -- content checksum (defence in depth): the inner zstd frame
+            # starts right after the 40-byte dcz header, so byte 44 is its
+            # Frame_Header_Descriptor; Content_Checksum_flag is bit 2.
+            fhd = dcz_body[44] if len(dcz_body) > 44 else None
+            check(
+                "dcz frame declares a content checksum (FHD bit 2)",
+                fhd is not None and (fhd & 0x04) != 0,
+                f"(FHD {fhd:#04x})" if fhd is not None else "(body too short)",
+            )
+
+            # The property the checksum exists for: decoding against a
+            # WRONG dictionary of the same size structurally succeeds and
+            # yields wrong bytes (raw-prefix references stay in range and
+            # nothing else in the frame ties the output to the content).
+            # With the checksum the decoder must reject it loudly instead
+            # of handing wrong content to the caller.
+            dict_path = root / "dicts" / "app-v1.js"
+            wrong_dict = root / "wrong-same-size.js"
+            wrong_dict.write_bytes(b"Z" * dict_path.stat().st_size)
+            wrong_src = root / "response-wrongdict.dcz"
+            wrong_src.write_bytes(dcz_body)
+            wrong_out = root / "response-wrongdict.out"
+            wrong_rc = subprocess.run(
+                [
+                    args.zstd_bin, "-d", "-q", "-f",
+                    f"--memory={RFC_CLIENT_WINDOW}",
+                    "-D", str(wrong_dict),
+                    "-o", str(wrong_out), str(wrong_src),
+                ],
+                capture_output=True,
+            )
+            if wrong_rc.returncode == 0:
+                wrong_len = len(wrong_out.read_bytes()) if wrong_out.exists() else 0
+                wrong_detail = f"(rc=0, {wrong_len} bytes of wrong content accepted)"
+            else:
+                wrong_detail = ""
+            check(
+                "wrong same-size dictionary fails the decode "
+                "(checksum turns silent corruption into a loud error)",
+                wrong_rc.returncode != 0,
+                wrong_detail,
+            )
+
             # -- every gate miss must fall back to zstd, never break
             fallback_cases = [
                 (
