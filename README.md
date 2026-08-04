@@ -68,7 +68,10 @@ against current nginx. Differences from upstream:
   tooling that generates the directive list has usually just computed
   the hashes anyway (see [`examples/`](examples/)). Only supply hashes
   for content-hashed immutable assets: a *stale* supplied hash keeps
-  matching and serves responses those clients cannot decode, where a
+  matching, and the resulting responses may fail to decode or silently
+  decode to wrong content (a same-size stale dictionary yields wrong
+  bytes — the dcb stream carries no content checksum), fanned out by
+  any shared cache to every client advertising the stale hash; a
   self-computed hash of a changed file simply stops matching (safe
   fallback to plain `br`). A request
   whose `Available-Dictionary` matches a loaded dictionary and whose

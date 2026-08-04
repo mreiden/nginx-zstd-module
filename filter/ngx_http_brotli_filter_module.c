@@ -1219,8 +1219,10 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
      hashes anyway (deduplication). The trade, and why the argument is
      opt-in: with a self-computed hash a file that changes on disk after
      clients stored it simply stops matching (safe fallback to plain
-     br); a stale supplied hash instead keeps matching and serves
-     responses those clients cannot decode. The generator owns hash
+     br); a stale supplied hash instead keeps matching, and the
+     responses may fail to decode or silently decode to WRONG content
+     (a same-size stale raw dictionary yields wrong bytes — the dcb
+     stream carries no content checksum). The generator owns hash
      correctness — content-hashed immutable assets are the intended use.
 
      Validated before the file is opened so a malformed literal is

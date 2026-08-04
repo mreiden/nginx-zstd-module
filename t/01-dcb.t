@@ -378,10 +378,12 @@ Vary: Available-Dictionary
 
 
 
-=== TEST 16: supplied hash is trusted verbatim, not recomputed
+=== TEST 16: supplied hash is trusted verbatim as the negotiation key
 # The directive declares a hash that is NOT the file's: negotiation must
-# key on the declared value (client presenting it gets dcb) — the only
-# observable proof the load-time hashing pass was actually skipped.
+# key on the declared value (client presenting it gets dcb). This does
+# NOT prove the hashing pass was skipped — the branch overwrites
+# dict->hash either way; that evidence is the zero user-time benchmark
+# (see nginx-zstd-module#100 for the instrumentation idea).
 --- config eval
 "    location /t {
         brotli on;
@@ -422,10 +424,13 @@ Content-Encoding: br
 
 
 === TEST 18: supplied hash with the wrong length is a config-load error
+# The dictionary path deliberately does NOT exist: the hash error must
+# surface anyway, pinning that malformed literals are validated before
+# ngx_open_file() rather than shadowed by the file error.
 --- config
     location /t {
         brotli on;
-        brotli_dcb_dict_file $TEST_NGINX_PERL_PATH/suite/hello.js abc123;
+        brotli_dcb_dict_file $TEST_NGINX_PERL_PATH/suite/no-such-dict abc123;
         default_type text/html;
         return 200 "unreachable\n";
     }
@@ -440,10 +445,11 @@ invalid dcb dictionary hash
 
 
 === TEST 19: supplied hash with non-hex characters is a config-load error
+# Nonexistent path for the same reason as TEST 18.
 --- config
     location /t {
         brotli on;
-        brotli_dcb_dict_file $TEST_NGINX_PERL_PATH/suite/hello.js zz23456789012345678901234567890123456789012345678901234567890123;
+        brotli_dcb_dict_file $TEST_NGINX_PERL_PATH/suite/no-such-dict zz23456789012345678901234567890123456789012345678901234567890123;
         default_type text/html;
         return 200 "unreachable\n";
     }
