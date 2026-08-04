@@ -1643,8 +1643,12 @@ ngx_http_zstd_filter_init_cctx(ngx_http_request_t *r,
          * verified by libzstd-based clients — i.e. browsers — by
          * default) turns that into a visible decode error. Four bytes
          * per response plus an XXH64 pass; negligible next to the
-         * compression itself. Plain responses are unchanged: without a
-         * dictionary there is no mismatch failure mode.
+         * compression itself. Plain responses are unchanged: a
+         * zstd_dict_file CDict already embeds a dictionary ID that the
+         * decoder checks (a wrong trained dictionary fails as
+         * "Dictionary mismatch"), and a dictionary-less response has
+         * nothing to mismatch. Only the RFC 9842 raw prefix carries no
+         * such binding, which is why it needs the checksum.
          */
         if (ngx_http_zstd_set_param(r, cctx, ZSTD_c_checksumFlag, 1,
                                     "checksumFlag(dcz)")

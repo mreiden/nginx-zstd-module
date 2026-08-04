@@ -351,6 +351,7 @@ def main() -> int:
                     "-o", str(wrong_out), str(wrong_src),
                 ],
                 capture_output=True,
+                check=False,
             )
             if wrong_rc.returncode == 0:
                 wrong_len = len(wrong_out.read_bytes()) if wrong_out.exists() else 0
