@@ -79,7 +79,12 @@ BROTLI_COMMON_H="$BROTLI_MODULE_SRC_DIR/../ngx_http_brotli_common.h \
                  $BROTLI_MODULE_SRC_DIR/../ngx_http_brotli_sha256.h"
 
 if [ "$use_system_brotli" = yes ]; then
-    ngx_module_incs="$(pkg-config --cflags-only-I libbrotlienc)"
+    # Bare directories only: nginx's auto/make prefixes every incs token
+    # with the compiler's include option, so "-I/x" here would come out
+    # as the mangled "-I -I/x" (silently a no-op under gcc, C1083 under
+    # MSVC). Usually empty — a system libbrotli needs no -I at all.
+    ngx_module_incs="$(pkg-config --cflags-only-I libbrotlienc \
+                       | sed -e 's/-I *//g')"
     ngx_module_libs="$(pkg-config --libs libbrotlienc) -lm"
     ngx_module_deps="$BROTLI_COMMON_H"
 else
