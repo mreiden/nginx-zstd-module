@@ -161,10 +161,15 @@ if [ "$ngx_module_link" != DYNAMIC ]; then
                          | sed "s/$next/$next $ngx_module_name/"`
 fi
 
-if [ "$NGX_MSVC_VER" = "" ]; then
-    CFLAGS="$CFLAGS -Wno-deprecated-declarations"
-else  # MSVC
+# Branch on NGX_CC_NAME, not the historical NGX_MSVC_VER: nginx removed
+# that variable from configure years ago, so the old test was always
+# true — an MSVC build got the gcc flag and died with
+# "D8021: invalid numeric argument '/Wno-deprecated-declarations'".
+# auto/cc/name sets NGX_CC_NAME=msvc reliably on every supported nginx.
+if [ "$NGX_CC_NAME" = "msvc" ]; then
     CFLAGS="$CFLAGS -Y- -wd4127 -wd4189 -wd4201 -wd4334 -wd4702"
+else
+    CFLAGS="$CFLAGS -Wno-deprecated-declarations"
 fi
 
 have=NGX_HTTP_BROTLI_FILTER . auto/have
