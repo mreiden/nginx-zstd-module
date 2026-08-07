@@ -176,6 +176,35 @@ load_module modules/ngx_http_brotli_static_module.so;
 ```
 
 
+### Windows (MSVC)
+
+nginx's win32 build (MSYS shell + `cl`) works as a static `--add-module`
+build. Build the bundled brotli first, into the `deps/brotli/out`
+directory the module's config expects, with the **static CRT** to match
+nginx's `cl` defaults — CMake's default `/MD` runtime produces
+LIBCMT/MSVCRT conflicts at the final link:
+
+```
+cd ngx_brotli/deps/brotli
+cmake -B out -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=OFF -DBROTLI_DISABLE_TESTS=ON \
+      -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+cmake --build out
+```
+
+Then configure nginx with a **relative** `--add-module` path (`cl`
+cannot open MSYS-style `/c/...` absolute paths). Two upstream bugs are
+fixed in this fork's config for MSVC to work at all: the compiler
+branch guarded on `NGX_MSVC_VER`, a variable modern nginx no longer
+defines, so `cl` received the gcc-only `-Wno-deprecated-declarations`
+(fatal `D8021`); and the link flags were gcc-spelled `-L`/`-l`, which
+`cl` drops with a `D9002` warning, leaving every `BrotliEncoder*`
+symbol unresolved — the config now names the `.lib` files outright.
+
+`brotli_static` links no brotli library at all (it only serves
+pre-compressed `.br` files), so it is unaffected by any of the encoder
+link mechanics.
+
 
 ## Configuration directives
 

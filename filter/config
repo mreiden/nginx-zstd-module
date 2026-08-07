@@ -90,7 +90,21 @@ else
 
     ngx_module_incs="$brotli/include"
     ngx_module_deps="$BROTLI_ENC_H $BROTLI_COMMON_H"
-    ngx_module_libs="-L$BROTLI_OUTPUT_DIRECTORY -lbrotlienc -lbrotlicommon -lm"
+
+    if [ "$NGX_CC_NAME" = "msvc" ]; then
+        # cl/link drop gcc-style -L/-l with a D9002 "ignoring unknown
+        # option" warning, so the libraries silently vanish and every
+        # BrotliEncoder* symbol comes back unresolved at the final
+        # link. Name the .lib files outright (brotli >= 1.1's cmake
+        # emits brotlienc.lib/brotlicommon.lib for a static build; see
+        # the README's Windows section for the cmake invocation — the
+        # static-CRT runtime flag there matters). No -lm equivalent:
+        # there is no separate math library on Windows.
+        ngx_module_libs="$BROTLI_OUTPUT_DIRECTORY/brotlienc.lib \
+                         $BROTLI_OUTPUT_DIRECTORY/brotlicommon.lib"
+    else
+        ngx_module_libs="-L$BROTLI_OUTPUT_DIRECTORY -lbrotlienc -lbrotlicommon -lm"
+    fi
 fi
 
 # Optional acceleration for dcb dictionary hashing: RFC 9842 keys
