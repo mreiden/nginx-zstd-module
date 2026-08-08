@@ -205,6 +205,13 @@ symbol unresolved — the config now names the `.lib` files outright.
 pre-compressed `.br` files), so it is unaffected by any of the encoder
 link mechanics.
 
+A complete, SHA-pinned build script that assembles a static Windows
+`nginx.exe` with this module (and optionally the zstd pair and
+headers-more) lives in nginx-zstd-module's
+[`tools/build-windows.sh`](https://github.com/myguard-labs/nginx-zstd-module/blob/master/tools/build-windows.sh),
+including the VS-prompt/MSYS2 launch steps above and native-perl
+detection for the OpenSSL build.
+
 
 ## Configuration directives
 
