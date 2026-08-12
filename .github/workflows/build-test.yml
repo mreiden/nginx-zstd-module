@@ -70,7 +70,10 @@ jobs:
 
       - name: Build against PGP-verified nginx
         run: |
-          bash tools/ci-build.sh system "$NGINX_VERSION"
+          # WITH_CVARY_STUB additionally builds the do-nothing dynamic
+          # module that claims the compression_vary module's name, for
+          # the suppression witness below.
+          WITH_CVARY_STUB=1 bash tools/ci-build.sh system "$NGINX_VERSION"
           echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/.build/nginx-$NGINX_VERSION/objs/nginx" >> "$GITHUB_ENV"
           # This job is the accelerated-hash path: libcrypto must have
           # been detected, or dictionary hashing silently regressed to
@@ -78,6 +81,67 @@ jobs:
           grep -q 'NGX_HTTP_BROTLI_HAVE_LIBCRYPTO' \
             ".build/nginx-$NGINX_VERSION/objs/ngx_auto_config.h"
           echo "✓ libcrypto EVP SHA-256 detected"
+
+      - name: Assert gzip_vary warning suppression witness (both directions)
+        # When a module named ngx_http_compression_vary_filter_module is
+        # loaded, the per-location gzip_vary-off warnings collapse into
+        # one summary warning per module — never full silence, because
+        # that module's compression_vary directive defaults to off and
+        # its effective value cannot be read from here (see
+        # ngx_http_brotli_common.h). The brotli modules are static in
+        # this build and the stub loads via load_module — the harder
+        # detection case — while the warn-direction control keeps the
+        # quiet-direction greps from passing vacuously if the warning
+        # text ever changes. The semantic contract against the REAL
+        # module (single Vary with compression_vary on, none with it
+        # off) is CI'd in the zstd sibling repo's cvary-interop job.
+        run: |
+          set -euo pipefail
+          cd ".build/nginx-$NGINX_VERSION"
+
+          mkdir -p wprefix/logs
+          cat > wprefix/warn.conf <<EOF
+          pid warn.pid;
+          events {}
+          http {
+              server {
+                  listen 127.0.0.1:8080;
+                  location / {
+                      brotli on;
+                      brotli_static on;
+                      root html;
+                  }
+              }
+          }
+          EOF
+
+          # Identical config plus the stub that claims the
+          # compression_vary module's name.
+          { echo "load_module $PWD/objs/ngx_http_compression_vary_filter_module.so;"
+            cat wprefix/warn.conf; } > wprefix/quiet.conf
+
+          # Control direction: without the stub, both modules must warn.
+          out=$(objs/nginx -p "$PWD/wprefix" -c warn.conf -t 2>&1)
+          echo "$out"
+          echo "$out" | grep -q 'test is successful'
+          echo "$out" | grep -q 'brotli is enabled but "gzip_vary" is off'
+          echo "$out" | grep -q 'brotli_static is enabled but "gzip_vary" is off'
+          echo "✓ both warnings fire without the stub"
+
+          # Witness direction: with the stub loaded, the per-location
+          # lines must vanish and exactly the two per-module summaries
+          # must appear (the exact counts also mutation-check the
+          # counters).
+          out=$(objs/nginx -p "$PWD/wprefix" -c quiet.conf -t 2>&1)
+          echo "$out"
+          echo "$out" | grep -q 'test is successful'
+          if echo "$out" | grep -q 'is enabled but "gzip_vary" is off'; then
+            echo "✗ per-location warning not suppressed with stub loaded"
+            exit 1
+          fi
+          echo "$out" | grep -q 'brotli is enabled with "gzip_vary" off in 1 location'
+          echo "$out" | grep -q 'brotli_static is enabled with "gzip_vary" off in 1 location'
+          echo "✓ per-location warnings suppressed, summary warnings present"
 
       - name: Roundtrip smoke test
         run: |

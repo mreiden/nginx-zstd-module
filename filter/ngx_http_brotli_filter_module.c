@@ -90,6 +90,17 @@ typedef struct {
   size_t lg_win;
 } ngx_http_brotli_conf_t;
 
+/* Main (http-level) configuration. Cycle-owned on purpose: a rejected
+   reload takes this state down with its pool (the same reasoning as
+   the zstd sibling's dcz counter). */
+typedef struct {
+  /* Locations where the gzip_vary-off warning was withheld because a
+     compression_vary module is loaded (see merge_conf); reported as
+     one summary warning from postconfiguration instead of per
+     location. */
+  ngx_uint_t vary_warn_suppressed;
+} ngx_http_brotli_main_conf_t;
+
 /* Instance context. */
 typedef struct {
   /* Brotli encoder instance. */
@@ -161,6 +172,7 @@ static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
                                                 ngx_http_variable_value_t* v,
                                                 uintptr_t data);
 
+static void* ngx_http_brotli_create_main_conf(ngx_conf_t* cf);
 static void* ngx_http_brotli_create_conf(ngx_conf_t* cf);
 static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
                                         void* child);
@@ -256,7 +268,7 @@ static ngx_http_module_t ngx_http_brotli_filter_module_ctx = {
     ngx_http_brotli_add_variables, /* pre-configuration */
     ngx_http_brotli_filter_init,   /* post-configuration */
 
-    NULL, /* create main configuration */
+    ngx_http_brotli_create_main_conf, /* create main configuration */
     NULL, /* init main configuration */
 
     NULL, /* create server configuration */
@@ -1077,6 +1089,11 @@ static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
   return NGX_OK;
 }
 
+static void* ngx_http_brotli_create_main_conf(ngx_conf_t* cf) {
+  /* pcalloc zeroes vary_warn_suppressed — no reset hook needed. */
+  return ngx_pcalloc(cf->pool, sizeof(ngx_http_brotli_main_conf_t));
+}
+
 static void* ngx_http_brotli_create_conf(ngx_conf_t* cf) {
   ngx_http_brotli_conf_t* conf;
 
@@ -1145,16 +1162,30 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
      nginx only emits that header when the core gzip_vary is on, so warn
      per merged location — the same check the zstd sibling modules ship,
      which has caught real stale "gzip_vary off" workarounds in configs
-     predating correct Vary handling in caches. */
+     predating correct Vary handling in caches. When the
+     compression_vary filter module is loaded — it emits the header
+     from r->gzip_vary without needing "gzip_vary on" — the
+     per-location warning is withheld and counted instead; presence
+     alone cannot prove it is enabled here (see
+     ngx_http_brotli_vary_handled_externally()), so postconfiguration
+     reports one summary warning. */
   if (conf->enable) {
     ngx_http_core_loc_conf_t* clcf =
         ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
     if (clcf != NULL && !clcf->gzip_vary) {
-      ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                         "brotli is enabled but \"gzip_vary\" is off; add "
-                         "\"gzip_vary on\" to emit \"Vary: Accept-Encoding\" "
-                         "so proxies and CDNs cache compressed and "
-                         "uncompressed responses separately");
+      if (ngx_http_brotli_vary_handled_externally(cf)) {
+        ngx_http_brotli_main_conf_t* bmcf = ngx_http_conf_get_module_main_conf(
+            cf, ngx_http_brotli_filter_module);
+        if (bmcf != NULL) {
+          bmcf->vary_warn_suppressed++;
+        }
+      } else {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "brotli is enabled but \"gzip_vary\" is off; add "
+                           "\"gzip_vary on\" to emit \"Vary: Accept-Encoding\" "
+                           "so proxies and CDNs cache compressed and "
+                           "uncompressed responses separately");
+      }
     }
   }
 
@@ -1163,6 +1194,30 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
 
 /* Prepend to filter chain. */
 static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf) {
+  ngx_http_brotli_main_conf_t* bmcf;
+
+  /* The per-location gzip_vary-off warnings withheld in merge_conf,
+     folded into one line. Still a warning rather than silence:
+     "compression_vary" defaults to off in that module, so its presence
+     does not prove the Vary header is actually emitted for these
+     locations — and one module cannot read another's merged
+     configuration to check (private conf struct; merge order between
+     unrelated modules is unspecified). Postconfiguration runs after
+     every merge, so the count is final. */
+  bmcf =
+      ngx_http_conf_get_module_main_conf(cf, ngx_http_brotli_filter_module);
+  if (bmcf != NULL && bmcf->vary_warn_suppressed) {
+    ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                       "brotli is enabled with \"gzip_vary\" off in %ui "
+                       "location(s); the per-location warnings are "
+                       "suppressed because "
+                       "ngx_http_compression_vary_filter_module is loaded, "
+                       "but its \"compression_vary\" directive defaults to "
+                       "off; verify \"compression_vary on\" covers those "
+                       "locations so \"Vary: Accept-Encoding\" is emitted",
+                       bmcf->vary_warn_suppressed);
+  }
+
   ngx_http_next_header_filter = ngx_http_top_header_filter;
   ngx_http_top_header_filter = ngx_http_brotli_header_filter;
 

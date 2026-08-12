@@ -413,4 +413,50 @@ ngx_http_brotli_ok(ngx_http_request_t *r)
 }
 
 
+/*
+ * ngx_http_brotli_vary_handled_externally()
+ *
+ * True when a module named "ngx_http_compression_vary_filter_module"
+ * (HanadaLee's Vary-flattening filter) is loaded, statically or via
+ * load_module. When its "compression_vary" directive is on, that
+ * module emits Vary: Accept-Encoding keyed on r->gzip_vary alone,
+ * regardless of clcf->gzip_vary — replacing the "gzip_vary" directive
+ * (verified empirically against all four gzip_vary x compression_vary
+ * quadrants; its author explicitly recommends "gzip_vary off" when
+ * "compression_vary on" is used). With it loaded, "gzip_vary off" is
+ * plausibly deliberate rather than a caching hazard.
+ *
+ * PRESENCE IS NOT PROOF, though: "compression_vary" itself defaults
+ * to off, and this module cannot verify the effective value — the
+ * conf struct is private to that module, and merge order between
+ * unrelated modules follows their position in cycle->modules, so its
+ * merged values may not even exist yet when ours merge. Callers
+ * therefore must not silence the gzip_vary-off warning outright on
+ * this check; they withhold the per-location lines and emit one
+ * summary warning from postconfiguration that tells the operator
+ * exactly what to verify.
+ *
+ * Called at merge-time: every load_module directive has been processed
+ * by then (core conf parses before the http block), so
+ * cf->cycle->modules is complete for both linkage styles.
+ *
+ * ngx_inline for the same reason as ngx_http_brotli_ok() above.
+ */
+static ngx_inline ngx_uint_t
+ngx_http_brotli_vary_handled_externally(ngx_conf_t *cf)
+{
+    ngx_uint_t  i;
+
+    for (i = 0; cf->cycle->modules[i]; i++) {
+        if (ngx_strcmp(cf->cycle->modules[i]->name,
+                       "ngx_http_compression_vary_filter_module") == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 #endif /* NGX_HTTP_BROTLI_COMMON_H */

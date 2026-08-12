@@ -52,7 +52,14 @@ against current nginx. Differences from upstream:
   location whose effective `gzip_vary` is off (matching the zstd
   siblings — without `Vary: Accept-Encoding` a shared cache can serve
   the compressed variant to a client that cannot decode it;
-  `brotli_static always` is exempt since it does not vary).
+  `brotli_static always` is exempt since it does not vary; when
+  [ngx_http_compression_vary_filter_module](https://github.com/HanadaLee/ngx_http_compression_vary_filter_module)
+  is loaded — it emits the header from `r->gzip_vary` in place of the
+  `gzip_vary` directive wherever `compression_vary on` applies — the
+  per-location warnings collapse into one summary warning per module
+  asking you to verify `compression_vary on` covers those locations,
+  since that directive itself defaults to off and its effective value
+  cannot be read from another module).
 - **Tests:** a Test::Nginx regression suite (`t/`) covering the
   negotiation matrix, bypass, caps, and the static-module fallback
   regression, run in CI alongside the roundtrip smoke tool and the fuzz

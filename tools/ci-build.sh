@@ -132,11 +132,22 @@ fi
 
 cd "$SRCDIR"
 
+# WITH_CVARY_STUB=1 (CI only) also builds tools/ci-cvary-stub as a dynamic
+# module — a do-nothing module claiming the compression_vary module's
+# name, so the workflow can witness the gzip_vary-warning suppression in
+# both directions (see ngx_http_brotli_common.h). Off by default: the
+# stub must never end up in a real deployment's objs/.
+stub_args=()
+if [ "${WITH_CVARY_STUB:-0}" = "1" ]; then
+    stub_args=(--add-dynamic-module="$MODULE_DIR/tools/ci-cvary-stub")
+fi
+
 ./configure \
     --with-compat \
     --with-debug \
     --with-http_gzip_static_module \
-    --add-module="$MODULE_DIR" > /dev/null
+    --add-module="$MODULE_DIR" \
+    "${stub_args[@]}" > /dev/null
 
 make -j"$(nproc)" 2>&1 | tail -3
 
