@@ -120,18 +120,32 @@ jobs:
           { echo "load_module $PWD/objs/ngx_http_compression_vary_filter_module.so;"
             cat wprefix/warn.conf; } > wprefix/quiet.conf
 
-          # Control direction: without the stub, both modules must warn.
+          # Cardinality, not just presence: one location per module in
+          # the fixture means each expected line must appear EXACTLY
+          # once — a duplicate emission (e.g. postconfiguration running
+          # twice) is a bug grep -q would wave through.
+          expect_one() {
+            local n
+            n=$(echo "$out" | grep -cF "$1" || true)
+            if [ "$n" -ne 1 ]; then
+              echo "✗ expected exactly one \"$1\" line, got $n"
+              exit 1
+            fi
+          }
+
+          # Control direction: without the stub, each module must warn
+          # once for the single affected location.
           out=$(objs/nginx -p "$PWD/wprefix" -c warn.conf -t 2>&1)
           echo "$out"
           echo "$out" | grep -q 'test is successful'
-          echo "$out" | grep -q 'brotli is enabled but "gzip_vary" is off'
-          echo "$out" | grep -q 'brotli_static is enabled but "gzip_vary" is off'
-          echo "✓ both warnings fire without the stub"
+          expect_one 'brotli is enabled but "gzip_vary" is off'
+          expect_one 'brotli_static is enabled but "gzip_vary" is off'
+          echo "✓ both warnings fire exactly once without the stub"
 
           # Witness direction: with the stub loaded, the per-location
-          # lines must vanish and exactly the two per-module summaries
-          # must appear (the exact counts also mutation-check the
-          # counters).
+          # lines must vanish and each per-module summary must appear
+          # exactly once (the count in the message also mutation-checks
+          # the counters).
           out=$(objs/nginx -p "$PWD/wprefix" -c quiet.conf -t 2>&1)
           echo "$out"
           echo "$out" | grep -q 'test is successful'
@@ -139,9 +153,9 @@ jobs:
             echo "✗ per-location warning not suppressed with stub loaded"
             exit 1
           fi
-          echo "$out" | grep -q 'brotli is enabled with "gzip_vary" off in 1 location'
-          echo "$out" | grep -q 'brotli_static is enabled with "gzip_vary" off in 1 location'
-          echo "✓ per-location warnings suppressed, summary warnings present"
+          expect_one 'brotli is enabled with "gzip_vary" off in 1 location'
+          expect_one 'brotli_static is enabled with "gzip_vary" off in 1 location'
+          echo "✓ per-location warnings suppressed, one summary each"
 
       - name: Roundtrip smoke test
         run: |
