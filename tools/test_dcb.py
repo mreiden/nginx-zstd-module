@@ -358,7 +358,16 @@ http {{
 
         finally:
             nginx.terminate()
-            nginx.wait(timeout=10)
+            try:
+                # 30s, not 10: an instrumented nginx flushing profile
+                # data at exit on a loaded runner can outlive a tight
+                # reap budget; teardown runs after the verdict, so
+                # patience costs nothing when healthy. Mirrors
+                # nginx-zstd-module #114/#115.
+                nginx.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                nginx.kill()
+                nginx.wait(timeout=30)
 
     if failures:
         print(f"FAILED: {len(failures)} dcb check(s): {', '.join(failures)}")
