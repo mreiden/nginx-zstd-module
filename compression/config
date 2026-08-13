@@ -25,8 +25,9 @@ if test -n "$ngx_module_link"; then
 else
     cat << END
 
-$0: error: the nginx-compression prototype requires nginx >= 1.9.11
-(the dynamic-modules build system).
+$0: error: the nginx-compression prototype requires nginx >= 1.23.0
+(list-linked headers; the header additionally enforces this with a
+compile-time version check).
 
 END
     exit 1

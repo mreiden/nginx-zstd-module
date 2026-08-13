@@ -22,6 +22,17 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <nginx.h>
+
+/*
+ * Floor: 1.23.0 (May 2022) — the list-linked header change
+ * (ngx_table_elt_t.next) this module relies on when pushing
+ * Content-Encoding and Vary. Review round 1 caught the config
+ * script claiming 1.9.11.
+ */
+#if (nginx_version < 1023000)
+#error "nginx-compression requires nginx >= 1.23.0 (ngx_table_elt_t.next)"
+#endif
 
 
 /*
@@ -84,6 +95,19 @@ struct ngx_http_compression_backend_s {
      * empty when the backend has none. Phase-1 seam: negotiation
      * (Available-Dictionary) happens in the core module against the
      * shared store; the backend only ever sees raw bytes.
+     *
+     * BOTH dictionary codings carry a wire prologue the compression
+     * library does not emit (review round 1 corrected the earlier
+     * "dcz is a plain zstd frame" text): dcz prepends a 40-byte zstd
+     * SKIPPABLE frame (magic 0x184D2A5E, size 0x20, then the
+     * dictionary's SHA-256) which a zstd decoder skips natively;
+     * dcb prepends 36 raw bytes (0xFF 'D' 'C' 'B' + SHA-256) the
+     * brotli decoder does NOT consume. Same shape — magic plus hash —
+     * different framing and different consumer obligations, which is
+     * why wire_prologue is a per-backend hook rather than chassis
+     * code. (Phase-1 alternative on the table: since both prologues
+     * are derivable from {magic, hash}, the chassis could emit them
+     * from two descriptor fields and the hook disappears.)
      */
     ngx_str_t    dict_coding;
 
@@ -126,12 +150,13 @@ struct ngx_http_compression_backend_s {
     ngx_int_t  (*attach_dictionary)(void *bctx, ngx_str_t *raw);
 
     /*
-     * Wire prologue BEFORE the first encoder byte, or NULL. Exists
-     * only because RFC 9842 made the two dictionary framings
-     * asymmetric (wrinkle #6): dcb prepends a 36-byte magic+SHA-256
-     * header the brotli DECODER does not consume, while dcz is a
-     * plain zstd frame. Returns the number of bytes written into
-     * `out` (bounded by out_len), or NGX_ERROR.
+     * Wire prologue BEFORE the first encoder byte, or NULL when the
+     * backend has no dictionary coding. Both dict codings need one —
+     * see dict_coding above for the corrected framing details — and
+     * neither library emits it (zstd's refPrefix is transparent;
+     * brotli's header is outside the stream). Returns the number of
+     * bytes written into `out` (bounded by out_len), or NGX_ERROR.
+     * Phase 1 implements both emitters when the store lands.
      */
     ssize_t    (*wire_prologue)(void *bctx, u_char *out, size_t out_len);
 

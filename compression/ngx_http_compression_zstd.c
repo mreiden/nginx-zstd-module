@@ -154,7 +154,10 @@ static ngx_http_compression_backend_t  ngx_http_compression_zstd_backend = {
     ngx_http_compression_zstd_create,
     ngx_http_compression_zstd_hint_input_size,
     ngx_http_compression_zstd_attach_dictionary,
-    NULL,                                   /* dcz is a plain zstd frame */
+    NULL,       /* PHASE1: dcz's 40-byte skippable-frame prologue
+                 * (magic 0x184D2A5E + size + SHA-256) lands here with
+                 * the store — libzstd will not emit it; refPrefix is
+                 * transparent (review round 1) */
     ngx_http_compression_zstd_process,
     ngx_http_compression_zstd_out_size,
 };

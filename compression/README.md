@@ -17,10 +17,16 @@ not this code. Directives implemented: `compression on|off`,
 unknown or duplicate = config error; the list is the enable set),
 `compression_min_length`, `compression_types`.
 
-Build (needs system libzstd + libbrotli):
+Build (needs system libzstd + libbrotli, nginx >= 1.23.0):
 
 ```bash
 ./configure --add-module=/path/to/nginx-zstd-module/compression
 ```
+
+Works with and without the core gzip module: gzip-less builds do their
+own Accept-Encoding lookup, push their own `Vary: Accept-Encoding`,
+and reject the `gzip` order token at config load. With gzip present,
+Vary is delegated via `r->gzip_vary` — which the core emits only under
+`gzip_vary on`, so the module warns at config load when that is off.
 
 [myguard-labs/nginx-zstd-module#109]: https://github.com/myguard-labs/nginx-zstd-module/issues/109

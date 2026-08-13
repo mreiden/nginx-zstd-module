@@ -1,9 +1,19 @@
 /*
- * Accept-Encoding parsing per RFC 9110 §12.5.3 / §12.4.2 — lifted from
- * nginx-zstd-module's ngx_http_zstd_common.h, where the walker was
- * already token-parameterized and fuzz-hardened (differential oracle;
- * quoted-string, stray-comma, malformed-qvalue cases). Only the name
- * prefix changed. Strictly length-bounded, never NUL-reliant.
+ * Accept-Encoding VALUE parsing per RFC 9110 §12.5.3 / §12.4.2 —
+ * lifted from nginx-zstd-module's ngx_http_zstd_common.h, where the
+ * walker was already token-parameterized and fuzz-hardened
+ * (differential oracle; quoted-string, stray-comma, malformed-qvalue
+ * cases). Only the name prefix changed. Strictly length-bounded,
+ * never NUL-reliant.
+ *
+ * Scope (review round 1): the caller hands this ONE field line — the
+ * first Accept-Encoding header — not the RFC 9110 §5.2 combination of
+ * every AE line in the request. That is deliberate core-gzip parity:
+ * ngx_http_gzip_ok() reads only the first line too, and the defer
+ * decision must match what the core filter will conclude, or a
+ * multi-line request could be deferred to a gzip that then declines.
+ * Walking the ->next chain as a combined field is a productization
+ * item, to be taken only together with the defer story.
  *
  * Weight semantics: an explicit token always decides (even q=0, which
  * then overrides a permissive "*"); with no explicit token the "*"

@@ -95,6 +95,76 @@ Reading file bufs (sendfile-backed responses) needs the same handling
 the core gzip filter has, entirely in the shared body-filter chassis —
 no backend hook required. Phase-0 rejects file bufs loudly instead.
 
+## Review round 1 (PR #117) — wrinkles found by reading, not building
+
+### 10. The gzip cooperation is OPTIONAL-module territory
+
+`r->gzip_vary`, `r->gzip_tested`, `r->gzip_ok`, and even
+`r->headers_in.accept_encoding` exist only under `#if (NGX_HTTP_GZIP)`
+in `ngx_http_request.h` — a `--without-http_gzip_module` build got six
+compile errors. The sneaky half: **`--with-compat` forces
+`NGX_HTTP_GZIP=1`**, so any compat CI build is structurally incapable
+of catching this; the gzip-less build shape must be tested explicitly
+and without `--with-compat`. Fixed with guards: gzip-less builds do
+their own Accept-Encoding lookup (first header, same parity), push
+their own literal `Vary: Accept-Encoding` (no flag, no core emitter to
+delegate to), and reject the `gzip` order token at config load
+("requires nginx built with ngx_http_gzip_module") — better than a
+token that silently means identity.
+
+### 11. Flag-delegated Vary is gated on `gzip_vary on` — whose default is off
+
+Setting `r->gzip_vary = 1` only *requests* emission; the core header
+filter emits solely when the `gzip_vary` directive is on. The phase-0
+validation matrix had `gzip_vary on` and never saw this — a
+default-config deployment behind a shared cache would store compressed
+responses with no Vary (the classic poisoning shape). Unlike the
+abandoned warning in #1, this one IS observable — `clcf->gzip_vary`
+is public core conf — so the module now warns at config load when
+`compression` is on and `gzip_vary` is off, same policy as the parent
+repo's modules. (PHASE0: per-location; productization collapses it
+into the #110-style per-module summary.)
+
+### 12. dcz has a wire prologue too — the earlier contract text was wrong
+
+RFC 9842's dcz is not "a plain zstd frame": it opens with a 40-byte
+zstd SKIPPABLE frame (magic `0x184D2A5E`, size `0x20`, the
+dictionary's SHA-256) that libzstd will not emit — `refPrefix` is
+transparent. The real asymmetry with dcb is who consumes the prologue
+(zstd decoders skip theirs natively; dcb clients must strip 36 raw
+bytes themselves), not whether one exists. Contract text corrected;
+phase 1 implements both emitters — or, since both prologues derive
+from {magic, hash}, moves emission into the chassis and deletes the
+hook. Decision deferred to phase 1 with the store.
+
+### 13. Defer/veto assumes this filter runs before core gzip
+
+True for the default `--add-(dynamic-)module` placement (addon filters
+register after core filters and therefore run earlier), but dynamic
+module load order can invert it. Failure shape when inverted: core
+gzip's filter sees the response first and may compress it before the
+election ever runs — the order list is silently ignored for
+gzip-accepting clients, not broken outright. Productization needs the
+ordering pinned (static builds can order explicitly; dynamic builds
+document the load_module requirement, as the parent repo already does
+for zstd-vs-brotli ordering).
+
+### Fixed outright in the same round
+
+An exactly-buffer-boundary FINISH double-fired the op (ship-then-loop
+re-entered a finished encoder; zstd appends an empty frame, brotli
+hard-errors) — the completion check now precedes the full-buffer ship,
+flags riding whatever buffer the op ended in. Consumed input chain
+links are freed instead of accumulating for the request's lifetime.
+Special bufs no longer take NULL-pointer arithmetic through their
+cursors. The header filter sets `r->main_filter_need_in_memory` so the
+in-memory-only cut can't truncate a sendfile response after headers.
+The version floor is enforced at compile time: 1.23.0
+(`ngx_table_elt_t.next`), not the 1.9.11 the config script claimed.
+The AE parser's header now states its actual scope (one field line —
+deliberate core-gzip parity so the defer decision matches what core
+gzip concludes) rather than implying combined-field coverage.
+
 ## Phase-0 shortcuts (not findings — deliberate scope cuts)
 
 status set is 200-only (real module inherits the zstd filter's set);

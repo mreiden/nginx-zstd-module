@@ -126,6 +126,50 @@ static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 static ngx_str_t  ngx_http_compression_gzip_token = ngx_string("gzip");
 
 
+#if !(NGX_HTTP_GZIP)
+/*
+ * Without the gzip module there is no r->headers_in.accept_encoding —
+ * that field, like r->gzip_vary/gzip_tested/gzip_ok, lives inside
+ * #if (NGX_HTTP_GZIP) in ngx_http_request.h (review round 1; the
+ * sneaky part being that --with-compat forces NGX_HTTP_GZIP=1, so
+ * compat CI builds can never catch a gzip-less break). Find the
+ * header ourselves; FIRST match only, same parity as the gzip-built
+ * path (see ngx_http_compression_ae.h on why).
+ */
+static ngx_table_elt_t *
+ngx_http_compression_accept_encoding(ngx_http_request_t *r)
+{
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].key.len == sizeof("Accept-Encoding") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Accept-Encoding",
+                               sizeof("Accept-Encoding") - 1) == 0)
+        {
+            return &h[i];
+        }
+    }
+
+    return NULL;
+}
+#endif
+
+
 static ngx_int_t
 ngx_http_compression_add_backends(ngx_conf_t *cf)
 {
@@ -224,12 +268,43 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
         }
         t->backend = ngx_http_compression_backend_brotli;
 
+#if (NGX_HTTP_GZIP)
+        /* the gzip token joins the default only when there is a core
+         * gzip filter to defer to */
         t = ngx_array_push(conf->order);
         if (t == NULL) {
             return NGX_CONF_ERROR;
         }
-        t->backend = NULL;      /* the gzip token */
+        t->backend = NULL;
+#endif
     }
+
+#if (NGX_HTTP_GZIP)
+    /*
+     * Setting r->gzip_vary only REQUESTS Vary: Accept-Encoding; the
+     * core header filter emits it solely when the gzip_vary directive
+     * is on — and its default is off (review round 1: the live matrix
+     * had gzip_vary on and never saw this). Without it a shared cache
+     * stores a zstd response with no Vary and serves it to clients
+     * that cannot decode it. clcf->gzip_vary IS observable (core loc
+     * conf, public — contrast WRINKLES #1's abandoned warning about
+     * the gzip module's private conf), so warn like the parent repo
+     * does. PHASE0: per-location; productization collapses this into
+     * the #110-style per-module summary.
+     */
+    if (conf->enable) {
+        ngx_http_core_loc_conf_t  *clcf;
+
+        clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+        if (clcf != NULL && !clcf->gzip_vary) {
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "compression is enabled but \"gzip_vary\" is "
+                               "off; add \"gzip_vary on\" or shared caches "
+                               "may serve compressed responses to clients "
+                               "that cannot decode them");
+        }
+    }
+#endif
 
     return NGX_CONF_OK;
 }
@@ -266,7 +341,16 @@ ngx_http_compression_order(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            ngx_http_compression_gzip_token.data,
                            value[i].len) == 0)
         {
+#if (NGX_HTTP_GZIP)
             /* gzip: valid token, no backend — defer/veto semantics */
+#else
+            /* nothing to defer to: better a config error than a token
+             * that silently means "identity" */
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"gzip\" in \"compression_order\" requires "
+                               "nginx built with ngx_http_gzip_module");
+            return NGX_CONF_ERROR;
+#endif
 
         } else {
             for (k = 0; ngx_http_compression_backends[k]; k++) {
@@ -317,7 +401,10 @@ static ngx_int_t
 ngx_http_compression_header_filter(ngx_http_request_t *r)
 {
     ngx_int_t                        w;
-    ngx_uint_t                       i, gzip_listed;
+    ngx_uint_t                       i;
+#if (NGX_HTTP_GZIP)
+    ngx_uint_t                       gzip_listed;
+#endif
     ngx_table_elt_t                 *ae;
     ngx_http_compression_ctx_t      *ctx;
     ngx_http_compression_conf_t     *conf;
@@ -348,27 +435,54 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     }
 
     /*
-     * Vary before any accept decision, so identity fallbacks vary too;
-     * emission is delegated to nginx's own writers (h1/h2/h3) via the
-     * core gzip_vary mechanism — the module never pushes a literal
-     * Vary: Accept-Encoding. (And the compression_vary module keys on
-     * exactly this flag; the cooperation is free.)
+     * Vary before any accept decision, so identity fallbacks vary too.
+     * With the gzip module present, emission is delegated to nginx's
+     * own writers (h1/h2/h3) via the r->gzip_vary mechanism — the
+     * module never pushes a literal Vary: Accept-Encoding itself, and
+     * the compression_vary module's cooperation (it keys on this flag)
+     * comes free. NOTE the emission is still gated on "gzip_vary on";
+     * merge_conf warns when it is off (review round 1). Without the
+     * gzip module neither the flag nor the core emitter exists, so
+     * push the header ourselves.
      */
+#if (NGX_HTTP_GZIP)
     r->gzip_vary = 1;
 
     ae = r->headers_in.accept_encoding;
+#else
+    {
+        ngx_table_elt_t  *v;
+
+        v = ngx_list_push(&r->headers_out.headers);
+        if (v == NULL) {
+            return NGX_ERROR;
+        }
+        v->hash = 1;
+        v->next = NULL;
+        ngx_str_set(&v->key, "Vary");
+        ngx_str_set(&v->value, "Accept-Encoding");
+    }
+
+    ae = ngx_http_compression_accept_encoding(r);
+#endif
+
     if (ae == NULL || ae->value.len == 0) {
         return ngx_http_next_header_filter(r);
     }
 
     elected = NULL;
+#if (NGX_HTTP_GZIP)
     gzip_listed = 0;
+#endif
 
     t = conf->order->elts;
 
     for (i = 0; i < conf->order->nelts; i++) {
 
         if (t[i].backend == NULL) {
+            /* without the gzip module this token cannot exist — the
+             * order parser rejects it at config load */
+#if (NGX_HTTP_GZIP)
             gzip_listed = 1;
 
             w = ngx_http_compression_coding_weight(
@@ -385,7 +499,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
                  */
                 return ngx_http_next_header_filter(r);
             }
-
+#endif
             continue;
         }
 
@@ -398,6 +512,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     }
 
     if (elected == NULL) {
+#if (NGX_HTTP_GZIP)
         /*
          * VETO: the election concluded and gzip was absent from the
          * list — gzip is genuinely off for this response, latch so the
@@ -409,6 +524,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
             r->gzip_tested = 1;
             r->gzip_ok = 0;
         }
+#endif
         return ngx_http_next_header_filter(r);
     }
 
@@ -445,9 +561,21 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
 
     ngx_http_set_ctx(r, ctx, ngx_http_compression_module);
 
+    /*
+     * The copy filter must hand the body filter memory buffers —
+     * without this, sendfile-backed responses arrive as file bufs and
+     * the (deliberate) in-memory-only cut used to fire AFTER the
+     * compressed headers had gone out, truncating the response
+     * instead of failing cleanly (review round 1). Same line core
+     * gzip uses.
+     */
+    r->main_filter_need_in_memory = 1;
+
+#if (NGX_HTTP_GZIP)
     /* we compress: the core gzip filter must stand down */
     r->gzip_tested = 1;
     r->gzip_ok = 0;
+#endif
 
     r->headers_out.content_encoding =
         ngx_list_push(&r->headers_out.headers);
@@ -499,10 +627,11 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         b = ctx->in->buf;
 
         /*
-         * PHASE0: in-memory bufs only. A real module reads file bufs
-         * the way the core gzip filter does (wrinkle #9: the chassis,
-         * not the interface, owns that complexity — no backend hook
-         * needed).
+         * PHASE0: in-memory bufs only (wrinkle #9: chassis complexity,
+         * no backend hook needed). Belt only — the header filter sets
+         * r->main_filter_need_in_memory, so the copy filter converts
+         * file bufs before they reach here; if this fires, that
+         * contract broke upstream of us.
          */
         if (b->in_file && !ngx_buf_in_memory(b)) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -516,15 +645,17 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
         for ( ;; ) {
 
-            if (ctx->ob == NULL) {
-                ctx->ob = ngx_create_temp_buf(r->pool, ctx->out_size);
-                if (ctx->ob == NULL) {
-                    return NGX_ERROR;
-                }
-                ctx->ob->tag = (ngx_buf_tag_t) &ngx_http_compression_module;
-            }
+            size_t  data;
 
-            if (b->pos < b->last) {
+            /*
+             * Special bufs (flags only) have pos == last == NULL, and
+             * NULL pointer arithmetic is UB even when the difference
+             * would be zero (review round 1) — gate on
+             * ngx_buf_in_memory before touching the cursors.
+             */
+            data = ngx_buf_in_memory(b) ? (size_t) (b->last - b->pos) : 0;
+
+            if (data > 0) {
                 op = NGX_HTTP_COMPRESSION_OP_PROCESS;
             } else if (last_seen) {
                 op = NGX_HTTP_COMPRESSION_OP_FINISH;
@@ -534,9 +665,19 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 break;      /* buf drained, no flags: next link */
             }
 
+            if (ctx->ob == NULL) {
+                ctx->ob = ngx_create_temp_buf(r->pool, ctx->out_size);
+                if (ctx->ob == NULL) {
+                    return NGX_ERROR;
+                }
+                ctx->ob->tag = (ngx_buf_tag_t) &ngx_http_compression_module;
+            }
+
             ngx_memzero(&io, sizeof(io));
-            io.in = b->pos;
-            io.in_len = b->last - b->pos;
+            if (data > 0) {
+                io.in = b->pos;
+                io.in_len = data;
+            }
             io.out = ctx->ob->last;
             io.out_len = ctx->ob->end - ctx->ob->last;
 
@@ -544,34 +685,22 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 return NGX_ERROR;
             }
 
-            b->pos += io.in_consumed;
+            if (io.in_consumed > 0) {
+                b->pos += io.in_consumed;
+            }
             ctx->ob->last += io.out_produced;
 
-            if (ctx->ob->last == ctx->ob->end) {
-                /* output space exhausted: ship it, keep stepping */
-                cl = ngx_alloc_chain_link(r->pool);
-                if (cl == NULL) {
-                    return NGX_ERROR;
-                }
-                cl->buf = ctx->ob;
-                cl->next = NULL;
-                *last_out = cl;
-                last_out = &cl->next;
-                ctx->ob = NULL;
-                continue;
-            }
-
-            if (op == NGX_HTTP_COMPRESSION_OP_PROCESS) {
-                if (io.done && b->pos == b->last
-                    && !last_seen && !flush_seen)
-                {
-                    break;                      /* next link */
-                }
-                continue;
-            }
-
-            if (io.done) {
-                /* FLUSH or FINISH completed into ctx->ob */
+            /*
+             * ORDER MATTERS (review round 1's double-FINISH): the
+             * completion check must run BEFORE the full-buffer ship.
+             * When a FINISH lands its last byte exactly at ob->end,
+             * shipping first and looping used to call FINISH again on
+             * a finished encoder — zstd silently appends an empty
+             * frame, brotli hard-errors mid-response. done means done:
+             * the flags ride whatever buffer the op ended in, full or
+             * not.
+             */
+            if (io.done && op != NGX_HTTP_COMPRESSION_OP_PROCESS) {
                 ngx_buf_t  *ob;
 
                 if (op == NGX_HTTP_COMPRESSION_OP_FINISH) {
@@ -614,9 +743,36 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 last_seen = 0;
                 break;
             }
+
+            if (ctx->ob->last == ctx->ob->end) {
+                /* output space exhausted mid-op: ship it, keep
+                 * stepping the SAME op per the vtable contract */
+                cl = ngx_alloc_chain_link(r->pool);
+                if (cl == NULL) {
+                    return NGX_ERROR;
+                }
+                cl->buf = ctx->ob;
+                cl->next = NULL;
+                *last_out = cl;
+                last_out = &cl->next;
+                ctx->ob = NULL;
+            }
+
+            /* PROCESS with io.done falls through to the op
+             * recomputation above: input drained → flags or next
+             * link; io.done == 0 → step the same op again with
+             * fresh output space */
         }
 
-        ctx->in = ctx->in->next;
+        /*
+         * Link consumed: free it (review round 1 — these used to
+         * accumulate for the request's lifetime; core gzip frees them
+         * too, and this is separate from the declared no-recycling
+         * cut, which is about OUTPUT bufs).
+         */
+        cl = ctx->in;
+        ctx->in = cl->next;
+        ngx_free_chain(r->pool, cl);
     }
 
     if (out == NULL) {
