@@ -1,0 +1,33 @@
+# nginx-compression phase-0 prototype build glue.
+#
+# PROTOTYPE-GRADE ON PURPOSE: links system libzstd + libbrotli
+# unconditionally, no feature probes, no bundled fallbacks, no MSVC.
+# The production build system inherits the hardened auto/zstd patterns
+# from nginx-zstd-module (bare-directory ngx_module_incs — the
+# never-applied-include lesson — pkg-config -I stripping, EVP
+# detection); reproducing them here would just dilute the phase-0
+# deliverable, which is the backend interface.
+
+ngx_addon_name=ngx_http_compression_module
+
+if test -n "$ngx_module_link"; then
+    ngx_module_type=HTTP_FILTER
+    ngx_module_name=ngx_http_compression_module
+    ngx_module_incs=
+    ngx_module_deps="$ngx_addon_dir/ngx_http_compression.h \
+                     $ngx_addon_dir/ngx_http_compression_ae.h"
+    ngx_module_srcs="$ngx_addon_dir/ngx_http_compression_module.c \
+                     $ngx_addon_dir/ngx_http_compression_zstd.c \
+                     $ngx_addon_dir/ngx_http_compression_brotli.c"
+    ngx_module_libs="-lzstd -lbrotlienc -lbrotlicommon"
+
+    . auto/module
+else
+    cat << END
+
+$0: error: the nginx-compression prototype requires nginx >= 1.9.11
+(the dynamic-modules build system).
+
+END
+    exit 1
+fi
