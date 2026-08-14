@@ -157,7 +157,9 @@ static ngx_http_compression_backend_t  ngx_http_compression_zstd_backend = {
     NULL,       /* PHASE1: dcz's 40-byte skippable-frame prologue
                  * (magic 0x184D2A5E + size + SHA-256) lands here with
                  * the store — libzstd will not emit it; refPrefix is
-                 * transparent (review round 1) */
+                 * transparent (review round 1). NULL keeps "dcz"
+                 * UNELECTABLE until then (the election gates dict
+                 * codings on wire_prologue != NULL) */
     ngx_http_compression_zstd_process,
     ngx_http_compression_zstd_out_size,
 };

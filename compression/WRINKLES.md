@@ -64,12 +64,16 @@ one side can't honour.
 
 ## 6. RFC 9842's framing asymmetry costs exactly one nullable hook
 
-dcb prepends a 36-byte magic+SHA-256 prologue the brotli decoder does
-not consume; dcz is a plain zstd frame. `wire_prologue` (nullable)
-absorbs it; nothing else in the chassis cares. The dictionary seam
-otherwise matches the load-bearing claim: backends receive raw bytes
-per request (`attach_dictionary`), zstd referencing them in place —
-the store's "raw bytes + sha256 only" ownership model held.
+Both dict codings prepend a magic+SHA-256 prologue (dcb: 36 raw bytes
+the brotli decoder does not consume; dcz: a 40-byte zstd skippable
+frame the decoder skips natively — see 12, which corrected this
+section's original "dcz is a plain frame" claim). They differ in who
+consumes the prologue, not whether one exists. `wire_prologue`
+(nullable; NULL = the dict coding is unelectable) absorbs both;
+nothing else in the chassis cares. The dictionary seam otherwise
+matches the load-bearing claim: backends receive raw bytes per request
+(`attach_dictionary`), zstd referencing them in place — the store's
+"raw bytes + sha256 only" ownership model held.
 
 ## 7. gzip genuinely never needed a backend slot — defer/veto validated live
 

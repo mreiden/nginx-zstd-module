@@ -227,7 +227,9 @@ static ngx_http_compression_backend_t  ngx_http_compression_brotli_backend = {
     ngx_http_compression_brotli_hint_input_size,
     ngx_http_compression_brotli_attach_dictionary,
     NULL,       /* dcb's 36-byte prologue lands here in phase 1 —
-                 * slot exists, emitter comes with the store */
+                 * slot exists, emitter comes with the store. NULL
+                 * keeps "dcb" UNELECTABLE until then (the election
+                 * gates dict codings on wire_prologue != NULL) */
     ngx_http_compression_brotli_process,
     ngx_http_compression_brotli_out_size,
 };

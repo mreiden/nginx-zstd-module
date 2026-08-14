@@ -46,6 +46,11 @@ typedef struct {
     ngx_buf_t                       *ob;        /* current output buf */
     size_t                           out_size;
     unsigned                         done:1;
+    unsigned                         started:1; /* encoder has consumed
+                                                 * input: it (and maybe
+                                                 * ctx->ob) holds bytes
+                                                 * until FINISH drains —
+                                                 * drives r->buffered */
 } ngx_http_compression_ctx_t;
 
 
@@ -687,6 +692,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             if (io.in_consumed > 0) {
                 b->pos += io.in_consumed;
+                ctx->started = 1;
             }
             ctx->ob->last += io.out_produced;
 
@@ -775,7 +781,37 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         ngx_free_chain(r->pool, cl);
     }
 
+    /*
+     * Publish held state (review round 2): after a PROCESS-only
+     * invocation the response's bytes live in ctx->ob AND inside the
+     * encoder — both libraries buffer internally — while this filter
+     * returns without sending anything downstream. Without a buffered
+     * bit, ngx_http_writer and finalization can treat the response as
+     * idle and stall it until the send timeout. `started` (not just
+     * ctx->ob content) drives the bit because encoder-internal state
+     * is held data too, and it only fully drains at FINISH. PHASE0:
+     * reuses the core gzip bit — defined in every build, and the
+     * elected path latches core gzip off so the owners can never
+     * overlap; a dedicated bit ships with productization.
+     */
+    if (ctx->done) {
+        r->buffered &= ~NGX_HTTP_GZIP_BUFFERED;
+
+    } else if (ctx->started
+               || (ctx->ob != NULL && ctx->ob->last != ctx->ob->pos))
+    {
+        r->buffered |= NGX_HTTP_GZIP_BUFFERED;
+    }
+
     if (out == NULL) {
+        if (in == NULL) {
+            /*
+             * Writer-driven pass (review round 2): nothing of ours to
+             * emit, but the chain below may hold undelivered output —
+             * forward the poke instead of reporting idle.
+             */
+            return ngx_http_next_body_filter(r, NULL);
+        }
         return NGX_OK;
     }
 
