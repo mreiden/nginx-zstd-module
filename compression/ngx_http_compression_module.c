@@ -8,6 +8,7 @@
 
 #include "ngx_http_compression.h"
 #include "ngx_http_compression_ae.h"
+#include "ngx_http_compression_dict.h"
 
 
 extern ngx_http_compression_backend_t  *ngx_http_compression_backend_zstd;
@@ -36,6 +37,14 @@ typedef struct {
     ngx_hash_t     types;
     ngx_array_t   *types_keys;
     ngx_array_t   *order;          /* of ngx_http_compression_token_t */
+
+    /*
+     * PHASE1a: this level's active dictionaries — pointers into the
+     * cycle-global store (see ngx_http_compression_dict.h). Loaded,
+     * deduped, and rule-checked at config parse; read by nobody until
+     * phase 1b wires negotiation. NULL = inherit.
+     */
+    ngx_array_t   *dicts;          /* of ngx_http_compression_dict_t * */
 } ngx_http_compression_conf_t;
 
 
@@ -55,6 +64,7 @@ typedef struct {
 
 
 static ngx_int_t ngx_http_compression_add_backends(ngx_conf_t *cf);
+static void *ngx_http_compression_create_main_conf(ngx_conf_t *cf);
 static void *ngx_http_compression_create_conf(ngx_conf_t *cf);
 static char *ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -96,6 +106,13 @@ static ngx_command_t  ngx_http_compression_commands[] = {
       offsetof(ngx_http_compression_conf_t, types_keys),
       &ngx_http_html_default_types[0] },
 
+    { ngx_string("compression_dict_file"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE12,
+      ngx_http_compression_dict_file,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_compression_conf_t, dicts),
+      NULL },
+
     ngx_null_command
 };
 
@@ -104,7 +121,7 @@ static ngx_http_module_t  ngx_http_compression_module_ctx = {
     ngx_http_compression_add_backends,     /* preconfiguration */
     ngx_http_compression_init,             /* postconfiguration */
 
-    NULL,                                  /* create main configuration */
+    ngx_http_compression_create_main_conf, /* create main configuration */
     NULL,                                  /* init main configuration */
 
     NULL,                                  /* create server configuration */
@@ -188,7 +205,30 @@ ngx_http_compression_add_backends(ngx_conf_t *cf)
     ngx_http_compression_backends[0] = ngx_http_compression_backend_zstd;
     ngx_http_compression_backends[1] = ngx_http_compression_backend_brotli;
 
-    return NGX_OK;
+    return ngx_http_compression_dict_add_variables(cf);
+}
+
+
+static void *
+ngx_http_compression_create_main_conf(ngx_conf_t *cf)
+{
+    ngx_http_compression_main_conf_t  *cmcf;
+
+    cmcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_compression_main_conf_t));
+    if (cmcf == NULL) {
+        return NULL;
+    }
+
+    if (ngx_array_init(&cmcf->store, cf->pool, 4,
+                       sizeof(ngx_http_compression_dict_t *))
+        != NGX_OK)
+    {
+        return NULL;
+    }
+
+    /* pcalloc zeroes dicts_hashed — cycle-owned, no reset hook */
+
+    return cmcf;
 }
 
 
@@ -250,6 +290,17 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (conf->order == NULL) {
         conf->order = prev->order;
+    }
+
+    /*
+     * A level that declares its own compression_dict_file list
+     * replaces the inherited one WHOLESALE (the RFC's alias-merge
+     * rule; standard array-directive semantics). The pointers target
+     * the cycle-global store either way — inheritance shares entries,
+     * never bytes.
+     */
+    if (conf->dicts == NULL) {
+        conf->dicts = prev->dicts;
     }
 
     if (conf->order == NULL) {

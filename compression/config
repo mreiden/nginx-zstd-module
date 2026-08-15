@@ -15,8 +15,11 @@ if test -n "$ngx_module_link"; then
     ngx_module_name=ngx_http_compression_module
     ngx_module_incs=
     ngx_module_deps="$ngx_addon_dir/ngx_http_compression.h \
-                     $ngx_addon_dir/ngx_http_compression_ae.h"
+                     $ngx_addon_dir/ngx_http_compression_ae.h \
+                     $ngx_addon_dir/ngx_http_compression_dict.h \
+                     $ngx_addon_dir/../ngx_http_zstd_sha256.h"
     ngx_module_srcs="$ngx_addon_dir/ngx_http_compression_module.c \
+                     $ngx_addon_dir/ngx_http_compression_dict.c \
                      $ngx_addon_dir/ngx_http_compression_zstd.c \
                      $ngx_addon_dir/ngx_http_compression_brotli.c"
     ngx_module_libs="-lzstd -lbrotlienc -lbrotlicommon"

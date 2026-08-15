@@ -169,6 +169,30 @@ The AE parser's header now states its actual scope (one field line —
 deliberate core-gzip parity so the defer decision matches what core
 gzip concludes) rather than implying combined-field coverage.
 
+## Phase 1a — the store's own findings
+
+### 14. Store entries must be pointer-stable, and the API shape almost wasn't
+
+First cut held `ngx_http_compression_dict_t` VALUES in the store
+array while per-location lists aliased them — and `ngx_array_push()`
+relocates element storage on growth, so every alias went stale the
+moment a fifth dictionary loaded. Latent in 1a (nothing reads the
+lists yet), lethal in 1b. Caught while writing the store's own
+documentation, pinned by the six-dict growth test (a duplicate
+re-declaration after forced growth: pointer-compare against a stale
+alias silently accepts; the pointer-store errors). Entry objects are
+now individually allocated; the array holds only pointers.
+
+### 15. "Supplied never satisfies unsupplied" buys a free audit
+
+The RFC rule mandates a computation whenever an unsupplied directive
+references a path whose entry knows only a verbatim hash. Since that
+pass is paid for regardless, comparing it against the supplied value
+costs nothing — and catches exactly the stale-supplied-hash hazard
+(deploy script hashed an older file) that verbatim trust cannot see.
+A mismatch is a config error naming the hazard. This slightly exceeds
+the RFC text, in the safe direction; the doc should adopt it.
+
 ## Phase-0 shortcuts (not findings — deliberate scope cuts)
 
 status set is 200-only (real module inherits the zstd filter's set);
