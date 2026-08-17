@@ -88,7 +88,49 @@ ngx_http_compression_zstd_attach_dictionary(void *bctx, ngx_str_t *raw)
     if (ZSTD_isError(ZSTD_CCtx_refPrefix(z->cctx, raw->data, raw->len))) {
         return NGX_ERROR;
     }
+
+    /*
+     * Content checksum on dictionary-compressed frames (parent repo
+     * #102, defence in depth): a client decoding against the WRONG
+     * dictionary bytes can otherwise succeed silently with corrupt
+     * output — the checksum converts that into a visible decode
+     * error for ~4 bytes per response. Set here rather than at
+     * create() so plain-zstd responses keep the parent module's
+     * bare-frame behavior.
+     */
+    if (ZSTD_isError(ZSTD_CCtx_setParameter(z->cctx, ZSTD_c_checksumFlag,
+                                            1)))
+    {
+        return NGX_ERROR;
+    }
+
     return NGX_OK;
+}
+
+
+static ssize_t
+ngx_http_compression_zstd_wire_prologue(void *bctx,
+    const u_char *dict_sha256, u_char *out, size_t out_len)
+{
+    (void) bctx;
+
+    /*
+     * RFC 9842 §2.2: dcz opens with a 40-byte zstd SKIPPABLE frame —
+     * magic 0x184D2A5E and the 32-byte content size, both little-
+     * endian, then the dictionary's SHA-256. A zstd decoder skips it
+     * natively (which is why the phase-0 contract text got away with
+     * calling dcz "a plain frame" for as long as it did); libzstd
+     * will not emit it.
+     */
+    if (out_len < 40) {
+        return NGX_ERROR;
+    }
+
+    out[0] = 0x5e; out[1] = 0x2a; out[2] = 0x4d; out[3] = 0x18;
+    out[4] = 0x20; out[5] = 0x00; out[6] = 0x00; out[7] = 0x00;
+    ngx_memcpy(out + 8, dict_sha256, 32);
+
+    return 40;
 }
 
 
@@ -154,12 +196,7 @@ static ngx_http_compression_backend_t  ngx_http_compression_zstd_backend = {
     ngx_http_compression_zstd_create,
     ngx_http_compression_zstd_hint_input_size,
     ngx_http_compression_zstd_attach_dictionary,
-    NULL,       /* PHASE1: dcz's 40-byte skippable-frame prologue
-                 * (magic 0x184D2A5E + size + SHA-256) lands here with
-                 * the store — libzstd will not emit it; refPrefix is
-                 * transparent (review round 1). NULL keeps "dcz"
-                 * UNELECTABLE until then (the election gates dict
-                 * codings on wire_prologue != NULL) */
+    ngx_http_compression_zstd_wire_prologue,
     ngx_http_compression_zstd_process,
     ngx_http_compression_zstd_out_size,
 };

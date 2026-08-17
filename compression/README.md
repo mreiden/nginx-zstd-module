@@ -36,10 +36,18 @@ Vary is delegated via `r->gzip_vary` — which the core emits only under
 cycle-global store regardless of how many levels reference them), the
 RFC's provenance rules enforced at config load, and
 `$compression_dicts_hashed` as the observable witness for the dedup
-and the supplied-hash fast path. Dictionary codings remain unelectable
-until phase 1b wires negotiation and the prologue emitters. The branch
-also now carries the full ngx_brotli hardened-fork history under
-`brotli/` (subtree merge; the fork point is the merge's second
-parent).
+and the supplied-hash fast path. The branch also carries the full
+ngx_brotli hardened-fork history under `brotli/` (subtree merge; the
+fork point is the merge's second parent).
+
+**Phase 1b** makes the dictionary codings real: RFC 9842
+Available-Dictionary negotiation against the store (RFC 8941 byte
+sequence, strict shape), per-backend wire-prologue emitters (dcz's
+40-byte skippable frame with a checksummed stream; dcb's 36 raw
+bytes), election of `dcz`/`dcb` at their base coding's position on an
+explicit Accept-Encoding token only (`*` never elects them), graceful
+degrade to the base coding on any negotiation miss, and a hoisted
+`Vary: Available-Dictionary` on every eligible response wherever
+dictionaries are configured — identity fallbacks included.
 
 [myguard-labs/nginx-zstd-module#109]: https://github.com/myguard-labs/nginx-zstd-module/issues/109

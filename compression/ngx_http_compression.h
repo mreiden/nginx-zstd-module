@@ -150,24 +150,28 @@ struct ngx_http_compression_backend_s {
     ngx_int_t  (*attach_dictionary)(void *bctx, ngx_str_t *raw);
 
     /*
-     * Wire prologue BEFORE the first encoder byte. Both dict codings
-     * need one — see dict_coding above for the corrected framing
-     * details — and neither library emits it (zstd's refPrefix is
-     * transparent; brotli's header is outside the stream). Returns
-     * the number of bytes written into `out` (bounded by out_len),
-     * or NGX_ERROR.
+     * Wire prologue BEFORE the first encoder byte, from the elected
+     * dictionary's SHA-256. Both dict codings need one — see
+     * dict_coding above — and neither library emits it (zstd's
+     * refPrefix is transparent; brotli's header is outside the
+     * stream). Returns the number of bytes written into `out`
+     * (bounded by out_len), or NGX_ERROR.
      *
-     * NULL means the dictionary coding is NOT SERVABLE (review round
-     * 2): the prologue is mandatory on the wire, so the election MUST
-     * gate dict codings on `wire_prologue != NULL`, never on
-     * `dict_coding.len` alone — both backends currently name their
-     * coding while shipping no emitter, and a len-gated election
-     * would emit dcz/dcb responses no client could decode. Phase 1
-     * implements both emitters when the store lands (or moves
-     * emission into the chassis and deletes this hook — see
-     * dict_coding).
+     * SETTLED in phase 1b (the chassis-vs-backend question from
+     * round 1): emission stays per-backend. dcz's prologue is a
+     * VALID ZSTD SKIPPABLE FRAME — its shape (magic 0x184D2A5E,
+     * little-endian size word, then the hash) is zstd format
+     * knowledge; dcb's is raw out-of-band bytes the decoder never
+     * sees. A chassis emitter would need per-backend format
+     * descriptors, which is this hook wearing a struct costume.
+     *
+     * NULL still means the dictionary coding is NOT SERVABLE (review
+     * round 2): the prologue is mandatory on the wire, so the
+     * election gates dict codings on `wire_prologue != NULL`, never
+     * on `dict_coding.len` alone.
      */
-    ssize_t    (*wire_prologue)(void *bctx, u_char *out, size_t out_len);
+    ssize_t    (*wire_prologue)(void *bctx, const u_char *dict_sha256,
+                                u_char *out, size_t out_len);
 
     /*
      * The streaming step. See ngx_http_compression_io_t for the

@@ -193,6 +193,52 @@ costs nothing — and catches exactly the stale-supplied-hash hazard
 A mismatch is a config error naming the hazard. This slightly exceeds
 the RFC text, in the safe direction; the doc should adopt it.
 
+## Phase 1b — negotiation and the wire
+
+### 16. `ngx_base64_decoded_length()` is an upper bound, and it bit twice
+
+The Available-Dictionary value is an RFC 8941 Byte Sequence — base64
+of exactly 32 bytes, exactly 44 characters with one `=` pad. The
+first-cut validity check compared `ngx_base64_decoded_length(44)`
+against 32; the macro ignores padding and returns 33, so the check
+rejected EVERY valid header and all dict elections silently degraded
+to base codings. The failure was invisible to roundtrip-style tests
+(fallback still decodes fine) and was caught only when the matrix
+asserted the Content-Encoding per case — graceful-degrade negative
+paths need positive assertions or they hide. Second bite: the decode
+buffer must be sized by the macro's bound (33+), not the hash length —
+a pad-less 44-character value legitimately decodes to 33 bytes, and a
+32-byte buffer was a one-byte overflow awaiting a malicious header.
+Rule now in code: validate the ENCODED length (== 44), decode into a
+bound-sized buffer, then require the decoded length (== 32).
+
+### 17. Chassis-vs-backend prologue emission: SETTLED, per-backend
+
+The round-1 alternative (chassis emits both prologues from {magic,
+hash} descriptor fields) dies on inspection: dcz's prologue is a
+VALID ZSTD SKIPPABLE FRAME — magic and little-endian size word are
+zstd format knowledge — while dcb's is raw out-of-band bytes the
+decoder never sees. A chassis emitter needs per-backend format
+descriptors, which is the hook wearing a struct costume. The hook
+stays; the readiness gate (`wire_prologue != NULL`) now also covers
+capability holes for free — a libbrotli < 1.1 build simply cannot
+elect dcb.
+
+### Wire behavior pinned by the phase-1b matrix
+
+dcz = 40-byte skippable frame (`5e 2a 4d 18 20 00 00 00` + SHA-256)
+then a checksummed zstd frame (the parent's #102 defence-in-depth,
+set at attach so plain zstd keeps bare frames); dcb = 36 raw bytes
+(`ff 44 43 42` + SHA-256) the client strips. Dict codings elect only
+on an EXPLICIT Accept-Encoding token — `*` never elects them — and a
+client that accepts dcz without zstd still gets dcz. No match, wrong
+hash, or malformed header degrade to the base coding. Wherever
+dictionaries are configured, every eligible response varies on
+Available-Dictionary (module-pushed, both build shapes), identity
+included. Both codings verified byte-exact through the reference
+CLIs with the dictionary proven load-bearing (99 and 92 bytes for a
+19,400-byte fixture).
+
 ## Phase-0 shortcuts (not findings — deliberate scope cuts)
 
 status set is 200-only (real module inherits the zstd filter's set);

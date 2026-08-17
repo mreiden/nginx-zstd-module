@@ -54,12 +54,22 @@ typedef struct {
     ngx_chain_t                     *in;
     ngx_buf_t                       *ob;        /* current output buf */
     size_t                           out_size;
+
+    /*
+     * PHASE1b: the elected dictionary variant's wire prologue,
+     * prepared at election time and emitted ahead of the first
+     * encoder byte (40 bytes dcz, 36 dcb; 0 = base coding).
+     */
+    u_char                           prologue[40];
+    size_t                           prologue_len;
+
     unsigned                         done:1;
     unsigned                         started:1; /* encoder has consumed
                                                  * input: it (and maybe
                                                  * ctx->ob) holds bytes
                                                  * until FINISH drains —
                                                  * drives r->buffered */
+    unsigned                         prologue_sent:1;
 } ngx_http_compression_ctx_t;
 
 
@@ -146,6 +156,114 @@ static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 
 static ngx_str_t  ngx_http_compression_gzip_token = ngx_string("gzip");
+
+
+/*
+ * PHASE1b: RFC 9842 negotiation. The client names the dictionary it
+ * holds via Available-Dictionary — an RFC 8941 Byte Sequence, i.e.
+ * `:<base64 of the raw SHA-256>:` — and it matches (or doesn't)
+ * against this location's list of store entries. First match wins;
+ * the lists are short by construction (a handful of dictionaries per
+ * location), so a linear scan is the right tool.
+ */
+static ngx_http_compression_dict_t *
+ngx_http_compression_match_dict(ngx_http_request_t *r,
+    ngx_http_compression_conf_t *conf)
+{
+    /*
+     * Decode target: sized by ngx_base64_decoded_length(44) = 33, NOT
+     * by the hash length — the macro is an upper bound that ignores
+     * padding, and a pad-less 44-char value legitimately decodes to
+     * 33 bytes. Sizing this at 32 was a one-byte overflow waiting for
+     * a malicious header; the dst.len == 32 check below rejects that
+     * input AFTER it decoded safely.
+     */
+    u_char                         raw[36];
+    u_char                        *p, *last;
+    ngx_str_t                      b64, dst;
+    ngx_uint_t                     i;
+    ngx_list_part_t               *part;
+    ngx_table_elt_t               *h, *ad;
+    ngx_http_compression_dict_t  **list;
+
+    if (conf->dicts == NULL || conf->dicts->nelts == 0) {
+        return NULL;
+    }
+
+    /* no built-in field for Available-Dictionary: generic list walk */
+    ad = NULL;
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].key.len == sizeof("Available-Dictionary") - 1
+            && ngx_strncasecmp(h[i].key.data,
+                               (u_char *) "Available-Dictionary",
+                               sizeof("Available-Dictionary") - 1) == 0)
+        {
+            ad = &h[i];
+            break;
+        }
+    }
+
+    if (ad == NULL || ad->value.len == 0) {
+        return NULL;
+    }
+
+    /* strict RFC 8941 byte-sequence shape: OWS ":" base64 ":" OWS */
+    p = ad->value.data;
+    last = ad->value.data + ad->value.len;
+
+    while (p < last && (*p == ' ' || *p == '\t')) { p++; }
+    while (last > p && (last[-1] == ' ' || last[-1] == '\t')) { last--; }
+
+    if (last - p < 2 || *p != ':' || last[-1] != ':') {
+        return NULL;    /* malformed: negotiate nothing, serve base */
+    }
+
+    b64.data = p + 1;
+    b64.len = (last - 1) - (p + 1);
+
+    /*
+     * base64 of exactly 32 bytes is exactly 44 characters. Checked by
+     * ENCODED length, not ngx_base64_decoded_length() — that macro is
+     * an upper bound that ignores '=' padding (44 chars → 33), and
+     * comparing it against 32 rejected every valid header this
+     * negotiation exists to read (caught by the fallback matrix: all
+     * dict elections silently degraded to base codings).
+     */
+    if (b64.len != 44) {
+        return NULL;
+    }
+
+    dst.data = raw;
+    if (ngx_decode_base64(&dst, &b64) != NGX_OK
+        || dst.len != NGX_HTTP_COMPRESSION_SHA256_LEN)
+    {
+        return NULL;
+    }
+
+    list = conf->dicts->elts;
+    for (i = 0; i < conf->dicts->nelts; i++) {
+        if (ngx_memcmp(list[i]->sha256, raw,
+                       NGX_HTTP_COMPRESSION_SHA256_LEN) == 0)
+        {
+            return list[i];
+        }
+    }
+
+    return NULL;
+}
 
 
 #if !(NGX_HTTP_GZIP)
@@ -457,6 +575,7 @@ static ngx_int_t
 ngx_http_compression_header_filter(ngx_http_request_t *r)
 {
     ngx_int_t                        w;
+    ssize_t                          plen;
     ngx_uint_t                       i;
 #if (NGX_HTTP_GZIP)
     ngx_uint_t                       gzip_listed;
@@ -465,6 +584,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     ngx_http_compression_ctx_t      *ctx;
     ngx_http_compression_conf_t     *conf;
     ngx_http_compression_token_t    *t;
+    ngx_http_compression_dict_t     *dict, *elected_dict;
     ngx_http_compression_backend_t  *elected;
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_compression_module);
@@ -522,11 +642,40 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     ae = ngx_http_compression_accept_encoding(r);
 #endif
 
+    /*
+     * PHASE1b: wherever dictionaries are configured, EVERY eligible
+     * response varies on Available-Dictionary — which encoding a
+     * client receives depends on that header for every client, and a
+     * shared cache that failed to key on it could serve an
+     * undecodable dcz/dcb body to a dictionary-less client. Hoisted
+     * before the accept checks (identity fallbacks vary too), pushed
+     * literally by the module in both build shapes: unlike
+     * Accept-Encoding there is no core emitter to delegate to — this
+     * is the RFC's "Available-Dictionary stays module-pushed"
+     * decision in code.
+     */
+    if (conf->dicts != NULL && conf->dicts->nelts > 0) {
+        ngx_table_elt_t  *v;
+
+        v = ngx_list_push(&r->headers_out.headers);
+        if (v == NULL) {
+            return NGX_ERROR;
+        }
+        v->hash = 1;
+        v->next = NULL;
+        ngx_str_set(&v->key, "Vary");
+        ngx_str_set(&v->value, "Available-Dictionary");
+    }
+
     if (ae == NULL || ae->value.len == 0) {
         return ngx_http_next_header_filter(r);
     }
 
+    /* one store match serves every token the loop considers */
+    dict = ngx_http_compression_match_dict(r, conf);
+
     elected = NULL;
+    elected_dict = NULL;
 #if (NGX_HTTP_GZIP)
     gzip_listed = 0;
 #endif
@@ -557,6 +706,30 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
             }
 #endif
             continue;
+        }
+
+        /*
+         * PHASE1b: at each base token, the dictionary variant runs
+         * first. Electable iff the location matched the client's
+         * Available-Dictionary AND the backend is dict-ready
+         * (wire_prologue != NULL — the round-2 readiness gate) AND
+         * the client names the dict coding EXPLICITLY: a "*" wildcard
+         * must never elect dcz/dcb, since only a client that actually
+         * holds the dictionary can decode them (allow_wildcard=0).
+         * A client that accepts dcz but not zstd still gets dcz —
+         * it is the coding they asked for.
+         */
+        if (dict != NULL
+            && t[i].backend->dict_coding.len != 0
+            && t[i].backend->wire_prologue != NULL)
+        {
+            w = ngx_http_compression_coding_weight(
+                    &ae->value, &t[i].backend->dict_coding, 0);
+            if (w > 0) {
+                elected = t[i].backend;
+                elected_dict = dict;
+                break;
+            }
         }
 
         w = ngx_http_compression_coding_weight(&ae->value,
@@ -610,10 +783,29 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         }
     }
 
-    /* PHASE1 seam: dictionary negotiation would run here —
-     * Available-Dictionary against the shared store, then
-     * elected->attach_dictionary(ctx->bctx, raw) and the dict_coding
-     * Content-Encoding instead of the base one. */
+    if (elected_dict != NULL) {
+        /*
+         * The lifecycle invariant's last leg: attach AFTER the size
+         * hint, BEFORE the first process step. The backend receives
+         * raw bytes only — the store's ownership claim, load-bearing
+         * to the end — and the prologue derives from the entry's
+         * hash, prepared here and spent by the body filter ahead of
+         * the first encoder byte.
+         */
+        if (elected->attach_dictionary(ctx->bctx, &elected_dict->bytes)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        plen = elected->wire_prologue(ctx->bctx, elected_dict->sha256,
+                                      ctx->prologue,
+                                      sizeof(ctx->prologue));
+        if (plen == NGX_ERROR) {
+            return NGX_ERROR;
+        }
+        ctx->prologue_len = (size_t) plen;
+    }
 
     ngx_http_set_ctx(r, ctx, ngx_http_compression_module);
 
@@ -642,7 +834,8 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     r->headers_out.content_encoding->hash = 1;
     r->headers_out.content_encoding->next = NULL;
     ngx_str_set(&r->headers_out.content_encoding->key, "Content-Encoding");
-    r->headers_out.content_encoding->value = elected->coding;
+    r->headers_out.content_encoding->value =
+        (elected_dict != NULL) ? elected->dict_coding : elected->coding;
 
     ngx_http_clear_content_length(r);
     ngx_http_clear_accept_ranges(r);
@@ -677,6 +870,29 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
     out = NULL;
     last_out = &out;
+
+    /*
+     * PHASE1b: the dict coding's wire prologue rides ahead of the
+     * first encoder byte, in the same output buffer the first step
+     * fills (every backend's out_size dwarfs 40 bytes). Emitted on
+     * the first invocation that carries input — a zero-body response
+     * still gets it, since the last_buf special buf arrives through
+     * ctx->in like any other link.
+     */
+    if (ctx->prologue_len > 0 && !ctx->prologue_sent && ctx->in != NULL) {
+
+        if (ctx->ob == NULL) {
+            ctx->ob = ngx_create_temp_buf(r->pool, ctx->out_size);
+            if (ctx->ob == NULL) {
+                return NGX_ERROR;
+            }
+            ctx->ob->tag = (ngx_buf_tag_t) &ngx_http_compression_module;
+        }
+
+        ngx_memcpy(ctx->ob->last, ctx->prologue, ctx->prologue_len);
+        ctx->ob->last += ctx->prologue_len;
+        ctx->prologue_sent = 1;
+    }
 
     while (ctx->in != NULL) {
 

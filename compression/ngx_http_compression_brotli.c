@@ -144,6 +144,32 @@ ngx_http_compression_brotli_attach_dictionary(void *bctx, ngx_str_t *raw)
 }
 
 
+#if (NGX_HTTP_COMPRESSION_BROTLI_DICT)
+static ssize_t
+ngx_http_compression_brotli_wire_prologue(void *bctx,
+    const u_char *dict_sha256, u_char *out, size_t out_len)
+{
+    (void) bctx;
+
+    /*
+     * RFC 9842 §2.1: dcb opens with 36 raw bytes — the magic
+     * 0xFF 'D' 'C' 'B' and the dictionary's SHA-256 — that the brotli
+     * DECODER does not consume: a client must strip them before
+     * feeding the stream to the decoder, unlike dcz's natively-skipped
+     * frame. Same asymmetry the interface documents at dict_coding.
+     */
+    if (out_len < 36) {
+        return NGX_ERROR;
+    }
+
+    out[0] = 0xff; out[1] = 0x44; out[2] = 0x43; out[3] = 0x42;
+    ngx_memcpy(out + 4, dict_sha256, 32);
+
+    return 36;
+}
+#endif
+
+
 static ngx_int_t
 ngx_http_compression_brotli_process(void *bctx,
     ngx_http_compression_io_t *io, ngx_http_compression_op_e op)
@@ -226,10 +252,13 @@ static ngx_http_compression_backend_t  ngx_http_compression_brotli_backend = {
     ngx_http_compression_brotli_create,
     ngx_http_compression_brotli_hint_input_size,
     ngx_http_compression_brotli_attach_dictionary,
-    NULL,       /* dcb's 36-byte prologue lands here in phase 1 —
-                 * slot exists, emitter comes with the store. NULL
-                 * keeps "dcb" UNELECTABLE until then (the election
-                 * gates dict codings on wire_prologue != NULL) */
+#if (NGX_HTTP_COMPRESSION_BROTLI_DICT)
+    ngx_http_compression_brotli_wire_prologue,
+#else
+    NULL,   /* libbrotli < 1.1: no shared-dictionary encoder API, so
+             * "dcb" stays unelectable — the readiness gate doing its
+             * job for a capability hole rather than a missing emitter */
+#endif
     ngx_http_compression_brotli_process,
     ngx_http_compression_brotli_out_size,
 };
