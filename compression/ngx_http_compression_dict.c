@@ -111,7 +111,14 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
     }
 
-    if (ngx_conf_full_name(cf->cycle, &path, 1) != NGX_OK) {
+    /*
+     * Relative paths resolve against the SERVER prefix (third arg 0),
+     * not the conf prefix: dictionaries are data assets like roots
+     * and user files, not configuration includes. (The first cut
+     * passed 1; invisible while the test harness kept conf and prefix
+     * in one directory, caught the moment Test::Nginx split them.)
+     */
+    if (ngx_conf_full_name(cf->cycle, &path, 0) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
 
