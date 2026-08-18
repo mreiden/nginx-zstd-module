@@ -531,11 +531,16 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
                    "zstd static: serving precompressed \"%s\"", path.data);
 
-    /* Byte ranges are meaningless on a compressed body: offsets in the
-     * .zst file do not correspond to positions in the original content.
-     * RFC 9110 §14.2 — clear Accept-Ranges so clients do not request
-     * ranges that would yield undecipherable fragments. */
-    ngx_http_clear_accept_ranges(r);
+    /* gzip_static parity: byte ranges address the SELECTED
+     * REPRESENTATION (RFC 9110 §14.2) — here the .zst bytes on disk,
+     * which a client can fetch, resume and concatenate coherently
+     * because the validator is strong and the bytes are stable. That
+     * is why gzip_static has always set r->allow_ranges, and ranges
+     * only work by opting in: the range filter bails without the
+     * flag. The FILTER module's clear_accept_ranges remains correct
+     * for the opposite reason — a stream generated on the fly has
+     * nothing stable to seek into. */
+    r->allow_ranges = 1;
 
     b = ngx_calloc_buf(r->pool);
     if (b == NULL) {
