@@ -486,6 +486,41 @@ Suite note: Test::Nginx's response_headers matcher FOLDS same-name
 header lines with ", " — asserting the folded value is how you pin
 "both Vary lines present" (and the fold initially read as a failure).
 
+### 26. The proxy-backed tools land: what they pin vs patrol
+
+compression/tools/ gains the two harnesses everything above kept
+deferring to, both parent-tool-disciplined (threaded backend verified
+before nginx starts, decode-and-byte-compare oracles, root-run
+umask/chmod fixes, 30s reap budgets):
+
+- test_flush_paths.py PINS end-to-end mid-stream FLUSH: an unbuffered
+  proxy in front of a chunked upstream with real inter-write delays
+  makes every delayed segment reach the filter with a flush flag, and
+  the client's arrival-timestamp witness (compressed bytes on the
+  wire BEFORE the response ends, gaps matching the upstream's long
+  pauses) proves FLUSH produced decodable output mid-stream. The
+  chunk-size matrix varies per-flush output sizes — the honest form
+  of FLUSH/FINISH-at-exactly-ob->end coverage stays a PATROL:
+  compressed sizes aren't controllable, so the boundary is swept, not
+  forced. Tool-rig lesson: witness math must derive from the case
+  (the first cut hard-coded every-8th-chunk long delays and demanded
+  2 gaps — a 3-chunk case can never produce them; positions and the
+  requirement now derive from the chunk count).
+
+- test_slow_drain.py PINS the recycling pause that local sockets
+  cannot produce: sndbuf=16384 + compression_buffers 2 + ~1 MB
+  incompressible + a deliberately slow reader (small SO_RCVBUF too —
+  without it the client kernel buffers everything and nginx never
+  feels backpressure). The genuine cross-invocation pause got its own
+  witness line for exactly this: "resuming after drain" logs ONLY on
+  the writer-driven re-entry through the nomem block, never on a
+  same-invocation resume. Measured on landing: 52 genuine pauses
+  across the two codings, streams byte-exact through all of them.
+
+Both tools need the module compiled in (checked via nginx -V);
+slow-drain additionally requires --with-debug and says so instead of
+passing vacuously. CI wiring for both remains with the CI item.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep

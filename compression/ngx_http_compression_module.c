@@ -1458,7 +1458,16 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
          * bufs (the loop's get_buf may trip the cap again; each
          * invocation makes the progress the client's drain rate
          * allows, which is the whole point of the cap).
+         *
+         * The debug line is the observable witness that the GENUINE
+         * pause path ran — a same-invocation resume never comes
+         * through here, only a writer-driven re-entry after a real
+         * cross-invocation pause does (tools/test_slow_drain.py
+         * asserts it under forced backpressure).
          */
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "compression: resuming after drain");
+
         if (ngx_http_next_body_filter(r, NULL) == NGX_ERROR) {
             return NGX_ERROR;
         }
