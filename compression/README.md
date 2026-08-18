@@ -40,6 +40,19 @@ and the supplied-hash fast path. The branch also carries the full
 ngx_brotli hardened-fork history under `brotli/` (subtree merge; the
 fork point is the merge's second parent).
 
+**Phase 2** adds unified static sidecar serving: `compression_static
+off|on|always` and `compression_static_order` (tokens `zstd`/`br`/
+`gzip`; the list is the enable set AND the probe order; default
+`br zstd gzip` — static prefers br because its CPU was spent at build
+time). One content-phase handler probes `file.zst`/`.br`/`.gz` in
+order and serves the first acceptable hit; no compression library is
+called, which makes gzip fully first-class here — a gzip-less build
+serves `.gz` sidecars byte-exact. The parent zstd_static's
+magic + declared-window probe rides along intact (an oversized-window
+`.zst` declines to the NEXT coding in the order, not just identity),
+`always` serves the first existing sidecar with no Vary, and a static
+miss falls through to the dynamic filter with no latches touched.
+
 **Phase 1b** makes the dictionary codings real: RFC 9842
 Available-Dictionary negotiation against the store (RFC 8941 byte
 sequence, strict shape), per-backend wire-prologue emitters (dcz's

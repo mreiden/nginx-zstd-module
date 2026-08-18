@@ -239,6 +239,33 @@ included. Both codings verified byte-exact through the reference
 CLIs with the dictionary proven load-bearing (99 and 92 bytes for a
 19,400-byte fixture).
 
+## Phase 2 — static serving (mostly a confirmation round)
+
+Phase 2 produced no new interface wrinkles — as predicted, it never
+touches a compression library, and the backend vtable sits it out
+entirely. What it CONFIRMED:
+
+- **The #76 latch class is structurally gone.** One handler probing
+  codings in order either serves, falls to the next coding, or
+  declines whole — there is no cross-module latch to strand a
+  fallback. The window-cap decline now lands on a BETTER answer than
+  the split modules could produce: an oversized `.zst` falls through
+  to the `.gz` sidecar (pinned by test), where the parent zstd_static
+  could only decline to identity.
+- **gzip subsumption is literal.** A `--without-http_gzip_module`
+  build serves `.gz` sidecars byte-exact with `Content-Encoding:
+  gzip` — file serving needs no zlib. The static coding table carries
+  gzip as a peer entry, no backend, no defer/veto.
+- **The window-cap port stayed a port.** The probe (magic sanity +
+  RFC 8878 declared-window parse, directio-aligned geometry,
+  pread-only for open_file_cache safety) is the parent's reviewed
+  implementation with names changed; its scope note (leading regular
+  frame only) carries over verbatim.
+- PHASE2 note for productization: the static coding table is literal
+  in static.c; the registry should grow a `sidecar_ext` field so a
+  future coding lands in static serving automatically (gzip stays a
+  table entry either way — it has no backend to hang an ext on).
+
 ## Phase-0 shortcuts (not findings — deliberate scope cuts)
 
 status set is 200-only (real module inherits the zstd filter's set);

@@ -21,31 +21,8 @@ ngx_http_compression_backend_t  *ngx_http_compression_backends[] = {
 };
 
 
-/*
- * One election-order entry. backend == NULL is the gzip token: gzip is
- * never implemented here (RFC: defer or veto, never implement), it
- * only occupies a position in the order.
- */
-typedef struct {
-    ngx_http_compression_backend_t  *backend;
-} ngx_http_compression_token_t;
-
-
-typedef struct {
-    ngx_flag_t     enable;
-    ssize_t        min_length;
-    ngx_hash_t     types;
-    ngx_array_t   *types_keys;
-    ngx_array_t   *order;          /* of ngx_http_compression_token_t */
-
-    /*
-     * PHASE1a: this level's active dictionaries — pointers into the
-     * cycle-global store (see ngx_http_compression_dict.h). Loaded,
-     * deduped, and rule-checked at config parse; read by nobody until
-     * phase 1b wires negotiation. NULL = inherit.
-     */
-    ngx_array_t   *dicts;          /* of ngx_http_compression_dict_t * */
-} ngx_http_compression_conf_t;
+/* conf struct + token type moved to ngx_http_compression.h in phase 2:
+ * the static handler TU shares them */
 
 
 typedef struct {
@@ -86,6 +63,14 @@ static ngx_int_t ngx_http_compression_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
 
 
+static ngx_conf_enum_t  ngx_http_compression_static_enum[] = {
+    { ngx_string("off"), NGX_HTTP_COMPRESSION_STATIC_OFF },
+    { ngx_string("on"), NGX_HTTP_COMPRESSION_STATIC_ON },
+    { ngx_string("always"), NGX_HTTP_COMPRESSION_STATIC_ALWAYS },
+    { ngx_null_string, 0 }
+};
+
+
 static ngx_command_t  ngx_http_compression_commands[] = {
 
     { ngx_string("compression"),
@@ -123,6 +108,20 @@ static ngx_command_t  ngx_http_compression_commands[] = {
       offsetof(ngx_http_compression_conf_t, dicts),
       NULL },
 
+    { ngx_string("compression_static"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_compression_conf_t, static_enable),
+      &ngx_http_compression_static_enum },
+
+    { ngx_string("compression_static_order"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      ngx_http_compression_static_order,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
     ngx_null_command
 };
 
@@ -156,6 +155,71 @@ static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 
 static ngx_str_t  ngx_http_compression_gzip_token = ngx_string("gzip");
+
+
+/*
+ * Vary: Accept-Encoding, requested once per response through whichever
+ * mechanism this build has (see the header). Both the filter and the
+ * static handler call this BEFORE their accept checks, so identity
+ * fallbacks vary too.
+ */
+ngx_int_t
+ngx_http_compression_vary(ngx_http_request_t *r)
+{
+#if (NGX_HTTP_GZIP)
+    r->gzip_vary = 1;
+    return NGX_OK;
+#else
+    ngx_table_elt_t  *v;
+
+    v = ngx_list_push(&r->headers_out.headers);
+    if (v == NULL) {
+        return NGX_ERROR;
+    }
+    v->hash = 1;
+    v->next = NULL;
+    ngx_str_set(&v->key, "Vary");
+    ngx_str_set(&v->value, "Accept-Encoding");
+    return NGX_OK;
+#endif
+}
+
+
+ngx_table_elt_t *
+ngx_http_compression_ae_header(ngx_http_request_t *r)
+{
+#if (NGX_HTTP_GZIP)
+    return r->headers_in.accept_encoding;
+#else
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].key.len == sizeof("Accept-Encoding") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Accept-Encoding",
+                               sizeof("Accept-Encoding") - 1) == 0)
+        {
+            return &h[i];
+        }
+    }
+
+    return NULL;
+#endif
+}
 
 
 /*
@@ -266,48 +330,9 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
 }
 
 
-#if !(NGX_HTTP_GZIP)
-/*
- * Without the gzip module there is no r->headers_in.accept_encoding —
- * that field, like r->gzip_vary/gzip_tested/gzip_ok, lives inside
- * #if (NGX_HTTP_GZIP) in ngx_http_request.h (review round 1; the
- * sneaky part being that --with-compat forces NGX_HTTP_GZIP=1, so
- * compat CI builds can never catch a gzip-less break). Find the
- * header ourselves; FIRST match only, same parity as the gzip-built
- * path (see ngx_http_compression_ae.h on why).
- */
-static ngx_table_elt_t *
-ngx_http_compression_accept_encoding(ngx_http_request_t *r)
-{
-    ngx_uint_t        i;
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h;
-
-    part = &r->headers_in.headers.part;
-    h = part->elts;
-
-    for (i = 0; /* void */; i++) {
-
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-
-        if (h[i].key.len == sizeof("Accept-Encoding") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Accept-Encoding",
-                               sizeof("Accept-Encoding") - 1) == 0)
-        {
-            return &h[i];
-        }
-    }
-
-    return NULL;
-}
-#endif
+/* the gzip-less Accept-Encoding walk moved into
+ * ngx_http_compression_ae_header() above (phase 2: the static handler
+ * needs it too) */
 
 
 static ngx_int_t
@@ -382,6 +407,7 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     conf->enable = NGX_CONF_UNSET;
     conf->min_length = NGX_CONF_UNSET;
     conf->order = NULL;     /* NULL = inherit / shipped default */
+    conf->static_enable = NGX_CONF_UNSET_UINT;
 
     return conf;
 }
@@ -419,6 +445,20 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
      */
     if (conf->dicts == NULL) {
         conf->dicts = prev->dicts;
+    }
+
+    /* PHASE2: static serving */
+    ngx_conf_merge_uint_value(conf->static_enable, prev->static_enable,
+                              NGX_HTTP_COMPRESSION_STATIC_OFF);
+
+    if (conf->static_order == NULL) {
+        conf->static_order = prev->static_order;
+    }
+
+    if (conf->static_order == NULL) {
+        if (ngx_http_compression_static_default_order(cf, conf) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
     }
 
     if (conf->order == NULL) {
@@ -612,35 +652,17 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
 
     /*
      * Vary before any accept decision, so identity fallbacks vary too.
-     * With the gzip module present, emission is delegated to nginx's
-     * own writers (h1/h2/h3) via the r->gzip_vary mechanism — the
-     * module never pushes a literal Vary: Accept-Encoding itself, and
-     * the compression_vary module's cooperation (it keys on this flag)
-     * comes free. NOTE the emission is still gated on "gzip_vary on";
-     * merge_conf warns when it is off (review round 1). Without the
-     * gzip module neither the flag nor the core emitter exists, so
-     * push the header ourselves.
+     * The helper hides the build split: with the gzip module, emission
+     * is delegated via r->gzip_vary to nginx's own writers (still
+     * gated on "gzip_vary on" — merge_conf warns when off), and the
+     * compression_vary module's cooperation comes free; without it,
+     * the header is pushed literally.
      */
-#if (NGX_HTTP_GZIP)
-    r->gzip_vary = 1;
-
-    ae = r->headers_in.accept_encoding;
-#else
-    {
-        ngx_table_elt_t  *v;
-
-        v = ngx_list_push(&r->headers_out.headers);
-        if (v == NULL) {
-            return NGX_ERROR;
-        }
-        v->hash = 1;
-        v->next = NULL;
-        ngx_str_set(&v->key, "Vary");
-        ngx_str_set(&v->value, "Accept-Encoding");
+    if (ngx_http_compression_vary(r) != NGX_OK) {
+        return NGX_ERROR;
     }
 
-    ae = ngx_http_compression_accept_encoding(r);
-#endif
+    ae = ngx_http_compression_ae_header(r);
 
     /*
      * PHASE1b: wherever dictionaries are configured, EVERY eligible
@@ -1097,7 +1119,19 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 static ngx_int_t
 ngx_http_compression_init(ngx_conf_t *cf)
 {
-    (void) cf;
+    ngx_http_handler_pt        *h;
+    ngx_http_core_main_conf_t  *cmcf;
+
+    /* PHASE2: the static sidecar handler joins the content phase,
+     * exactly like gzip_static and the parent *_static modules */
+    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_CONTENT_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_compression_static_handler;
 
     ngx_http_next_header_filter = ngx_http_top_header_filter;
     ngx_http_top_header_filter = ngx_http_compression_header_filter;
