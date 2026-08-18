@@ -435,3 +435,91 @@ Accept-Encoding: zstd
 1234567890123456789
 --- no_error_log
 [error]
+
+
+
+=== TEST 20a: a 404 body is eligible (parent status-set parity)
+# error responses are often the most-served compressible content on a
+# busy origin; the parent zstd filter includes 403/404 deliberately
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 404 "this 404 body is long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 404
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 20b: a 403 body is eligible
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 403 "this 403 body is long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 403
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 20c: a 500 body is NOT eligible (outside the status set)
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 500 "this 500 body is long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 500
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 20d: a 302 is NOT eligible (3xx outside 403/404 carve-outs)
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 302 "moved body text long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 302
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]

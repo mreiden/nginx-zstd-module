@@ -844,12 +844,21 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     conf = ngx_http_get_module_loc_conf(r, ngx_http_compression_module);
 
     /*
-     * PHASE0: 200 only. The real module inherits the zstd filter's
-     * status set (2xx minus 204/205, plus 403/404).
+     * PHASE3: the parent zstd filter's status set — every 2xx except
+     * 204/205 (no body by definition) and 206 (ranges address the
+     * ENCODED representation; compressing a slice would corrupt it),
+     * plus 403 and 404, whose bodies are often the most-served
+     * compressible content on a busy origin.
      */
     if (!conf->enable
         || r != r->main
-        || r->headers_out.status != NGX_HTTP_OK
+        || r->headers_out.status < NGX_HTTP_OK
+        || r->headers_out.status == NGX_HTTP_NO_CONTENT
+        || r->headers_out.status == 205  /* Reset Content: no core macro */
+        || r->headers_out.status == NGX_HTTP_PARTIAL_CONTENT
+        || (r->headers_out.status > 299
+            && r->headers_out.status != NGX_HTTP_FORBIDDEN
+            && r->headers_out.status != NGX_HTTP_NOT_FOUND)
         || r->header_only
         || (r->headers_out.content_encoding != NULL
             && r->headers_out.content_encoding->value.len != 0)
