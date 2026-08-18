@@ -78,4 +78,18 @@ dictionary variant shares the base coding's parameters (brotli bakes
 quality into the prepared dictionary; there is nothing separate to
 tune).
 
+Phase 3 also brings output-buffer recycling (the core gzip filter's
+busy/free pattern): shipped buffers are reclaimed once downstream
+drains them, and `compression_buffers <num> [size]` caps how many a
+request may hold in flight (default `32`, size defaulting to the
+backend's recommended step size — an explicit size overrides it, and
+the dict-prologue clamp applies either way). At the cap, production
+pauses until the client drains — the backstop that keeps a slow
+client behind a fast upstream from pinning unbounded output memory.
+The backend roster is also build-conditional
+(`NGX_HTTP_COMPRESSION_HAVE_ZSTD`/`_BROTLI`): a build without one or
+both libraries compiles, elects what remains, rejects absent codings
+with a pointer at the build, and still serves every static sidecar —
+static serving reads format constants, not library APIs.
+
 [myguard-labs/nginx-zstd-module#109]: https://github.com/myguard-labs/nginx-zstd-module/issues/109

@@ -436,6 +436,34 @@ the match — nginx -t exits nonzero BY DESIGN on the config errors
 under test, and pipefail propagates it past grep's success. Capture
 first, then grep.
 
+### 24. Buffer recycling: never return holding unconsumed input
+
+The busy/free recycling (core gzip's pattern, via the parent) landed
+with one real lesson re-learned from scratch: the first cut handled
+the buffer cap by shipping what it had and RETURNING, betting the
+caller would re-invoke with the remainder. nginx's filter contract
+makes no such promise — on a fast local socket the capped response
+stalled to the test timeout ("no last chunk found"), because nothing
+downstream had a reason to poke again. The parent's outer loop is the
+correct shape and is now ours: produce until the cap pauses, ship,
+reclaim via ngx_chain_update_chains, and RESUME IN THE SAME
+INVOCATION whenever the reclaim freed anything. The only legitimate
+early return is the genuinely-slow-client case (ship drained nothing
+back), which returns NGX_AGAIN and leans on r->buffered keeping the
+writer re-poking — the entry-path nomem block picks the request back
+up on the next pass.
+
+`compression_buffers <num> [size]` is TAKE12, not the stock bufs
+slot's TAKE2, because size is genuinely optional here: the backend
+already recommends a step size, so most operators only want the
+count cap. An explicit size overrides the recommendation; the
+dict-prologue clamp applies to either source. Suite witnesses: with
+cap 2 against ~200 KB of incompressible output, the pause line AND
+the reuse line are both certain (finishing at all requires reuse),
+and the decode roundtrip proves the pause/drain/resume seams
+preserved the stream; the default cap is pinned to stay dormant on
+an ordinary response.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep

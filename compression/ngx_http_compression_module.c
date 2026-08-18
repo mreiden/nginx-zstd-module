@@ -36,6 +36,22 @@ typedef struct {
     size_t                           out_size;
 
     /*
+     * PHASE3: output-buffer recycling (the gzip filter's busy/free
+     * pattern). Shipped bufs sit on `busy` until downstream drains
+     * them; ngx_chain_update_chains reclaims drained ones onto
+     * `free`, and get_buf prefers a reclaimed buf over a fresh
+     * allocation. `allocated` counts live temp bufs against the
+     * compression_buffers cap; at the cap with nothing reclaimable,
+     * `nomem` stops production until a later invocation flushes the
+     * busy chain — the backstop that keeps a slow client from pinning
+     * unbounded output memory.
+     */
+    ngx_chain_t                     *free;
+    ngx_chain_t                     *busy;
+    ngx_uint_t                       allocated;
+    ngx_uint_t                       bufs_num;
+
+    /*
      * PHASE1b: the elected dictionary variant's wire prologue,
      * prepared at election time and emitted ahead of the first
      * encoder byte (40 bytes dcz, 36 dcb; 0 = base coding).
@@ -50,6 +66,7 @@ typedef struct {
                                                  * until FINISH drains —
                                                  * drives r->buffered */
     unsigned                         prologue_sent:1;
+    unsigned                         nomem:1;
 } ngx_http_compression_ctx_t;
 
 
@@ -63,6 +80,8 @@ static char *ngx_http_compression_order(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_http_compression_level_cmd(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_compression_window_cmd(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_compression_buffers_cmd(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_compression_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_compression_header_filter(ngx_http_request_t *r);
@@ -104,6 +123,13 @@ static ngx_command_t  ngx_http_compression_commands[] = {
     { ngx_string("compression_window"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
       ngx_http_compression_window_cmd,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("compression_buffers"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE12,
+      ngx_http_compression_buffers_cmd,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -581,6 +607,58 @@ ngx_http_compression_level_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
+/*
+ * compression_buffers <num> [size] — TAKE12 rather than the stock
+ * bufs slot's TAKE2 because size is genuinely optional here: the
+ * backend already recommends a step size (out_size), so most
+ * operators only ever want the COUNT cap. An explicit size overrides
+ * the recommendation; the dict-prologue clamp applies to either.
+ */
+static char *
+ngx_http_compression_buffers_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_compression_conf_t *ccf = conf;
+
+    ssize_t     size;
+    ngx_int_t   n;
+    ngx_str_t  *value;
+
+    (void) cmd;
+
+    if (ccf->bufs.num != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    n = ngx_atoi(value[1].data, value[1].len);
+    if (n == NGX_ERROR || n < 1) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid number \"%V\" in \"compression_buffers\"",
+                           &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    size = 0;   /* backend-recommended */
+
+    if (cf->args->nelts == 3) {
+        size = ngx_parse_size(&value[2]);
+        if (size == NGX_ERROR || size == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid size \"%V\" in "
+                               "\"compression_buffers\"", &value[2]);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    ccf->bufs.num = n;
+    ccf->bufs.size = (size_t) size;
+
+    return NGX_CONF_OK;
+}
+
+
 static char *
 ngx_http_compression_window_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf)
@@ -655,6 +733,7 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     conf->min_length = NGX_CONF_UNSET;
     conf->order = NULL;     /* NULL = inherit / shipped default */
     conf->static_enable = NGX_CONF_UNSET_UINT;
+    conf->bufs.num = NGX_CONF_UNSET;
 
     for (i = 0; i < NGX_HTTP_COMPRESSION_CONF_SLOTS; i++) {
         conf->levels[i] = NGX_CONF_UNSET;
@@ -676,6 +755,18 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
+
+    /* default cap 32 in-flight bufs (core gzip's number), size 0 =
+     * backend-recommended */
+    if (conf->bufs.num == NGX_CONF_UNSET) {
+        if (prev->bufs.num != NGX_CONF_UNSET) {
+            conf->bufs = prev->bufs;
+
+        } else {
+            conf->bufs.num = 32;
+            conf->bufs.size = 0;
+        }
+    }
 
     /*
      * PHASE3: tuning slots resolve to the backend's declared defaults
@@ -1088,6 +1179,15 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     ctx->backend = elected;
     ctx->out_size = elected->out_size(r->headers_out.content_length_n);
 
+    /* operator geometry: an explicit compression_buffers size beats
+     * the backend recommendation (the dict-prologue clamp below
+     * applies to either source); num caps in-flight bufs */
+    if (conf->bufs.size > 0) {
+        ctx->out_size = conf->bufs.size;
+    }
+
+    ctx->bufs_num = (ngx_uint_t) conf->bufs.num;
+
     /* PHASE3: resolve this coding's tuning slot (concrete post-merge;
      * the dict variant shares the base coding's values) */
     for (i = 0; ngx_http_compression_backends[i] != NULL; i++) {
@@ -1199,6 +1299,53 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
 }
 
 
+/*
+ * PHASE3: produce the working output buf — a reclaimed one when the
+ * free list has any, a fresh allocation while under the
+ * compression_buffers cap, or NGX_DECLINED with ctx->nomem latched
+ * when neither is possible (production pauses until downstream
+ * drains the busy chain).
+ */
+static ngx_int_t
+ngx_http_compression_get_buf(ngx_http_request_t *r,
+    ngx_http_compression_ctx_t *ctx)
+{
+    ngx_chain_t  *cl;
+
+    if (ctx->ob != NULL) {
+        return NGX_OK;
+    }
+
+    if (ctx->free != NULL) {
+        /* update_chains reset pos/last to start when it reclaimed */
+        cl = ctx->free;
+        ctx->free = cl->next;
+        ctx->ob = cl->buf;
+        ngx_free_chain(r->pool, cl);
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "compression: reused output buf %p", ctx->ob);
+        return NGX_OK;
+    }
+
+    if (ctx->allocated < ctx->bufs_num) {
+        ctx->ob = ngx_create_temp_buf(r->pool, ctx->out_size);
+        if (ctx->ob == NULL) {
+            return NGX_ERROR;
+        }
+        ctx->ob->tag = (ngx_buf_tag_t) &ngx_http_compression_module;
+        ctx->allocated++;
+        return NGX_OK;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "compression: buffer cap %ui reached, awaiting drain",
+                   ctx->bufs_num);
+    ctx->nomem = 1;
+    return NGX_DECLINED;
+}
+
+
 static ngx_int_t
 ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
@@ -1222,8 +1369,26 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         }
     }
 
-    out = NULL;
-    last_out = &out;
+    if (ctx->nomem) {
+        /*
+         * PHASE3 recycling: the previous invocation hit the buffer
+         * cap. Push the busy chain downstream first — a NULL pass
+         * lets the write filter drain what it holds — then reclaim
+         * whatever drained. Production resumes below with the freed
+         * bufs (the loop's get_buf may trip the cap again; each
+         * invocation makes the progress the client's drain rate
+         * allows, which is the whole point of the cap).
+         */
+        if (ngx_http_next_body_filter(r, NULL) == NGX_ERROR) {
+            return NGX_ERROR;
+        }
+
+        cl = NULL;
+        ngx_chain_update_chains(r->pool, &ctx->free, &ctx->busy, &cl,
+                                (ngx_buf_tag_t) &ngx_http_compression_module);
+
+        ctx->nomem = 0;
+    }
 
     /*
      * PHASE1b: the dict coding's wire prologue rides ahead of the
@@ -1238,18 +1403,31 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
      */
     if (ctx->prologue_len > 0 && !ctx->prologue_sent && ctx->in != NULL) {
 
-        if (ctx->ob == NULL) {
-            ctx->ob = ngx_create_temp_buf(r->pool, ctx->out_size);
-            if (ctx->ob == NULL) {
-                return NGX_ERROR;
-            }
-            ctx->ob->tag = (ngx_buf_tag_t) &ngx_http_compression_module;
+        /* first invocation with input: the cap cannot be reached yet */
+        if (ngx_http_compression_get_buf(r, ctx) != NGX_OK) {
+            return NGX_ERROR;
         }
 
         ngx_memcpy(ctx->ob->last, ctx->prologue, ctx->prologue_len);
         ctx->ob->last += ctx->prologue_len;
         ctx->prologue_sent = 1;
     }
+
+    /*
+     * PHASE3 recycling: the outer cycle is the parent filter's shape —
+     * produce until the buffer cap pauses us, ship, reclaim what
+     * downstream drained, and RESUME IN THIS INVOCATION when the
+     * reclaim freed anything. Returning early with unconsumed input
+     * would bet on the caller re-invoking us; nginx's contract makes
+     * no such promise on a fast socket (found the hard way: the first
+     * cut stalled a capped response to the test timeout). The genuine
+     * pause — downstream drained nothing — returns NGX_AGAIN and
+     * leans on r->buffered keeping the writer re-poking.
+     */
+    for ( ;; ) {
+
+    out = NULL;
+    last_out = &out;
 
     while (ctx->in != NULL) {
 
@@ -1294,12 +1472,18 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 break;      /* buf drained, no flags: next link */
             }
 
-            if (ctx->ob == NULL) {
-                ctx->ob = ngx_create_temp_buf(r->pool, ctx->out_size);
-                if (ctx->ob == NULL) {
-                    return NGX_ERROR;
-                }
-                ctx->ob->tag = (ngx_buf_tag_t) &ngx_http_compression_module;
+            rc = ngx_http_compression_get_buf(r, ctx);
+
+            if (rc == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+
+            if (rc == NGX_DECLINED) {
+                /* buffer cap: stop producing, ship what we have; the
+                 * unconsumed remainder stays on ctx->in (this link's
+                 * pos is already advanced past what the encoder ate)
+                 * for the invocation that follows the drain */
+                goto ship;
             }
 
             ngx_memzero(&io, sizeof(io));
@@ -1405,6 +1589,8 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         ngx_free_chain(r->pool, cl);
     }
 
+ship:
+
     /*
      * Publish held state (review round 2): after a PROCESS-only
      * invocation the response's bytes live in ctx->ob AND inside the
@@ -1428,26 +1614,61 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
 
     if (out == NULL) {
-        if (in == NULL) {
+        if (in == NULL && !ctx->nomem) {
             /*
              * Writer-driven pass (review round 2): nothing of ours to
              * emit, but the chain below may hold undelivered output —
-             * forward the poke instead of reporting idle.
+             * forward the poke, then reclaim whatever it drained.
              */
-            return ngx_http_next_body_filter(r, NULL);
+            rc = ngx_http_next_body_filter(r, NULL);
+            if (rc == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+
+            cl = NULL;
+            ngx_chain_update_chains(r->pool, &ctx->free, &ctx->busy, &cl,
+                                (ngx_buf_tag_t) &ngx_http_compression_module);
+            return rc;
         }
-        return NGX_OK;
+
+        /* input buffered (or the cap paused production): pending
+         * shipped output makes this AGAIN, not OK — the writer keeps
+         * driving until the busy chain drains */
+        return ctx->busy ? NGX_AGAIN : NGX_OK;
     }
 
     /*
-     * PHASE0: no busy/free buf recycling — output bufs are pool-fresh
-     * and NGX_AGAIN from downstream is returned as-is without
-     * retry-tracking. Fine for a prototype exercising the interface;
-     * a real module lifts the gzip filter's recycling.
+     * Ship, then fold the shipped chain into busy/free — drained bufs
+     * come back through get_buf instead of growing the pool. Links of
+     * untagged bufs (the flags-only specials) are released to the
+     * pool's free-chain list by the same call.
      */
     rc = ngx_http_next_body_filter(r, out);
 
-    return rc;
+    if (rc == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+
+    ngx_chain_update_chains(r->pool, &ctx->free, &ctx->busy, &out,
+                            (ngx_buf_tag_t) &ngx_http_compression_module);
+
+    if (ctx->done || !ctx->nomem) {
+        /* finished, or the input was fully consumed this pass */
+        return rc;
+    }
+
+    if (ctx->free == NULL) {
+        /* the cap paused us and the ship drained nothing back —
+         * a genuinely slow client. r->buffered is set (started
+         * input implies it above), so the writer re-pokes and the
+         * entry nomem block resumes us when drain happens. */
+        return NGX_AGAIN;
+    }
+
+    /* the ship freed buffers: resume producing right now */
+    ctx->nomem = 0;
+
+    }   /* outer produce/ship/reclaim cycle */
 }
 
 

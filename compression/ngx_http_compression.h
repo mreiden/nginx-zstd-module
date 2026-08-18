@@ -336,6 +336,16 @@ typedef struct {
      */
     ngx_uint_t     static_enable;
     ngx_array_t   *static_order;
+
+    /*
+     * PHASE3: output-buffer pool geometry. num caps how many output
+     * bufs a request may hold in flight (the recycling backstop
+     * against a slow client + fast upstream); size 0 means "the
+     * backend's recommended step size" — an explicit size overrides
+     * the recommendation, and the dict-prologue clamp applies to
+     * either source.
+     */
+    ngx_bufs_t     bufs;
 } ngx_http_compression_conf_t;
 
 

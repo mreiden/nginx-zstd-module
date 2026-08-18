@@ -1,0 +1,186 @@
+use Test::Nginx::Socket;
+use Test::More;
+use Digest::SHA qw(sha256_hex);
+use MIME::Base64 qw(encode_base64);
+use File::Temp qw(tempdir);
+
+# Phase-3 output-buffer recycling. The deterministic witnesses are the
+# get_buf debug lines: "buffer cap N reached, awaiting drain" proves
+# the cap paused production, "reused output buf" proves a reclaimed
+# buffer came back through the free list -- and with a cap far below
+# the output's buffer count, FINISHING the response at all requires
+# reuse, so the decode roundtrip doubles as the functional proof that
+# pause/drain/resume preserved the stream byte-exact.
+
+my $tmp = tempdir(CLEANUP => 1);
+
+# incompressible ~200 KB: compressed output ~200 KB, far above any
+# small cap x step size
+our $big = '';
+{
+    open my $ur, '<', '/dev/urandom' or die $!;
+    my $raw; read $ur, $raw, 150_000; close $ur;
+    $big = encode_base64($raw, "");
+}
+
+sub spew { open my $h, '>', $_[0] or die "$_[0]: $!"; binmode $h; print $h $_[1]; close $h }
+sub slurp { open my $h, '<', $_[0] or die "$_[0]: $!"; binmode $h; local $/; <$h> }
+
+sub cli_decode {
+    my ($cmd, $data) = @_;
+    spew("$tmp/in", $data);
+    system("$cmd < $tmp/in > $tmp/out 2>/dev/null") == 0 or return undef;
+    return slurp("$tmp/out");
+}
+
+our %decoders = (
+    zstd => sub { cli_decode("zstd -dq -c", $_[0]) },
+    br   => sub { cli_decode("brotli -d -c", $_[0]) },
+);
+
+add_response_body_check(sub {
+    my ($block, $body, $req_idx, $rep_idx, $dry) = @_;
+    return if $dry;
+
+    my $how = $block->decode_with or return;
+    chomp $how;
+
+    my $dec = $decoders{$how} ? $decoders{$how}->($body) : undef;
+
+    Test::More::is(
+        defined $dec ? sha256_hex($dec) : "(decode failed)",
+        sha256_hex($big),
+        $block->name . " - $how roundtrip decodes byte-exact"
+    );
+});
+
+no_long_string();
+log_level 'warn';
+repeat_each(1);
+plan 'no_plan';
+run_tests();
+
+__DATA__
+
+
+=== TEST 1: a tight cap pauses, drains, reuses -- and the stream survives
+# brotli's step bufs are 32 KB; ~200 KB of incompressible output needs
+# 6+ of them, so cap 2 MUST pause at least once and MUST reuse
+# reclaimed bufs to finish. The roundtrip proves the pause/resume
+# seams did not corrupt the stream.
+--- log_level: debug
+--- timeout: 10
+--- user_files eval
+[ [ "b/big.txt" => $::big ] ]
+--- config
+    location /b/ {
+        compression on;
+        compression_order br;
+        compression_buffers 2;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /b/big.txt
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+--- decode_with
+br
+--- error_log eval
+[qr/compression: buffer cap 2 reached, awaiting drain/,
+ qr/compression: reused output buf/]
+
+
+=== TEST 2: an operator size override feeds the same recycling machinery
+# 8 KB bufs x cap 4 against ~200 KB of zstd output: dozens of pauses,
+# reuse mandatory, stream still byte-exact
+--- log_level: debug
+--- timeout: 10
+--- user_files eval
+[ [ "b/big.txt" => $::big ] ]
+--- config
+    location /b/ {
+        compression on;
+        compression_buffers 4 8k;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /b/big.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- decode_with
+zstd
+--- error_log eval
+[qr/compression: buffer cap 4 reached, awaiting drain/,
+ qr/compression: reused output buf/]
+
+
+=== TEST 3: the default cap never pauses an ordinary response
+# 32 bufs at the backend step size is far above what ~200 KB needs;
+# the cap line must NOT appear (the recycling machinery stays dormant
+# on the fast path)
+--- log_level: debug
+--- timeout: 10
+--- user_files eval
+[ [ "b/big.txt" => $::big ] ]
+--- config
+    location /b/ {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /b/big.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- decode_with
+zstd
+--- no_error_log eval
+qr/buffer cap \d+ reached/
+
+
+=== TEST 4: a zero buffer count is a config error
+--- config
+    location / {
+        compression_buffers 0;
+    }
+--- must_die
+--- error_log
+invalid number "0" in "compression_buffers"
+
+
+=== TEST 5: a malformed size is a config error
+--- config
+    location / {
+        compression_buffers 4 zap;
+    }
+--- must_die
+--- error_log
+invalid size "zap" in "compression_buffers"
+
+
+=== TEST 6: duplicate compression_buffers is a config error
+--- config
+    location / {
+        compression_buffers 4;
+        compression_buffers 8;
+    }
+--- must_die
+--- error_log
+is duplicate
