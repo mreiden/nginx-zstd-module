@@ -510,8 +510,14 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
         h->value = c->coding;
         r->headers_out.content_encoding = h;
 
-        /* byte ranges are meaningless on a compressed body */
-        ngx_http_clear_accept_ranges(r);
+        /* gzip_static parity: on the static side the representation IS
+         * the sidecar's bytes and the validator is strong, so byte
+         * ranges are coherent — and they only work by opting in (the
+         * range filter bails unless r->allow_ranges is set; a content
+         * handler serving a local file never gets it otherwise).
+         * "Ranges are meaningless on a compressed body" is a FILTER
+         * truth: there the encoded stream is generated on the fly. */
+        r->allow_ranges = 1;
 
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
                        "compression static: serving \"%s\"", path.data);
@@ -538,6 +544,11 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
         b->in_file = b->file_last ? 1 : 0;
         b->last_buf = (r == r->main) ? 1 : 0;
         b->last_in_chain = 1;
+
+        /* an empty sidecar in a subrequest leaves in_file and last_buf
+         * both 0 — sync marks the flagless zero-size buf deliberate so
+         * the output chain doesn't alert (gzip_static parity) */
+        b->sync = (b->last_buf || b->in_file) ? 0 : 1;
 
         b->file->fd = of.fd;
         b->file->name = path;

@@ -632,3 +632,75 @@ $::src
 --- error_log eval
 [qr/16384-byte aligned probe on directio file/,
  qr/declares a 134217728-byte decompression window/]
+
+
+=== TEST 25: a 200 sidecar serve advertises Accept-Ranges: bytes
+# gzip_static parity: the handler opts in via r->allow_ranges — the
+# pre-fix build cleared ranges and this header could not appear
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.gz" => $::gz ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order gzip;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: gzip
+--- response_headers
+Content-Encoding: gzip
+Accept-Ranges: bytes
+--- response_body eval
+$::gz
+
+
+=== TEST 26: byte ranges slice the sidecar's bytes (206 + Content-Range)
+# the representation IS the encoded bytes and the validator is strong;
+# the range filter only runs because the handler sets allow_ranges —
+# unfixed code ignores Range and answers 200 with the full body
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.gz" => $::gz ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order gzip;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: gzip
+Range: bytes=0-9
+--- error_code: 206
+--- response_headers eval
+"Content-Range: bytes 0-9/" . length($::gz)
+--- response_body eval
+substr($::gz, 0, 10)
+
+
+=== TEST 27: empty sidecar behind an SSI include ships silently
+# in a subrequest in_file and last_buf are both 0; without b->sync the
+# flagless zero-size buf trips the output chain's "zero size buf" alert
+--- user_files eval
+[ [ "page/x.shtml" => qq{before[<!--#include virtual="/inc/empty.txt" -->]after\n} ],
+  [ "inc/empty.txt.gz" => "" ] ]
+--- config
+    location /page/ {
+        ssi on;
+        default_type text/html;   # the SSI filter only touches ssi_types
+        root html;
+    }
+    location /inc/ {
+        compression_static always;
+        root html;
+    }
+--- request
+GET /page/x.shtml
+--- response_body
+before[]after
+--- no_error_log eval
+qr/zero size buf/

@@ -316,6 +316,53 @@ clang-tidy currently errors on the compression/ files for want of the
 nginx include path — its C analysis is NOT running on this tree yet
 and must not be trusted as clean until wired.
 
+### 21. gzip_static's validation ledger, read side by side
+
+Asked whether nginx's gzip_static validates anything we don't (magic
+bytes 0x1f 0x8b?), the answer from its source is that it validates
+NOTHING content-wise — it never reads a byte of the file before
+serving. Rename /etc/passwd to index.html.gz and it ships as
+`Content-Encoding: gzip`; a zero-byte .gz (a valid gzip stream is at
+least ~20 bytes) ships as an empty gzip body. Its only checks are the
+filesystem-level ones we already ported (open-error triage, is_dir,
+is_file).
+
+DECISION: we intentionally do NOT add a .gz magic-byte check, matching
+the existing module. Twenty years of gzip_static practice treats the
+sidecar's content as the operator's contract, and guarding operator
+error would cost a per-request pread on every .gz serve. The zstd
+probe is not a counterexample but a different CATEGORY: it exists
+because browsers hard-reject declared windows over 8 MB, so an
+unprobed .zst can be a guaranteed-broken response for every client —
+that's serve-safety tied to a client-enforced protocol limit, and it's
+also why the probe stays unconditional rather than behind some
+`compression_static_validate` knob (a knob named "validate" would
+misdescribe it, and defaulting it off-for-gzip/on-for-zstd proves the
+two aren't one option). Its magic check rides along in the same pread
+for free. Brotli is unvalidatable by design — raw streams carry no
+magic. If integrity checking is ever wanted, it's a separate opt-in
+productization item, uniformly framed as such.
+
+The side-by-side read also surfaced two deltas running the OTHER way
+— things gzip_static does that the port didn't:
+
+- it sets `r->allow_ranges = 1`. On the static side ranges are
+  coherent (the representation IS the sidecar's bytes, the validator
+  is strong) and they only work by opting in — the range filter bails
+  unless allow_ranges is set, which is also why the parent
+  zstd_static's `clear_accept_ranges` was purely defensive (its own
+  suite documents that). The port had cleared ranges with a
+  filter-side justification; migrators off gzip_static would lose
+  resumable downloads. Fixed: the static handler opts in.
+- it sets `b->sync = (b->last_buf || b->in_file) ? 0 : 1`, guarding
+  the empty-sidecar-in-a-subrequest case where a flagless zero-size
+  buf trips the "zero size buf in output" alert. The port was missing
+  the line. Fixed, with an SSI-include test pinning the silence.
+
+Lesson: porting "intact" from ONE parent quietly inherits that
+parent's divergences from the module being subsumed. Every subsumed
+module deserves its own side-by-side read of the original.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep
