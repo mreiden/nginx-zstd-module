@@ -7,6 +7,8 @@
 
 #include "ngx_http_compression.h"
 
+#if (NGX_HTTP_COMPRESSION_HAVE_BROTLI)
+
 #include <brotli/encode.h>
 
 #if __has_include(<brotli/shared_dictionary.h>)
@@ -275,3 +277,5 @@ static ngx_http_compression_backend_t  ngx_http_compression_brotli_backend = {
 
 ngx_http_compression_backend_t  *ngx_http_compression_backend_brotli =
     &ngx_http_compression_brotli_backend;
+
+#endif /* NGX_HTTP_COMPRESSION_HAVE_BROTLI */

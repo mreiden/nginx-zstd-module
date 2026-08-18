@@ -11,15 +11,17 @@
 #include "ngx_http_compression_dict.h"
 
 
+#if (NGX_HTTP_COMPRESSION_HAVE_ZSTD)
 extern ngx_http_compression_backend_t  *ngx_http_compression_backend_zstd;
+#endif
+#if (NGX_HTTP_COMPRESSION_HAVE_BROTLI)
 extern ngx_http_compression_backend_t  *ngx_http_compression_backend_brotli;
+#endif
 
+/* filled densely in preconfiguration (add_backends); static storage
+ * zero-fills the NULL terminator for every NBACKENDS value */
 ngx_http_compression_backend_t
-    *ngx_http_compression_backends[NGX_HTTP_COMPRESSION_NBACKENDS + 1] = {
-    NULL,   /* set in preconfiguration: zstd */
-    NULL,   /* brotli */
-    NULL
-};
+    *ngx_http_compression_backends[NGX_HTTP_COMPRESSION_NBACKENDS + 1];
 
 
 /* conf struct + token type moved to ngx_http_compression.h in phase 2:
@@ -357,15 +359,28 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
 static ngx_int_t
 ngx_http_compression_add_backends(ngx_conf_t *cf)
 {
+    ngx_uint_t  n;
+
     (void) cf;
 
     /*
      * Filled here rather than by static initializer only because the
-     * backends live in separate TUs exporting pointers; a real module
-     * can use a designated static array.
+     * backends live in separate TUs exporting pointers. Fill is DENSE
+     * under the HAVE guards — a library-less build compacts the
+     * registry instead of leaving a hole, so registry position stays
+     * a valid conf-slot index everywhere.
      */
-    ngx_http_compression_backends[0] = ngx_http_compression_backend_zstd;
-    ngx_http_compression_backends[1] = ngx_http_compression_backend_brotli;
+    n = 0;
+
+#if (NGX_HTTP_COMPRESSION_HAVE_ZSTD)
+    ngx_http_compression_backends[n++] = ngx_http_compression_backend_zstd;
+#endif
+
+#if (NGX_HTTP_COMPRESSION_HAVE_BROTLI)
+    ngx_http_compression_backends[n++] = ngx_http_compression_backend_brotli;
+#endif
+
+    ngx_http_compression_backends[n] = NULL;
 
     return ngx_http_compression_dict_add_variables(cf);
 }
@@ -406,6 +421,36 @@ ngx_http_compression_create_main_conf(ngx_conf_t *cf)
  */
 
 /*
+ * Coding names whose backend is compiled OUT of this build, for
+ * error text: "unknown coding" would be wrong advice when the fix is
+ * the build line, not the config. Returns NULL when the token is not
+ * a compiled-out coding.
+ */
+static const char *
+ngx_http_compression_absent_coding(ngx_str_t *token)
+{
+#if !(NGX_HTTP_COMPRESSION_HAVE_ZSTD)
+    if ((token->len == 4 && ngx_strncmp(token->data, "zstd", 4) == 0)
+        || (token->len == 3 && ngx_strncmp(token->data, "dcz", 3) == 0))
+    {
+        return "zstd";
+    }
+#endif
+
+#if !(NGX_HTTP_COMPRESSION_HAVE_BROTLI)
+    if ((token->len == 2 && ngx_strncmp(token->data, "br", 2) == 0)
+        || (token->len == 3 && ngx_strncmp(token->data, "dcb", 3) == 0))
+    {
+        return "brotli";
+    }
+#endif
+
+    (void) token;
+    return NULL;
+}
+
+
+/*
  * Resolve a directive's coding token to a registry index. Returns
  * NGX_ERROR after logging when the token is known but not tunable
  * here (gzip, dict codings) or unknown entirely; `what` names the
@@ -418,7 +463,9 @@ ngx_http_compression_tuning_index(ngx_conf_t *cf, ngx_str_t *token,
     ngx_int_t                        i;
     ngx_http_compression_backend_t  *b;
 
-    for (i = 0; i < NGX_HTTP_COMPRESSION_NBACKENDS; i++) {
+    /* terminator-walked, not count-walked: compiles warning-free at
+     * every NBACKENDS including zero */
+    for (i = 0; ngx_http_compression_backends[i] != NULL; i++) {
         b = ngx_http_compression_backends[i];
 
         if (token->len == b->coding.len
@@ -448,6 +495,18 @@ ngx_http_compression_tuning_index(ngx_conf_t *cf, ngx_str_t *token,
                            "\"gzip_comp_level\" directive, not \"%s\"",
                            what);
         return NGX_ERROR;
+    }
+
+    {
+        const char  *absent = ngx_http_compression_absent_coding(token);
+
+        if (absent != NULL) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "coding \"%V\" in \"%s\" is not available: "
+                               "this nginx was built without %s support",
+                               token, what, absent);
+            return NGX_ERROR;
+        }
     }
 
     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -597,7 +656,7 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     conf->order = NULL;     /* NULL = inherit / shipped default */
     conf->static_enable = NGX_CONF_UNSET_UINT;
 
-    for (i = 0; i < NGX_HTTP_COMPRESSION_NBACKENDS; i++) {
+    for (i = 0; i < NGX_HTTP_COMPRESSION_CONF_SLOTS; i++) {
         conf->levels[i] = NGX_CONF_UNSET;
         conf->window_bits[i] = NGX_CONF_UNSET;
     }
@@ -624,7 +683,7 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
      * never re-implement defaulting. Merge runs after preconfiguration
      * filled the registry.
      */
-    for (i = 0; i < NGX_HTTP_COMPRESSION_NBACKENDS; i++) {
+    for (i = 0; ngx_http_compression_backends[i] != NULL; i++) {
         ngx_conf_merge_value(conf->levels[i], prev->levels[i],
                              ngx_http_compression_backends[i]->level_default);
         ngx_conf_merge_value(conf->window_bits[i], prev->window_bits[i],
@@ -671,24 +730,29 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (conf->order == NULL) {
         /* shipped default: zstd br gzip (RFC: dynamic prefers the
-         * cheap coding; gzip last makes deferral risk-free) */
+         * cheap coding; gzip last makes deferral risk-free) — each
+         * token joins only when its implementation is in the build */
         conf->order = ngx_array_create(cf->pool, 3,
                                     sizeof(ngx_http_compression_token_t));
         if (conf->order == NULL) {
             return NGX_CONF_ERROR;
         }
 
+#if (NGX_HTTP_COMPRESSION_HAVE_ZSTD)
         t = ngx_array_push(conf->order);
         if (t == NULL) {
             return NGX_CONF_ERROR;
         }
         t->backend = ngx_http_compression_backend_zstd;
+#endif
 
+#if (NGX_HTTP_COMPRESSION_HAVE_BROTLI)
         t = ngx_array_push(conf->order);
         if (t == NULL) {
             return NGX_CONF_ERROR;
         }
         t->backend = ngx_http_compression_backend_brotli;
+#endif
 
 #if (NGX_HTTP_GZIP)
         /* the gzip token joins the default only when there is a core
@@ -793,6 +857,19 @@ ngx_http_compression_order(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
             if (b == NULL) {
+                const char  *absent =
+                    ngx_http_compression_absent_coding(&value[i]);
+
+                if (absent != NULL) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "coding \"%V\" in "
+                                       "\"compression_order\" is not "
+                                       "available: this nginx was built "
+                                       "without %s support",
+                                       &value[i], absent);
+                    return NGX_CONF_ERROR;
+                }
+
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "unknown coding \"%V\" in "
                                    "\"compression_order\"", &value[i]);
@@ -1013,13 +1090,13 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
 
     /* PHASE3: resolve this coding's tuning slot (concrete post-merge;
      * the dict variant shares the base coding's values) */
-    for (i = 0; i < NGX_HTTP_COMPRESSION_NBACKENDS; i++) {
+    for (i = 0; ngx_http_compression_backends[i] != NULL; i++) {
         if (ngx_http_compression_backends[i] == elected) {
             break;
         }
     }
 
-    if (i == NGX_HTTP_COMPRESSION_NBACKENDS) {
+    if (ngx_http_compression_backends[i] == NULL) {
         /* unreachable: every order token is a registry pointer */
         return NGX_ERROR;
     }

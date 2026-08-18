@@ -24,8 +24,19 @@
 #include "ngx_http_compression.h"
 #include "ngx_http_compression_ae.h"
 
-#include <zstd.h>
 
+/*
+ * RFC 8878 FORMAT constants, deliberately NOT taken from <zstd.h>:
+ * static serving is file serving for every coding — a build without
+ * libzstd (or without any compression library at all) still probes
+ * and serves .zst sidecars byte-exact, exactly as it serves .gz
+ * without zlib. The values are the format's, frozen by the RFC:
+ * frame magic 0xFD2FB528, skippable magics 0x184D2A5? (low nibble
+ * masked).
+ */
+#define NGX_HTTP_COMPRESSION_STATIC_ZSTD_MAGIC       0xFD2FB528U
+#define NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_MASK   0xFFFFFFF0U
+#define NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_START  0x184D2A50U
 
 /* browsers enforce 8 MB for Content-Encoding: zstd (RFC 8878 §3.1.1.1.2) */
 #define NGX_HTTP_COMPRESSION_STATIC_MAX_WINDOW  (8 * 1024 * 1024)
@@ -243,8 +254,9 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
        | ((uint32_t) hdr[2] << 16)
        | ((uint32_t) hdr[3] << 24);
 
-    if (mw != ZSTD_MAGICNUMBER
-        && (mw & ZSTD_MAGIC_SKIPPABLE_MASK) != ZSTD_MAGIC_SKIPPABLE_START)
+    if (mw != NGX_HTTP_COMPRESSION_STATIC_ZSTD_MAGIC
+        && (mw & NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_MASK)
+           != NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_START)
     {
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "compression static: \"%V\" is not a zstd frame "
@@ -257,7 +269,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
     /* leading REGULAR frame only — a skippable lead is exempt (its
      * real header sits after a variable skip) and multi-frame assets
      * are pathological; the parent README documents the scope */
-    if (mw == ZSTD_MAGICNUMBER) {
+    if (mw == NGX_HTTP_COMPRESSION_STATIC_ZSTD_MAGIC) {
         uint64_t    window;
         ngx_uint_t  i, fhd, fcs_size, off;
 

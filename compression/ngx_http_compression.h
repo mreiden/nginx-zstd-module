@@ -81,11 +81,44 @@ typedef enum {
 
 
 /*
- * Compile-time backend count. The registry is a fixed array (plus the
- * NULL terminator) and the conf's per-coding tuning slots are sized by
- * it; a new backend bumps this constant along with its registry entry.
+ * Backend availability. The config script (or -D on the compiler
+ * line) sets these to 0 when a library is absent; unset means
+ * present, so the current always-both build glue keeps working
+ * unchanged. Each backend TU compiles to nothing under its 0 — the
+ * registry stays DENSE (no holes), which is what lets everything
+ * downstream index by registry position.
+ *
+ * The zero-backend build is deliberately legal: static sidecar
+ * serving is file serving and needs no compression library for ANY
+ * coding (the .zst window probe reads format constants, not the
+ * libzstd API), so a lib-less build still subsumes gzip_static and
+ * serves .zst/.br sidecars byte-exact. Only the dynamic filter needs
+ * the libraries.
  */
-#define NGX_HTTP_COMPRESSION_NBACKENDS  2
+#ifndef NGX_HTTP_COMPRESSION_HAVE_ZSTD
+#define NGX_HTTP_COMPRESSION_HAVE_ZSTD    1
+#endif
+
+#ifndef NGX_HTTP_COMPRESSION_HAVE_BROTLI
+#define NGX_HTTP_COMPRESSION_HAVE_BROTLI  1
+#endif
+
+/*
+ * Compile-time backend count — derived, never hand-set. The registry
+ * is a fixed array (plus the NULL terminator) and the conf's
+ * per-coding tuning slots are sized by it; a new backend adds its
+ * HAVE term here along with its registry entry.
+ */
+#define NGX_HTTP_COMPRESSION_NBACKENDS                                       \
+    (NGX_HTTP_COMPRESSION_HAVE_ZSTD + NGX_HTTP_COMPRESSION_HAVE_BROTLI)
+
+/* zero-length arrays are not C; the zero-backend build keeps one
+ * (never-indexed) conf slot */
+#if (NGX_HTTP_COMPRESSION_NBACKENDS > 0)
+#define NGX_HTTP_COMPRESSION_CONF_SLOTS  NGX_HTTP_COMPRESSION_NBACKENDS
+#else
+#define NGX_HTTP_COMPRESSION_CONF_SLOTS  1
+#endif
 
 
 /*
@@ -284,8 +317,8 @@ typedef struct {
      * against the backend's declared defaults, so by election time
      * every slot is concrete (see ngx_http_compression_tuning_t).
      */
-    ngx_int_t      levels[NGX_HTTP_COMPRESSION_NBACKENDS];
-    ngx_int_t      window_bits[NGX_HTTP_COMPRESSION_NBACKENDS];
+    ngx_int_t      levels[NGX_HTTP_COMPRESSION_CONF_SLOTS];
+    ngx_int_t      window_bits[NGX_HTTP_COMPRESSION_CONF_SLOTS];
 
     /*
      * PHASE1a: this level's active dictionaries — pointers into the

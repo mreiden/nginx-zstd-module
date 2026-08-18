@@ -6,6 +6,8 @@
 
 #include "ngx_http_compression.h"
 
+#if (NGX_HTTP_COMPRESSION_HAVE_ZSTD)
+
 #include <zstd.h>
 
 
@@ -243,3 +245,5 @@ static ngx_http_compression_backend_t  ngx_http_compression_zstd_backend = {
 
 ngx_http_compression_backend_t  *ngx_http_compression_backend_zstd =
     &ngx_http_compression_zstd_backend;
+
+#endif /* NGX_HTTP_COMPRESSION_HAVE_ZSTD */

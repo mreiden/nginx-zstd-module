@@ -401,6 +401,41 @@ operator window ceiling below the dictionary size degrades ratio
 silently. That computation belongs to attach_dictionary and lands
 with the prepared-dictionary work.
 
+### 23. The backend roster is a build-time variable (review question)
+
+Asked directly on the branch: does `NGX_HTTP_COMPRESSION_NBACKENDS 2`
+hold up when the module is built without libbrotli or libzstd? It
+did not — the constant was hand-set, the backend TUs included their
+library headers unconditionally, the registry fill referenced extern
+symbols that would not link, and the conf's tuning arrays were sized
+to a roster that stopped being true. Now:
+`NGX_HTTP_COMPRESSION_HAVE_ZSTD`/`_BROTLI` (default 1; the config
+script or -D sets 0), NBACKENDS is DERIVED as their sum, each backend
+TU compiles to nothing under its 0, the registry fill is DENSE under
+the same guards (no holes — registry position stays a valid conf-slot
+index), and absent codings fail with "this nginx was built without X
+support" instead of the lying "unknown coding". Registry walks are
+terminator-based, not count-based — count-walks trip
+-Wtype-limits/-Werror the moment a constant bound can be zero.
+
+The zero-backend build is deliberately LEGAL and useful: static
+sidecar serving is file serving for every coding, so the .zst window
+probe now reads RFC 8878 format constants instead of <zstd.h> macros
+and static.c includes no compression library at all — a lib-less
+build still subsumes gzip_static and serves .zst/.br byte-exact.
+Verified live: all three reduced shapes (no-brotli / no-zstd /
+neither) build clean and smoke — static .zst + .br served with
+correct CE in every shape, dynamic election falling to the remaining
+backend, absent-coding config errors asserted. What this does NOT yet
+include: the config-script feature detection that would set the HAVE
+macros from a real probe — that stays with the hardened-build-glue
+item; the -D path is how CI can exercise the shapes meanwhile.
+
+Script lesson (again): `set -o pipefail` + `nginx -t | grep -q` eats
+the match — nginx -t exits nonzero BY DESIGN on the config errors
+under test, and pipefail propagates it past grep's success. Capture
+first, then grep.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep
