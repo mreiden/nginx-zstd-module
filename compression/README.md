@@ -63,4 +63,19 @@ degrade to the base coding on any negotiation miss, and a hoisted
 `Vary: Available-Dictionary` on every eligible response wherever
 dictionaries are configured — identity fallbacks included.
 
+**Phase 3** (productization) begins with the per-coding tuning
+directives, keyed by coding so a new backend needs no new commands:
+`compression_level <coding> <n>` (zstd `-131072..22`, `0` = library
+default, default `3`; br quality `0..11`, default `6`) and
+`compression_window <coding> <size>` (a power-of-two size stored as
+its log2: zstd `1k..128m` acting as a per-request memory ceiling,
+unset by default; br `1k..16m`, default `512k`). Bounds and defaults
+are declared by the backend in the vtable and validated at config
+load. The `gzip` token is rejected with a pointer at
+`gzip_comp_level` (defer means the core module's own tuning applies),
+and `dcz`/`dcb` are rejected with a pointer at their base coding — a
+dictionary variant shares the base coding's parameters (brotli bakes
+quality into the prepared dictionary; there is nothing separate to
+tune).
+
 [myguard-labs/nginx-zstd-module#109]: https://github.com/myguard-labs/nginx-zstd-module/issues/109

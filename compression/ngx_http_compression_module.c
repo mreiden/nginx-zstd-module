@@ -14,7 +14,8 @@
 extern ngx_http_compression_backend_t  *ngx_http_compression_backend_zstd;
 extern ngx_http_compression_backend_t  *ngx_http_compression_backend_brotli;
 
-ngx_http_compression_backend_t  *ngx_http_compression_backends[] = {
+ngx_http_compression_backend_t
+    *ngx_http_compression_backends[NGX_HTTP_COMPRESSION_NBACKENDS + 1] = {
     NULL,   /* set in preconfiguration: zstd */
     NULL,   /* brotli */
     NULL
@@ -57,6 +58,10 @@ static char *ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static char *ngx_http_compression_order(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_compression_level_cmd(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_compression_window_cmd(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_compression_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_compression_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_compression_body_filter(ngx_http_request_t *r,
@@ -83,6 +88,20 @@ static ngx_command_t  ngx_http_compression_commands[] = {
     { ngx_string("compression_order"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
       ngx_http_compression_order,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("compression_level"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
+      ngx_http_compression_level_cmd,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("compression_window"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
+      ngx_http_compression_window_cmd,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
@@ -376,27 +395,196 @@ ngx_http_compression_create_main_conf(ngx_conf_t *cf)
 
 
 /*
- * PHASE0: per-backend tuning directives (levels, windows) are out of
- * scope; a unified "compression_level" was considered and REJECTED —
- * level scales are not comparable across codecs (zstd 3 and brotli 5
- * are both "the sane default" yet share no axis), so the real module
- * keeps per-coding directives. Wrinkle #8.
+ * PHASE3 tuning directives. Phase 0 rejected one unified level VALUE
+ * (zstd 3 and brotli 6 are both "the sane default" yet share no axis
+ * — wrinkle #8); what survives is one unified level NAME, keyed by
+ * coding: `compression_level zstd 9` / `compression_level br 11`.
+ * The backend declares its scale's bounds and default in the vtable,
+ * so a new coding gets both directives for free with its registry
+ * entry — and the tokens that are NOT backends (gzip, dcz/dcb) get
+ * educational rejections instead of silently doing nothing.
+ */
+
+/*
+ * Resolve a directive's coding token to a registry index. Returns
+ * NGX_ERROR after logging when the token is known but not tunable
+ * here (gzip, dict codings) or unknown entirely; `what` names the
+ * directive for the message.
  */
 static ngx_int_t
-ngx_http_compression_default_level(ngx_http_compression_backend_t *b)
+ngx_http_compression_tuning_index(ngx_conf_t *cf, ngx_str_t *token,
+    const char *what)
 {
-    if (b->coding.len == 4
-        && ngx_strncmp(b->coding.data, "zstd", 4) == 0)
-    {
-        return 3;
+    ngx_int_t                        i;
+    ngx_http_compression_backend_t  *b;
+
+    for (i = 0; i < NGX_HTTP_COMPRESSION_NBACKENDS; i++) {
+        b = ngx_http_compression_backends[i];
+
+        if (token->len == b->coding.len
+            && ngx_strncmp(token->data, b->coding.data, token->len) == 0)
+        {
+            return i;
+        }
+
+        if (b->dict_coding.len != 0
+            && token->len == b->dict_coding.len
+            && ngx_strncmp(token->data, b->dict_coding.data,
+                           token->len) == 0)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"%V\" is tuned through its base coding: "
+                               "use \"%s %V ...\" (a dictionary variant "
+                               "shares the base coding's parameters)",
+                               token, what, &b->coding);
+            return NGX_ERROR;
+        }
     }
-    return 5;   /* brotli quality */
+
+    if (token->len == 4 && ngx_strncmp(token->data, "gzip", 4) == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "gzip is compressed by the core gzip filter "
+                           "(defer/veto): tune it with the core "
+                           "\"gzip_comp_level\" directive, not \"%s\"",
+                           what);
+        return NGX_ERROR;
+    }
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "unknown coding \"%V\" in \"%s\"", token, what);
+    return NGX_ERROR;
+}
+
+
+static char *
+ngx_http_compression_level_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_compression_conf_t *ccf = conf;
+
+    u_char                          *p;
+    size_t                           len;
+    ngx_int_t                        i, n;
+    ngx_str_t                       *value;
+    ngx_uint_t                       neg;
+    ngx_http_compression_backend_t  *b;
+
+    (void) cmd;
+
+    value = cf->args->elts;
+
+    i = ngx_http_compression_tuning_index(cf, &value[1],
+                                          "compression_level");
+    if (i == NGX_ERROR) {
+        return NGX_CONF_ERROR;
+    }
+
+    b = ngx_http_compression_backends[i];
+
+    /* ngx_atoi has no sign handling; zstd's fast levels are negative */
+    p = value[2].data;
+    len = value[2].len;
+    neg = 0;
+
+    if (len > 0 && p[0] == '-') {
+        neg = 1;
+        p++;
+        len--;
+    }
+
+    n = ngx_atoi(p, len);
+    if (n == NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid level \"%V\" in \"compression_level\"",
+                           &value[2]);
+        return NGX_CONF_ERROR;
+    }
+
+    if (neg) {
+        n = -n;
+    }
+
+    if (n < b->level_min || n > b->level_max) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "compression level for \"%V\" must be between "
+                           "%i and %i", &b->coding, b->level_min,
+                           b->level_max);
+        return NGX_CONF_ERROR;
+    }
+
+    if (ccf->levels[i] != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    ccf->levels[i] = n;
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_http_compression_window_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_compression_conf_t *ccf = conf;
+
+    ssize_t                          size;
+    ngx_int_t                        i, bits;
+    ngx_str_t                       *value;
+    ngx_http_compression_backend_t  *b;
+
+    (void) cmd;
+
+    value = cf->args->elts;
+
+    i = ngx_http_compression_tuning_index(cf, &value[1],
+                                          "compression_window");
+    if (i == NGX_ERROR) {
+        return NGX_CONF_ERROR;
+    }
+
+    b = ngx_http_compression_backends[i];
+
+    size = ngx_parse_size(&value[2]);
+    if (size == NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid size \"%V\" in \"compression_window\"",
+                           &value[2]);
+        return NGX_CONF_ERROR;
+    }
+
+    /* the window is a power of two by both formats' definition; the
+     * directive takes the human SIZE (512k, 8m) and stores its log2 */
+    for (bits = b->window_bits_min; bits <= b->window_bits_max; bits++) {
+        if (size == (ssize_t) 1 << bits) {
+            break;
+        }
+    }
+
+    if (bits > b->window_bits_max) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "compression window for \"%V\" must be a "
+                           "power-of-two size between %uz and %uz bytes",
+                           &b->coding,
+                           (size_t) 1 << b->window_bits_min,
+                           (size_t) 1 << b->window_bits_max);
+        return NGX_CONF_ERROR;
+    }
+
+    if (ccf->window_bits[i] != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
+    ccf->window_bits[i] = bits;
+
+    return NGX_CONF_OK;
 }
 
 
 static void *
 ngx_http_compression_create_conf(ngx_conf_t *cf)
 {
+    ngx_uint_t                    i;
     ngx_http_compression_conf_t  *conf;
 
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_compression_conf_t));
@@ -409,6 +597,11 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     conf->order = NULL;     /* NULL = inherit / shipped default */
     conf->static_enable = NGX_CONF_UNSET_UINT;
 
+    for (i = 0; i < NGX_HTTP_COMPRESSION_NBACKENDS; i++) {
+        conf->levels[i] = NGX_CONF_UNSET;
+        conf->window_bits[i] = NGX_CONF_UNSET;
+    }
+
     return conf;
 }
 
@@ -419,10 +612,25 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_compression_conf_t *prev = parent;
     ngx_http_compression_conf_t *conf = child;
 
+    ngx_uint_t                     i;
     ngx_http_compression_token_t  *t;
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
+
+    /*
+     * PHASE3: tuning slots resolve to the backend's declared defaults
+     * here, so election-time values are always concrete and backends
+     * never re-implement defaulting. Merge runs after preconfiguration
+     * filled the registry.
+     */
+    for (i = 0; i < NGX_HTTP_COMPRESSION_NBACKENDS; i++) {
+        ngx_conf_merge_value(conf->levels[i], prev->levels[i],
+                             ngx_http_compression_backends[i]->level_default);
+        ngx_conf_merge_value(conf->window_bits[i], prev->window_bits[i],
+                             ngx_http_compression_backends[i]
+                                 ->window_bits_default);
+    }
 
     if (ngx_http_merge_types(cf, &conf->types_keys, &conf->types,
                              &prev->types_keys, &prev->types,
@@ -630,6 +838,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     ngx_http_compression_conf_t     *conf;
     ngx_http_compression_token_t    *t;
     ngx_http_compression_dict_t     *dict, *elected_dict;
+    ngx_http_compression_tuning_t    tuning;
     ngx_http_compression_backend_t  *elected;
 
     conf = ngx_http_get_module_loc_conf(r, ngx_http_compression_module);
@@ -793,12 +1002,29 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     ctx->backend = elected;
     ctx->out_size = elected->out_size(r->headers_out.content_length_n);
 
-    if (elected->create(r, ngx_http_compression_default_level(elected),
-                        &ctx->bctx)
-        != NGX_OK)
-    {
+    /* PHASE3: resolve this coding's tuning slot (concrete post-merge;
+     * the dict variant shares the base coding's values) */
+    for (i = 0; i < NGX_HTTP_COMPRESSION_NBACKENDS; i++) {
+        if (ngx_http_compression_backends[i] == elected) {
+            break;
+        }
+    }
+
+    if (i == NGX_HTTP_COMPRESSION_NBACKENDS) {
+        /* unreachable: every order token is a registry pointer */
         return NGX_ERROR;
     }
+
+    tuning.level = conf->levels[i];
+    tuning.window_bits = conf->window_bits[i];
+
+    if (elected->create(r, &tuning, &ctx->bctx) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "compression: create %V level %i window_bits %i",
+                   &elected->coding, tuning.level, tuning.window_bits);
 
     if (elected->hint_input_size != NULL
         && r->headers_out.content_length_n > 0)

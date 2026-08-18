@@ -363,6 +363,44 @@ Lesson: porting "intact" from ONE parent quietly inherits that
 parent's divergences from the module being subsumed. Every subsumed
 module deserves its own side-by-side read of the original.
 
+### 22. Tuning directives: one name, keyed by coding (phase 3 opens)
+
+Phase 0 rejected one unified level VALUE (wrinkle 8: zstd 3 and
+brotli 6 share no axis); what survives phase 3 is one unified level
+NAME: `compression_level <coding> <n>` and `compression_window
+<coding> <size>`, validated against bounds the backend DECLARES in
+the vtable (level_min/max/default, window_bits_min/max/default). The
+shape buys three things: a new backend gets both directives for free
+with its registry entry (the extensibility contract with zero new
+commands); the non-backend tokens get educational rejections instead
+of silently configuring nothing (`gzip` → "use gzip_comp_level" —
+defer means the core's own tuning applies; `dcz`/`dcb` → "tuned
+through the base coding" — a prepared brotli dictionary bakes in the
+quality, so a separate dict knob would be a lie); and defaulting
+lives in ONE place (conf merge resolves unset slots from the declared
+defaults, so backends never see an unset value).
+
+Found while declaring the defaults: the phase-0 shim said brotli 5;
+ngx_brotli's `brotli_comp_level` default is 6. The drift is corrected
+and pinned (suite block on the default's debug witness). Lesson:
+prototype constants that stand in for "the parent's default" get a
+parity check the moment the real seam lands, because nobody re-reads
+a shim.
+
+The deterministic test witness is a debug line logging exactly what
+reached the encoder ("compression: create zstd level 19 window_bits
+23") — applied-parameter witnesses beat ratio assertions, which hang
+test outcomes on codec internals. Tuned blocks still decode through
+the reference CLIs so "a tuned stream is a valid stream" stays
+proven (the parent's negative-level lesson).
+
+Known interaction deferred with a note in the zstd backend: the
+parent's dcz path sizes the window UP to dictionary + expected
+content (far end of a big dictionary must stay addressable); an
+operator window ceiling below the dictionary size degrades ratio
+silently. That computation belongs to attach_dictionary and lands
+with the prepared-dictionary work.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep

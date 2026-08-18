@@ -49,8 +49,8 @@ ngx_http_compression_brotli_cleanup(void *data)
 
 
 static ngx_int_t
-ngx_http_compression_brotli_create(ngx_http_request_t *r, ngx_int_t level,
-    void **bctx)
+ngx_http_compression_brotli_create(ngx_http_request_t *r,
+    const ngx_http_compression_tuning_t *tuning, void **bctx)
 {
     ngx_pool_cleanup_t                 *cln;
     ngx_http_compression_brotli_ctx_t  *b;
@@ -64,7 +64,7 @@ ngx_http_compression_brotli_create(ngx_http_request_t *r, ngx_int_t level,
     b = cln->data;
     ngx_memzero(b, sizeof(*b));
     b->r = r;
-    b->level = level;
+    b->level = tuning->level;
 
     b->enc = BrotliEncoderCreateInstance(NULL, NULL, NULL);
     if (b->enc == NULL) {
@@ -74,14 +74,16 @@ ngx_http_compression_brotli_create(ngx_http_request_t *r, ngx_int_t level,
     cln->handler = ngx_http_compression_brotli_cleanup;
 
     if (!BrotliEncoderSetParameter(b->enc, BROTLI_PARAM_QUALITY,
-                                   (uint32_t) level))
+                                   (uint32_t) tuning->level))
     {
         return NGX_ERROR;
     }
 
-    /* modest fixed window for the prototype; a real module maps its
-     * lg_win directive here */
-    if (!BrotliEncoderSetParameter(b->enc, BROTLI_PARAM_LGWIN, 19)) {
+    /* lg_win is always concrete here (declared default 19 = 512k,
+     * ngx_brotli's brotli_window default) */
+    if (!BrotliEncoderSetParameter(b->enc, BROTLI_PARAM_LGWIN,
+                                   (uint32_t) tuning->window_bits))
+    {
         return NGX_ERROR;
     }
 
@@ -249,6 +251,14 @@ ngx_http_compression_brotli_out_size(off_t content_length)
 static ngx_http_compression_backend_t  ngx_http_compression_brotli_backend = {
     ngx_string("br"),
     ngx_string("dcb"),
+    BROTLI_MIN_QUALITY,
+    BROTLI_MAX_QUALITY,
+    6,      /* ngx_brotli's brotli_comp_level merge default — the
+             * phase-0 shim said 5, a drift from the parent this
+             * declaration corrects */
+    BROTLI_MIN_WINDOW_BITS,
+    BROTLI_MAX_WINDOW_BITS,
+    19,     /* 512k, ngx_brotli's brotli_window default */
     ngx_http_compression_brotli_create,
     ngx_http_compression_brotli_hint_input_size,
     ngx_http_compression_brotli_attach_dictionary,

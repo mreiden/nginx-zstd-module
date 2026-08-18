@@ -80,6 +80,29 @@ typedef enum {
 } ngx_http_compression_op_e;
 
 
+/*
+ * Compile-time backend count. The registry is a fixed array (plus the
+ * NULL terminator) and the conf's per-coding tuning slots are sized by
+ * it; a new backend bumps this constant along with its registry entry.
+ */
+#define NGX_HTTP_COMPRESSION_NBACKENDS  2
+
+
+/*
+ * PHASE3: resolved per-request tuning, passed to create(). The values
+ * are always concrete by the time a backend sees them — conf merge
+ * fills unset slots from the backend's declared defaults — so a
+ * backend never re-implements defaulting. window_bits is log2 of the
+ * window size; 0 means "leave the library's own default untouched"
+ * (only zstd uses that meaning: its window is a per-request memory
+ * ceiling the operator may simply not set).
+ */
+typedef struct {
+    ngx_int_t  level;
+    ngx_int_t  window_bits;
+} ngx_http_compression_tuning_t;
+
+
 typedef struct ngx_http_compression_backend_s  ngx_http_compression_backend_t;
 
 struct ngx_http_compression_backend_s {
@@ -112,6 +135,26 @@ struct ngx_http_compression_backend_s {
     ngx_str_t    dict_coding;
 
     /*
+     * PHASE3: declared tuning contract. Each backend owns its level
+     * SCALE (zstd -131072..22 where 0 = library default, brotli
+     * quality 0..11) — the scales share no axis, which is why phase 0
+     * rejected one unified level VALUE. The keyed directives
+     * (`compression_level <coding> <n>`, `compression_window <coding>
+     * <size>`) keep per-coding values behind one name and validate
+     * against these bounds at config load, so a new backend gets its
+     * directives for free with its registry entry. The dict variant
+     * shares the base coding's tuning (a prepared brotli dictionary
+     * bakes in the quality — one more reason there is no separate
+     * dcz/dcb knob).
+     */
+    ngx_int_t    level_min;
+    ngx_int_t    level_max;
+    ngx_int_t    level_default;
+    ngx_int_t    window_bits_min;       /* log2 bounds for the window */
+    ngx_int_t    window_bits_max;
+    ngx_int_t    window_bits_default;   /* 0 = library default */
+
+    /*
      * Per-request lifecycle. INVARIANT (wrinkle #2, both libraries
      * force it): create → hint_input_size → attach_dictionary →
      * process. zstd's ZSTD_CCtx_refPrefix must precede the first
@@ -125,7 +168,8 @@ struct ngx_http_compression_backend_s {
      * never sees a raw encoder pointer and there is no destroy() slot
      * to forget to call on error paths.
      */
-    ngx_int_t  (*create)(ngx_http_request_t *r, ngx_int_t level,
+    ngx_int_t  (*create)(ngx_http_request_t *r,
+                         const ngx_http_compression_tuning_t *tuning,
                          void **bctx);
 
     /*
@@ -197,9 +241,12 @@ struct ngx_http_compression_backend_s {
 /*
  * Registry: compiled-in backends, NULL-terminated. The extensibility
  * contract from the RFC in its smallest form — a new coding is one
- * translation unit exporting one of these plus a registry entry.
+ * translation unit exporting one of these plus a registry entry (and
+ * a bump of NGX_HTTP_COMPRESSION_NBACKENDS, which also sizes the
+ * conf's tuning slots).
  */
-extern ngx_http_compression_backend_t  *ngx_http_compression_backends[];
+extern ngx_http_compression_backend_t
+    *ngx_http_compression_backends[NGX_HTTP_COMPRESSION_NBACKENDS + 1];
 
 
 /*
@@ -231,6 +278,14 @@ typedef struct {
     ngx_hash_t     types;
     ngx_array_t   *types_keys;
     ngx_array_t   *order;          /* of ngx_http_compression_token_t */
+
+    /*
+     * PHASE3: per-coding tuning, indexed by registry position. Merged
+     * against the backend's declared defaults, so by election time
+     * every slot is concrete (see ngx_http_compression_tuning_t).
+     */
+    ngx_int_t      levels[NGX_HTTP_COMPRESSION_NBACKENDS];
+    ngx_int_t      window_bits[NGX_HTTP_COMPRESSION_NBACKENDS];
 
     /*
      * PHASE1a: this level's active dictionaries — pointers into the

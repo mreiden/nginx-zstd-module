@@ -9,6 +9,22 @@
 #include <zstd.h>
 
 
+/*
+ * Declared level bounds (parent zstd_comp_level parity). The
+ * initializer needs compile-time constants, so the runtime
+ * ZSTD_minCLevel()/ZSTD_maxCLevel() values are pinned as literals:
+ * -(1 << 17) and 22, stable across every 1.4+ release. 0 is inside
+ * the range on purpose — it selects ZSTD_CLEVEL_DEFAULT. Pre-1.4
+ * libraries have no negative levels, matching the parent's clamp.
+ */
+#if ZSTD_VERSION_NUMBER >= 10400
+#define NGX_HTTP_COMPRESSION_ZSTD_LEVEL_MIN  (-131072)
+#else
+#define NGX_HTTP_COMPRESSION_ZSTD_LEVEL_MIN  0
+#endif
+#define NGX_HTTP_COMPRESSION_ZSTD_LEVEL_MAX  22
+
+
 typedef struct {
     ZSTD_CCtx           *cctx;
     ngx_http_request_t  *r;      /* for error logging with context */
@@ -28,8 +44,8 @@ ngx_http_compression_zstd_cleanup(void *data)
 
 
 static ngx_int_t
-ngx_http_compression_zstd_create(ngx_http_request_t *r, ngx_int_t level,
-    void **bctx)
+ngx_http_compression_zstd_create(ngx_http_request_t *r,
+    const ngx_http_compression_tuning_t *tuning, void **bctx)
 {
     ngx_pool_cleanup_t               *cln;
     ngx_http_compression_zstd_ctx_t  *z;
@@ -51,7 +67,23 @@ ngx_http_compression_zstd_create(ngx_http_request_t *r, ngx_int_t level,
 
     if (ZSTD_isError(ZSTD_CCtx_setParameter(z->cctx,
                                             ZSTD_c_compressionLevel,
-                                            (int) level)))
+                                            (int) tuning->level)))
+    {
+        return NGX_ERROR;
+    }
+
+    /*
+     * The window is a per-request memory CEILING (parent
+     * zstd_window_log semantics): unset (0) leaves the level's own
+     * default. PHASE3 note: the parent's dcz path additionally sizes
+     * the window UP to dictionary + expected content so the far end
+     * of a large dictionary keeps matching — that computation joins
+     * attach_dictionary when the prepared-dictionary work lands; an
+     * explicit operator ceiling must still win there, as here.
+     */
+    if (tuning->window_bits > 0
+        && ZSTD_isError(ZSTD_CCtx_setParameter(z->cctx, ZSTD_c_windowLog,
+                                               (int) tuning->window_bits)))
     {
         return NGX_ERROR;
     }
@@ -193,6 +225,14 @@ ngx_http_compression_zstd_out_size(off_t content_length)
 static ngx_http_compression_backend_t  ngx_http_compression_zstd_backend = {
     ngx_string("zstd"),
     ngx_string("dcz"),
+    NGX_HTTP_COMPRESSION_ZSTD_LEVEL_MIN,
+    NGX_HTTP_COMPRESSION_ZSTD_LEVEL_MAX,
+    3,      /* parent zstd_comp_level merge default */
+    10,     /* ZSTD_WINDOWLOG_MIN */
+    27,     /* ZSTD_WINDOWLOG_LIMIT_DEFAULT: past this, decoders demand
+             * explicit opt-in — a serving ceiling has no business
+             * beyond it */
+    0,      /* unset: the level's own window default */
     ngx_http_compression_zstd_create,
     ngx_http_compression_zstd_hint_input_size,
     ngx_http_compression_zstd_attach_dictionary,
