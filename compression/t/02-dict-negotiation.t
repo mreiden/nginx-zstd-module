@@ -57,7 +57,10 @@ qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
 Content-Encoding: dcz
 --- response_body_like eval
 $::dcz_re
---- raw_response_headers_like: Vary: Available-Dictionary
+--- raw_response_headers_like eval
+qr/Vary: Accept-Encoding, Available-Dictionary/
+--- raw_response_headers_unlike eval
+qr/Vary: Accept-Encoding\r/
 --- no_error_log
 [error]
 
@@ -108,7 +111,8 @@ GET /t
 Accept-Encoding: zstd, dcz
 --- response_headers
 Content-Encoding: zstd
---- raw_response_headers_like: Vary: Available-Dictionary
+--- raw_response_headers_like eval
+qr/Vary: Accept-Encoding, Available-Dictionary/
 --- no_error_log
 [error]
 
@@ -240,7 +244,12 @@ $::dcz_re
 
 
 
-=== TEST 9: identity clients still vary on Available-Dictionary
+=== TEST 9: identity clients still vary — ONE combined line
+# review round 2: a delegated AE line plus a literal AD line meant two
+# Vary lines on the wire, and first-line-keyed caches would drop the
+# dictionary axis. Dict locations now push the single combined line
+# and skip delegation entirely (gzip_vary on here must NOT produce a
+# second line).
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config
@@ -255,8 +264,10 @@ $::dcz_re
     }
 --- request
 GET /t
---- raw_response_headers_like: Vary: Available-Dictionary
---- raw_response_headers_unlike: Content-Encoding
+--- raw_response_headers_like eval
+qr/Vary: Accept-Encoding, Available-Dictionary/
+--- raw_response_headers_unlike eval
+qr/Vary: Accept-Encoding\r/
 --- response_body
 negotiation fixture body, long enough to compress meaningfully
 --- no_error_log

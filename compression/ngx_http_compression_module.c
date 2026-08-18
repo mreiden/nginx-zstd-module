@@ -506,7 +506,12 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
      * does. PHASE0: per-location; productization collapses this into
      * the #110-style per-module summary.
      */
-    if (conf->enable) {
+    /* dict-configured locations push their own combined Vary line and
+     * never depend on "gzip_vary on" — the warning would be wrong
+     * advice there (review round 2) */
+    if (conf->enable
+        && (conf->dicts == NULL || conf->dicts->nelts == 0))
+    {
         ngx_http_core_loc_conf_t  *clcf;
 
         clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
@@ -652,29 +657,25 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
 
     /*
      * Vary before any accept decision, so identity fallbacks vary too.
-     * The helper hides the build split: with the gzip module, emission
-     * is delegated via r->gzip_vary to nginx's own writers (still
-     * gated on "gzip_vary on" — merge_conf warns when off), and the
-     * compression_vary module's cooperation comes free; without it,
-     * the header is pushed literally.
-     */
-    if (ngx_http_compression_vary(r) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    ae = ngx_http_compression_ae_header(r);
-
-    /*
-     * PHASE1b: wherever dictionaries are configured, EVERY eligible
-     * response varies on Available-Dictionary — which encoding a
-     * client receives depends on that header for every client, and a
-     * shared cache that failed to key on it could serve an
-     * undecodable dcz/dcb body to a dictionary-less client. Hoisted
-     * before the accept checks (identity fallbacks vary too), pushed
-     * literally by the module in both build shapes: unlike
-     * Accept-Encoding there is no core emitter to delegate to — this
-     * is the RFC's "Available-Dictionary stays module-pushed"
-     * decision in code.
+     *
+     * Locations WITHOUT dictionaries delegate Accept-Encoding via the
+     * helper (r->gzip_vary with the gzip module — gated on "gzip_vary
+     * on", which merge_conf warns about — or a literal push without).
+     *
+     * Locations WITH dictionaries push ONE combined line,
+     * "Vary: Accept-Encoding, Available-Dictionary", instead of a
+     * delegated AE line plus a second literal AD line (review round
+     * 2): two Vary lines are legal per RFC 9110, but a fair number of
+     * intermediary caches key on the FIRST line only — precisely the
+     * hazard this header exists to prevent. Delegation is skipped ON
+     * PURPOSE there, so the core emitter cannot add a second line;
+     * these locations therefore need no "gzip_vary on" either (the
+     * merge-time warning skips them). Known narrow corner, accepted
+     * and documented: a gzip DEFERRAL in a dict location lets core
+     * gzip set r->gzip_vary itself and emit its own AE line beside
+     * the combined one — only when gzip is elected ahead of every
+     * better coding, and the combined line is still present for
+     * caches that read all lines.
      */
     if (conf->dicts != NULL && conf->dicts->nelts > 0) {
         ngx_table_elt_t  *v;
@@ -686,8 +687,13 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         v->hash = 1;
         v->next = NULL;
         ngx_str_set(&v->key, "Vary");
-        ngx_str_set(&v->value, "Available-Dictionary");
+        ngx_str_set(&v->value, "Accept-Encoding, Available-Dictionary");
+
+    } else if (ngx_http_compression_vary(r) != NGX_OK) {
+        return NGX_ERROR;
     }
+
+    ae = ngx_http_compression_ae_header(r);
 
     if (ae == NULL || ae->value.len == 0) {
         return ngx_http_next_header_filter(r);
@@ -827,6 +833,20 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
             return NGX_ERROR;
         }
         ctx->prologue_len = (size_t) plen;
+
+        /*
+         * The output buffer must hold the prologue (review round 2's
+         * blocking find): brotli's out_size is CONTENT-DERIVED —
+         * BrotliEncoderMaxCompressedSize(1..29) is smaller than the
+         * 36-byte dcb prologue — so a tiny known-length body sized a
+         * buffer the prologue memcpy overran (heap write, worker
+         * survives, response silently corrupt; ASan-reproduced).
+         * The guarantee belongs to whoever sizes the buffer: clamp
+         * here, where prologue_len is known, not in any backend.
+         */
+        if (ctx->out_size < ctx->prologue_len) {
+            ctx->out_size = ctx->prologue_len;
+        }
     }
 
     ngx_http_set_ctx(r, ctx, ngx_http_compression_module);
@@ -896,10 +916,13 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     /*
      * PHASE1b: the dict coding's wire prologue rides ahead of the
      * first encoder byte, in the same output buffer the first step
-     * fills (every backend's out_size dwarfs 40 bytes). Emitted on
-     * the first invocation that carries input — a zero-body response
-     * still gets it, since the last_buf special buf arrives through
-     * ctx->in like any other link.
+     * fills. The buffer is guaranteed to hold it by the clamp at
+     * election time — NOT by any assumption about backend out_size:
+     * zstd's recommendation is fixed and large, but brotli's is
+     * content-derived and can be as small as 7 bytes (review round
+     * 2). Emitted on the first invocation that carries input — a
+     * zero-body response still gets it, since the last_buf special
+     * buf arrives through ctx->in like any other link.
      */
     if (ctx->prologue_len > 0 && !ctx->prologue_sent && ctx->in != NULL) {
 

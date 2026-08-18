@@ -266,6 +266,56 @@ entirely. What it CONFIRMED:
   future coding lands in static serving automatically (gzip stays a
   table entry either way — it has no backend to hang an ext on).
 
+## Review round 2 (phases 1b–2)
+
+### 18. The dcb prologue could overflow its output buffer — comment-certified "safe"
+
+Blocking find, reviewer's. `BrotliEncoderMaxCompressedSize(1..29)` is
+smaller than the 36-byte dcb prologue, so a tiny known-length body
+sized an output buffer the prologue `memcpy` overran — and the comment
+four lines up said "every backend's out_size dwarfs 40 bytes", which
+is true for zstd's FIXED recommendation and false for brotli's
+CONTENT-DERIVED bound. ASan-reproduced before fixing: the heap write
+lands via the NEXT encoder step (the advanced `ob->last` makes
+`out_len` wrap), the worker SURVIVES, and the client gets a 200 with
+a silently corrupt body — production shape, not a crash. Fixed with a
+chassis clamp where `prologue_len` becomes known (`out_size =
+max(out_size, prologue_len)`) — the guarantee belongs to whoever
+sizes the buffer, never to per-backend accidents. Pinned by one-byte
+dcz/dcb roundtrip tests. Rule for the ground-rules list: a comment
+asserting a numeric safety property is a claim, and claims get
+clamps or asserts, not prose.
+
+### 19. One combined Vary line, not two
+
+Reviewer's find: the delegated `Vary: Accept-Encoding` (via
+r->gzip_vary) plus the literal `Vary: Available-Dictionary` meant TWO
+Vary lines on the wire — legal per RFC 9110, but a fair number of
+intermediary caches key on the first line only, which is precisely
+the hazard the header exists to prevent. Dict-configured locations
+now push ONE combined `Vary: Accept-Encoding, Available-Dictionary`
+and skip delegation entirely (so the core emitter cannot add a second
+line, and those locations no longer need — or get warned about —
+"gzip_vary on"). The suites' substring matches passed on either
+shape, which is its own lesson: header-shape assertions must pin the
+exact line and the ABSENCE of the split form. Accepted narrow corner,
+documented in code: a gzip deferral in a dict location lets core gzip
+emit its own AE line beside the combined one.
+
+### 20. Decode roundtrips live in the suites now
+
+Reviewer's find: every suite asserted headers and prologue bytes, but
+nothing fed a response back through a real decoder — the "decodes
+byte-exact" claims were hand-validated and unprotected against
+regression. t/04-roundtrip.t decodes every block's body through the
+reference CLIs (`add_response_body_check` + a `--- decode_with`
+section), with an incompressible ~200 KB fixture forcing multiple
+output-buffer ships (the double-FINISH path) and the one-byte blocks
+doubling as the overflow pins. Also acknowledged for CI wiring:
+clang-tidy currently errors on the compression/ files for want of the
+nginx include path — its C analysis is NOT running on this tree yet
+and must not be trusted as clean until wired.
+
 ## Phase-0 shortcuts (not findings — deliberate scope cuts)
 
 status set is 200-only (real module inherits the zstd filter's set);
