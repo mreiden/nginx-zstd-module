@@ -338,6 +338,19 @@ typedef struct {
     ngx_array_t   *static_order;
 
     /*
+     * PHASE3: per-request bypass predicates (parent zstd_bypass /
+     * fork brotli_bypass semantics — any predicate variable resolving
+     * non-empty and not "0" serves identity), plus the operator-named
+     * extra Vary field for header/cookie-driven predicates. One
+     * unified-module delta from the parents: bypass VETOES the gzip
+     * token too (latches core gzip off) — in this module gzip is part
+     * of the stack, and a bypass that silently fell through to core
+     * gzip would defeat the operator's intent.
+     */
+    ngx_array_t   *bypass;         /* of ngx_http_complex_value_t */
+    ngx_str_t      bypass_vary;
+
+    /*
      * PHASE3: output-buffer pool geometry. num caps how many output
      * bufs a request may hold in flight (the recycling backstop
      * against a slow client + fast upstream); size 0 means "the

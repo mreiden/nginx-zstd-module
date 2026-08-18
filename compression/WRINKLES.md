@@ -464,6 +464,28 @@ and the decode roundtrip proves the pause/drain/resume seams
 preserved the stream; the default cap is pinned to stay dormant on
 an ordinary response.
 
+### 25. Bypass predicates: the gzip token is part of the stack
+
+compression_bypass / compression_bypass_vary are the parents'
+zstd_bypass pair ported near-verbatim (stock set_predicate_slot /
+test_predicates; the operator-named extra Vary field on BOTH paths;
+the orphaned-bypass_vary config warning). ONE deliberate delta: in
+the parents, bypass falls through to whatever other compression
+modules run below — a zstd_bypass'd response can still come back
+gzip-compressed by core gzip, which is arguably fine for standalone
+modules that own only their coding. In the unified module gzip is an
+election TOKEN of this stack, so bypass VETOES it too (latches
+r->gzip_tested/gzip_ok): "do not compress this endpoint" has to mean
+the whole stack, or the BREACH-mitigation use case silently fails
+through the deferral door. Pinned by a paired test: bypass + gzip on
++ AE gzip serves identity, and the same config without the predicate
+match compresses via the deferral (the positive control that proves
+the veto is doing the work).
+
+Suite note: Test::Nginx's response_headers matcher FOLDS same-name
+header lines with ", " — asserting the folded value is how you pin
+"both Vary lines present" (and the fold initially read as a failure).
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep

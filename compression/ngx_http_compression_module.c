@@ -127,6 +127,20 @@ static ngx_command_t  ngx_http_compression_commands[] = {
       0,
       NULL },
 
+    { ngx_string("compression_bypass"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      ngx_http_set_predicate_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_compression_conf_t, bypass),
+      NULL },
+
+    { ngx_string("compression_bypass_vary"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_compression_conf_t, bypass_vary),
+      NULL },
+
     { ngx_string("compression_buffers"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE12,
       ngx_http_compression_buffers_cmd,
@@ -734,6 +748,7 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     conf->order = NULL;     /* NULL = inherit / shipped default */
     conf->static_enable = NGX_CONF_UNSET_UINT;
     conf->bufs.num = NGX_CONF_UNSET;
+    conf->bypass = NGX_CONF_UNSET_PTR;
 
     for (i = 0; i < NGX_HTTP_COMPRESSION_CONF_SLOTS; i++) {
         conf->levels[i] = NGX_CONF_UNSET;
@@ -755,6 +770,25 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
+
+    ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
+    ngx_conf_merge_str_value(conf->bypass_vary, prev->bypass_vary, "");
+
+    /*
+     * compression_bypass_vary only makes sense beside a bypass
+     * predicate: it names the request header the bypass decision
+     * varies on so shared caches key correctly. Alone it just emits a
+     * Vary field no response varies on — harmless over-varying, but
+     * warn so the misconfig is visible rather than silently degrading
+     * hit rate (parent zstd_bypass_vary parity).
+     */
+    if (conf->bypass_vary.len && conf->bypass == NULL) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "\"compression_bypass_vary\" is set without a "
+                           "\"compression_bypass\" predicate; it adds a "
+                           "\"Vary: %V\" field no response actually varies "
+                           "on", &conf->bypass_vary);
+    }
 
     /* default cap 32 in-flight bufs (core gzip's number), size 0 =
      * backend-recommended */
@@ -1038,6 +1072,52 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     if (r->headers_out.content_length_n != -1
         && r->headers_out.content_length_n < conf->min_length)
     {
+        return ngx_http_next_header_filter(r);
+    }
+
+    /*
+     * PHASE3 bypass (parent zstd_bypass semantics). The operator-named
+     * extra Vary field rides BOTH paths — the bypassed identity
+     * response and the compressed one — so a shared cache keys on the
+     * request header that drove the predicate (the module cannot infer
+     * which header that is; compression_bypass_vary names it). A
+     * second Vary line is fine: caches union all Vary fields.
+     */
+    if (conf->bypass_vary.len) {
+        ngx_table_elt_t  *bv;
+
+        bv = ngx_list_push(&r->headers_out.headers);
+        if (bv == NULL) {
+            return NGX_ERROR;
+        }
+
+        bv->hash = 1;
+        bv->next = NULL;
+        ngx_str_set(&bv->key, "Vary");
+        bv->value = conf->bypass_vary;
+    }
+
+    /*
+     * Any predicate variable resolving non-empty and not "0" serves
+     * identity — the operator lever for endpoints that must not be
+     * compressed (BREACH-style secret+reflection mixes,
+     * already-compressed dynamic payloads) without splitting the
+     * location. UNIFIED-MODULE DELTA from the parents: the gzip token
+     * is part of THIS stack, so bypass vetoes it too — the parents'
+     * standalone bypass falls through to core gzip, which would
+     * quietly defeat the operator's intent here.
+     */
+    if (conf->bypass != NULL
+        && ngx_http_test_predicates(r, conf->bypass) != NGX_OK)
+    {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "compression: bypassed by compression_bypass");
+
+#if (NGX_HTTP_GZIP)
+        r->gzip_tested = 1;
+        r->gzip_ok = 0;
+#endif
+
         return ngx_http_next_header_filter(r);
     }
 

@@ -92,4 +92,16 @@ both libraries compiles, elects what remains, rejects absent codings
 with a pointer at the build, and still serves every static sidecar —
 static serving reads format constants, not library APIs.
 
+Bypass predicates round out the phase-3 filter directives:
+`compression_bypass $var ...` serves identity when any predicate
+variable resolves non-empty and not `"0"` (the parents' zstd_bypass /
+brotli_bypass semantics), and `compression_bypass_vary <header>`
+names the request header the decision varies on so shared caches key
+correctly — emitted on both the bypassed and compressed responses.
+One deliberate delta from the parents: bypass vetoes the `gzip`
+election token too. In the standalone modules a bypassed response can
+still come back gzip-compressed by core gzip; here gzip is part of
+the stack, and "do not compress this endpoint" has to mean the whole
+stack.
+
 [myguard-labs/nginx-zstd-module#109]: https://github.com/myguard-labs/nginx-zstd-module/issues/109
