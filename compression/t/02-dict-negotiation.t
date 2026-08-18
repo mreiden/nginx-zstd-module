@@ -349,3 +349,51 @@ Content-Encoding: dcz
 $::dcz_re
 --- no_error_log
 [error]
+
+
+
+=== TEST 13: a 43-character byte sequence degrades gracefully
+# one under the only valid encoded length (WRINKLES 16's rule is
+# `== 44`); charset-valid so only the length gate rejects it
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        return 200 "negotiation fixture body, long enough to compress meaningfully\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :} . ("A" x 43) . qq{:}
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 14: a 45-character byte sequence degrades gracefully
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        return 200 "negotiation fixture body, long enough to compress meaningfully\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :} . ("A" x 45) . qq{:}
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]

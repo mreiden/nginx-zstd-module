@@ -28,6 +28,41 @@ our $br     = slurp("$f.br");
 our $gz     = slurp("$f.gz");
 our $bigwin = slurp("$f.bigwin.zst");
 
+# ── crafted zstd frame headers for the window-cap EDGES ─────────────
+# the probe only reads headers and decline paths never serve, so the
+# boundary fixtures are tiny hand-built byte strings instead of real
+# 8 MB streams; pass-case files are served AS-IS (byte-compared), no
+# decode expected
+our $magic       = "\x28\xB5\x2F\xFD";
+# descriptor path: window byte 0x68 -> 1<<(10+13) = 8 MB exactly
+# (the limit is `>`, so this passes); 0x70 -> 16 MB (declines)
+our $win8m_desc  = $magic . "\x00\x68";
+our $win16m_desc = $magic . "\x00\x70";
+# single-segment path: FHD 0xA0 = SS + 4-byte FCS; window = FCS
+our $ss8m        = $magic . "\xA0" . pack("V", 8388608);
+our $ss8m1       = $magic . "\xA0" . pack("V", 8388609);
+# FHD 0x60 = SS + 2-byte FCS: 65535 + the RFC 8878 +256 offset = 65791
+our $ss_fcs2     = $magic . "\x60\xFF\xFF";
+our $magic_only  = $magic;                 # 4 bytes: header truncated
+our $desc_trunc  = $magic . "\x00";        # 5 bytes: window byte missing
+our $tiny3       = "\x28\xB5\x2F";         # under the 4-byte minimum
+our $skippable   = "\x50\x2A\x4D\x18" . ("\x00" x 8);  # exempt lead
+
+# 8 KB of randomness for the directio blocks (compressed output stays
+# ~8 KB, comfortably over the directio threshold)
+our $bigwin8k;
+{
+    my $src8k = "";
+    open my $u, '<', '/dev/urandom' or die $!;
+    read $u, $src8k, 8192; close $u;
+    open my $w, '>', "$dir/rnd" or die $!;
+    binmode $w; print $w $src8k; close $w;
+    system("zstd -q -19 --long=27 < $dir/rnd > $dir/rnd.bigwin.zst") == 0
+        or die "bigwin8k";
+    $bigwin8k = slurp("$dir/rnd.bigwin.zst");
+}
+
+
 no_long_string();
 log_level 'warn';
 repeat_each(1);
@@ -324,3 +359,276 @@ Accept-Encoding: br
 $::src
 --- no_error_log
 [error]
+
+
+
+=== TEST 14: declared window of EXACTLY 8 MB passes (descriptor path)
+# the cap is `>`, not `>=`: 1<<23 is the largest window every browser
+# accepts, and it must serve. Crafted header, served as-is.
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::win8m_desc ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- response_body eval
+$::win8m_desc
+--- no_error_log
+[error]
+
+
+
+=== TEST 15: 16 MB descriptor window declines (first step above the cap)
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::win16m_desc ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- error_log
+declares a 16777216-byte decompression window
+--- no_error_log
+[alert]
+
+
+
+=== TEST 16: single-segment window of EXACTLY 8 MB passes
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::ss8m ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- response_body eval
+$::ss8m
+--- no_error_log
+[error]
+
+
+
+=== TEST 17: single-segment 8 MB + 1 declines (the exact crossing byte)
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::ss8m1 ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- error_log
+declares a 8388609-byte decompression window
+--- no_error_log
+[alert]
+
+
+
+=== TEST 18: the 2-byte FCS +256 offset parses and passes
+# RFC 8878's 2-byte field is offset by 256; 0xFFFF -> window 65791
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::ss_fcs2 ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- response_body eval
+$::ss_fcs2
+--- no_error_log
+[error]
+
+
+
+=== TEST 19: a 4-byte file (magic only) is a truncated header, declined
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::magic_only ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- error_log
+frame header truncated
+--- no_error_log
+[alert]
+
+
+
+=== TEST 20: a 5-byte file missing its window byte is truncated, declined
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::desc_trunc ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- error_log
+frame header truncated
+--- no_error_log
+[alert]
+
+
+
+=== TEST 21: a 3-byte file is under the magic minimum, declined
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::tiny3 ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- error_log
+too small to be a zstd frame
+--- no_error_log
+[alert]
+
+
+
+=== TEST 22: a skippable leading frame is exempt from the window check
+# its real header sits after a variable-length skip; the documented
+# leading-frame scope serves it as-is
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::skippable ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- response_body eval
+$::skippable
+--- no_error_log
+[error]
+
+
+
+=== TEST 23: the window check runs UNDER DIRECTIO (aligned probe witness)
+# the property the parent's #101 review pinned: oversized windows are a
+# systematic build-pipeline product, so O_DIRECT must not skip the
+# check. The debug line witnesses the aligned-probe path actually ran.
+--- log_level: debug
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::bigwin8k ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        directio 512;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- error_log eval
+[qr/aligned probe on directio file/,
+ qr/declares a 134217728-byte decompression window/]
+
+
+
+=== TEST 24: directio_alignment 16k geometry still probes and declines
+# probe size becomes max(4096, 16384); a short read at EOF is permitted
+# so the ~8 KB sidecar still parses, and the window check still fires
+--- log_level: debug
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::bigwin8k ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        directio 512;
+        directio_alignment 16k;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- error_log eval
+[qr/16384-byte aligned probe on directio file/,
+ qr/declares a 134217728-byte decompression window/]

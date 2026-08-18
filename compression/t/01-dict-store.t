@@ -213,3 +213,48 @@ conflicting sha256
 duplicate dictionary
 --- no_error_log
 [alert]
+
+
+
+=== TEST 11: an empty dictionary file is a config error
+--- user_files eval
+[ [ "empty.dict" => "" ] ]
+--- http_config
+    compression_dict_file html/empty.dict;
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+empty or unreadable
+--- no_error_log
+[alert]
+
+
+
+=== TEST 12: a 63-character hash is rejected (one under valid)
+--- user_files eval
+[ [ "a.dict" => $::dict_a ] ]
+--- http_config eval
+qq{    compression_dict_file html/a.dict } . ("0" x 63) . qq{;\n}
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+invalid dictionary hash
+--- no_error_log
+[alert]
+
+
+
+=== TEST 13: a 65-character hash is rejected (one over valid)
+--- user_files eval
+[ [ "a.dict" => $::dict_a ] ]
+--- http_config eval
+qq{    compression_dict_file html/a.dict } . ("0" x 65) . qq{;\n}
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+invalid dictionary hash
+--- no_error_log
+[alert]

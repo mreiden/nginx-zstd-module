@@ -30,7 +30,8 @@ our $big = '';
     $big = encode_base64($raw, "");
 }
 
-our %srcs = ( big => $big, one => "x" );
+our %srcs = ( big => $big, one => "x",
+              len29 => ("a" x 29), len30 => ("a" x 30) );
 
 sub spew { open my $h, '>', $_[0] or die "$_[0]: $!"; binmode $h; print $h $_[1]; close $h }
 sub slurp { open my $h, '<', $_[0] or die "$_[0]: $!"; binmode $h; local $/; <$h> }
@@ -239,5 +240,63 @@ qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
 Content-Encoding: dcz
 --- decode_with: dcz
 --- expect_src: one
+--- no_error_log
+[error]
+
+
+
+=== TEST 7: 29-byte dcb body — the last pre-clamp-unsafe length
+# BrotliEncoderMaxCompressedSize(29) = 35 < 36: without the clamp this
+# was the largest body that still sized the buffer under the prologue
+--- user_files eval
+[ [ "rt.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/rt.dict;
+--- config
+    location /one {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        return 200 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    }
+--- request
+GET /one
+--- more_headers eval
+qq{Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: dcb
+--- decode_with: dcb
+--- expect_src: len29
+--- no_error_log
+[error]
+
+
+
+=== TEST 8: 30-byte dcb body — buffer EXACTLY equals the prologue
+# MaxCompressedSize(30) = 36: the clamp leaves out_size == prologue_len,
+# so the prologue fills the first buffer completely, forcing an
+# immediate full-buffer ship before the encoder writes a byte — the
+# prologue-exactly-fills path no other block reaches
+--- user_files eval
+[ [ "rt.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/rt.dict;
+--- config
+    location /one {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        return 200 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    }
+--- request
+GET /one
+--- more_headers eval
+qq{Accept-Encoding: br, dcb\nAvailable-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: dcb
+--- decode_with: dcb
+--- expect_src: len30
 --- no_error_log
 [error]

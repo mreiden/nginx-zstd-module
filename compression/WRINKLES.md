@@ -316,6 +316,34 @@ clang-tidy currently errors on the compression/ files for want of the
 nginx include path — its C analysis is NOT running on this tree yet
 and must not be trusted as clean until wired.
 
+## Boundary coverage (post round 2)
+
+Round 2's overflow was a boundary bug, so the boundaries got a sweep
+of their own. Now pinned deterministically: the dcb clamp crossing
+(content lengths 29 and 30 — 30 also exercises
+prologue-exactly-fills-buffer, forcing a full-buffer ship before the
+encoder's first byte); `min_length` equality (the gate is `<`);
+Available-Dictionary encoded lengths 43/45 beside 44; supplied-hash
+lengths 63/65; the empty dictionary file; and the zstd window-cap
+EDGES via hand-crafted frame headers (tiny byte strings — the probe
+only reads headers and decline paths never serve, so no 8 MB fixtures
+needed): descriptor window exactly 8 MB passes vs 16 MB declines,
+single-segment exactly 8 MB passes vs 8 MB + 1 declines, the 2-byte
+FCS +256 offset, 3/4/5-byte truncation branches, and the
+skippable-lead exemption. The directio property from the parent's
+#101 review — the window check must not be skipped under O_DIRECT —
+is now witnessed in-suite (aligned-probe debug line + decline, at
+default and 16k alignment).
+
+Honestly NOT deterministically pinned: a FLUSH/FINISH landing at
+exactly `ob->end` (the round-1 double-FINISH class) — compressed
+sizes aren't controllable, so the multi-buffer roundtrips exercise
+the neighborhood every run without guaranteeing the exact byte; and
+the empty-FLUSH special-buf path, which needs a mid-stream flush a
+`return`-based test cannot produce. Both belong to the proxy-backed
+tools at productization (the parent repo's pattern), not to prose
+claims of coverage.
+
 ## Phase-0 shortcuts (not findings — deliberate scope cuts)
 
 status set is 200-only (real module inherits the zstd filter's set);

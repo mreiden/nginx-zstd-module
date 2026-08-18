@@ -393,3 +393,45 @@ GET /t
 Accept-Encoding: zstd
 --- no_error_log eval
 [qr/"gzip_vary" is off/, qr/\[error\]/]
+
+
+
+=== TEST 18: a body exactly at the default min_length compresses
+# the gate is `< min_length` (default 20): equality passes
+--- config
+    location /t {
+        compression on;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "12345678901234567890";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 19: one byte under the default min_length stays identity
+--- config
+    location /t {
+        compression on;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "1234567890123456789";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body chomp
+1234567890123456789
+--- no_error_log
+[error]
