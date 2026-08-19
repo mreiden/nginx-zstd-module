@@ -717,12 +717,38 @@ ngx_http_compression_window_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
     }
 
     if (bits > b->window_bits_max) {
+        u_char     list[192], *p;
+        ngx_int_t  i;
+        ngx_str_t  vals;
+
+        /*
+         * The valid set is small and finite, so enumerate it in the
+         * config's own notation (google's brotli_window error does
+         * the same) — strictly more actionable than raw byte counts
+         * for a message a human reads exactly once at config load.
+         */
+        p = list;
+
+        for (i = b->window_bits_min; i <= b->window_bits_max; i++) {
+            if (i > b->window_bits_min) {
+                p = ngx_cpymem(p, ", ", 2);
+            }
+            if (i >= 20) {
+                p = ngx_snprintf(p, list + sizeof(list) - p, "%uim",
+                                 (ngx_uint_t) 1 << (i - 20));
+            } else {
+                p = ngx_snprintf(p, list + sizeof(list) - p, "%uik",
+                                 (ngx_uint_t) 1 << (i - 10));
+            }
+        }
+
+        vals.data = list;
+        vals.len = p - list;
+
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "compression window for \"%V\" must be a "
-                           "power-of-two size between %uz and %uz bytes",
-                           &b->coding,
-                           (size_t) 1 << b->window_bits_min,
-                           (size_t) 1 << b->window_bits_max);
+                           "compression window \"%V\" for \"%V\" must be a "
+                           "power-of-two size (one of: %V)",
+                           &value[2], &b->coding, &vals);
         return NGX_CONF_ERROR;
     }
 

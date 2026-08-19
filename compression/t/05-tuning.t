@@ -150,7 +150,7 @@ is duplicate
     }
 --- must_die
 --- error_log
-compression window for "zstd" must be a power-of-two size
+compression window "100k" for "zstd" must be a power-of-two size
 
 
 === TEST 10: a window above brotli's 16m format ceiling is a config error
@@ -160,7 +160,7 @@ compression window for "zstd" must be a power-of-two size
     }
 --- must_die
 --- error_log
-compression window for "br" must be a power-of-two size between 1024 and 16777216 bytes
+compression window "32m" for "br" must be a power-of-two size (one of: 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m, 8m, 16m)
 
 
 === TEST 11: a window below the 1k floor is a config error
@@ -170,7 +170,7 @@ compression window for "br" must be a power-of-two size between 1024 and 1677721
     }
 --- must_die
 --- error_log
-compression window for "zstd" must be a power-of-two size
+compression window "512" for "zstd" must be a power-of-two size
 
 
 === TEST 12: tuned zstd reaches the encoder and still decodes
