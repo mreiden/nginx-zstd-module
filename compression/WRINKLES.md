@@ -598,6 +598,16 @@ claims of coverage.
   agreement — registry plumbing, unrelated to the filter work under
   review.
 
+- **Dictionary deploy example**: the fork's examples/ deployment
+  sample (grafted here under brotli/examples/) emits paired
+  zstd_dcz_dict_file + brotli_dcb_dict_file lines per dictionary,
+  deduped by sha256 across the two standalone modules. Under the
+  unified module that collapses to ONE compression_dict_file
+  <path> [sha256] line — the supplied-hash fast path carries over
+  with the same signature, and the script's cross-module dedupe
+  disappears (the store dedupes by path; one line IS the dedupe).
+  Lands with the post-merge batch alongside build-windows.sh.
+
 ## Phase-0 shortcuts (not findings — deliberate scope cuts)
 
 status set is 200-only (real module inherits the zstd filter's set);
