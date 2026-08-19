@@ -626,3 +626,129 @@ Accept-Encoding: gzip;foo="bar,zstd", zstd
 Content-Encoding: zstd
 --- no_error_log
 [error]
+
+
+
+=== TEST 23a: a declared body above compression_max_length stays identity
+# the worker-protection ceiling (parents' zstd_max_length /
+# brotli_max_length): known-size bodies above it skip compression
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_max_length 100;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "this body is comfortably longer than the one hundred byte compression_max_length ceiling configured above";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+=== TEST 23b: under the ceiling compresses as usual
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_max_length 10k;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "this body sits well under the ten kilobyte ceiling\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 23c: the RUNNING cap aborts an undeclared over-length stream
+# SSI strips Content-Length, so the header gate sees nothing to reject;
+# the body filter's running counter must catch the overage mid-stream
+# and fail the request (compression already started — aborting protects
+# the worker, completing one runaway response does not)
+--- user_files eval
+[ [ "p/page.shtml" => qq{<!--#include virtual="/p/big.html" -->\n} ],
+  [ "p/big.html" => ("ssi cap fixture line\n" x 2000) ] ]
+--- config
+    location /p/ {
+        ssi on;
+        default_type text/html;   # the SSI filter only touches ssi_types
+        compression on;
+        compression_min_length 1;
+        compression_max_length 2k;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /p/page.shtml
+--- more_headers
+Accept-Encoding: zstd
+--- ignore_response
+--- error_log
+input exceeded compression_max_length
+
+
+=== TEST 24a: $compression_ratio computation path (overflow-guard parity)
+# log-phase variable; referencing it forces registration + the scaled
+# division on a body big enough to make bytes_in*1000 large (the
+# parent's 064895c overflow lesson)
+--- user_files eval
+[ [ "t/big.txt" => ("ratio fixture line with some repetition\n" x 1500) ] ]
+--- config
+    location /t/ {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        set $unused $compression_ratio;
+        root html;
+    }
+--- request
+GET /t/big.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 24b: ratio and byte counters land in the access log
+# the variables are meaningful only at log phase; a second request
+# reads the log line the first one wrote
+--- http_config
+    log_format ctest "ratio=$compression_ratio in=$compression_bytes_in out=$compression_bytes_out";
+--- user_files eval
+[ [ "t/body.txt" => ("countable fixture line\n" x 50) ] ]
+--- config
+    location /t/ {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        access_log logs/ctest.log ctest;
+        root html;
+    }
+    location = /rlog {
+        alias logs/ctest.log;
+        default_type text/plain;
+    }
+--- request eval
+["GET /t/body.txt", "GET /rlog"]
+--- more_headers
+Accept-Encoding: zstd
+--- response_body_like eval
+[qr/./, qr/ratio=\d+\.\d{3} in=1150 out=\d+/]

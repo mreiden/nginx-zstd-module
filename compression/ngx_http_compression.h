@@ -304,6 +304,7 @@ typedef struct {
 typedef struct {
     ngx_flag_t     enable;
     ssize_t        min_length;
+    ssize_t        max_length;    /* NGX_CONF_UNSET = no ceiling */
     ngx_hash_t     types;
     ngx_array_t   *types_keys;
     ngx_array_t   *order;          /* of ngx_http_compression_token_t */

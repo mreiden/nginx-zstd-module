@@ -138,6 +138,15 @@ so static-only deployments never serve identity to dict-capable
 clients. Tradeoff: a dictionary miss pays runtime compression instead
 of the sidecar.
 
+`compression_max_length <size>` is the parents' worker-protection
+ceiling: declared bodies above it skip compression, and a running
+input counter enforces the same limit on chunked/undeclared streams
+mid-response (a misdeclaring upstream aborts the request — protecting
+the worker beats completing one runaway response). Unset by default.
+The `$compression_ratio`, `$compression_bytes_in` and
+`$compression_bytes_out` variables (parent `$zstd_*` parity) are
+log-phase counters for the compressed response.
+
 Bypass predicates round out the phase-3 filter directives:
 `compression_bypass $var ...` serves identity when any predicate
 variable resolves non-empty and not `"0"` (the parents' zstd_bypass /

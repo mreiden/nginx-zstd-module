@@ -56,6 +56,17 @@ typedef struct {
     ngx_uint_t                       bufs_num;
 
     /*
+     * PHASE3 parity: $compression_ratio / _bytes_in / _bytes_out feed
+     * from these, and max_length enforces the parents' running input
+     * cap — the declared-length gate in the header filter only sees
+     * the ADVERTISED length; a chunked or lying upstream can stream
+     * unbounded input past it (worker CPU/memory exhaustion).
+     */
+    size_t                           bytes_in;
+    size_t                           bytes_out;
+    ssize_t                          max_length;
+
+    /*
      * PHASE1b: the elected dictionary variant's wire prologue,
      * prepared at election time and emitted ahead of the first
      * encoder byte (40 bytes dcz, 36 dcb; 0 = base coding).
@@ -88,6 +99,10 @@ static char *ngx_http_compression_window_cmd(ngx_conf_t *cf,
 static char *ngx_http_compression_buffers_cmd(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_compression_init(ngx_conf_t *cf);
+static ngx_int_t ngx_http_compression_ratio_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *vv, uintptr_t data);
+static ngx_int_t ngx_http_compression_bytes_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *vv, uintptr_t data);
 static ngx_int_t ngx_http_compression_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_compression_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
@@ -142,6 +157,13 @@ static ngx_command_t  ngx_http_compression_commands[] = {
       ngx_http_compression_buffers_cmd,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
+      NULL },
+
+    { ngx_string("compression_max_length"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_compression_conf_t, max_length),
       NULL },
 
     { ngx_string("compression_min_length"),
@@ -380,6 +402,40 @@ ngx_http_compression_add_backends(ngx_conf_t *cf)
 #endif
 
     ngx_http_compression_backends[n] = NULL;
+
+    /*
+     * $compression_ratio / $compression_bytes_in / $compression_bytes_out
+     * (parent $zstd_* parity): log-phase variables fed by the ctx
+     * counters; not_found until the response finished compressing.
+     */
+    {
+        ngx_http_variable_t  *var;
+
+        static ngx_str_t  ratio_name = ngx_string("compression_ratio");
+        static ngx_str_t  in_name = ngx_string("compression_bytes_in");
+        static ngx_str_t  out_name = ngx_string("compression_bytes_out");
+
+        var = ngx_http_add_variable(cf, &ratio_name,
+                                    NGX_HTTP_VAR_NOCACHEABLE);
+        if (var == NULL) {
+            return NGX_ERROR;
+        }
+        var->get_handler = ngx_http_compression_ratio_variable;
+
+        var = ngx_http_add_variable(cf, &in_name, NGX_HTTP_VAR_NOCACHEABLE);
+        if (var == NULL) {
+            return NGX_ERROR;
+        }
+        var->get_handler = ngx_http_compression_bytes_variable;
+        var->data = offsetof(ngx_http_compression_ctx_t, bytes_in);
+
+        var = ngx_http_add_variable(cf, &out_name, NGX_HTTP_VAR_NOCACHEABLE);
+        if (var == NULL) {
+            return NGX_ERROR;
+        }
+        var->get_handler = ngx_http_compression_bytes_variable;
+        var->data = offsetof(ngx_http_compression_ctx_t, bytes_out);
+    }
 
     return ngx_http_compression_dict_add_variables(cf);
 }
@@ -717,6 +773,78 @@ ngx_http_compression_window_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
+/*
+ * $compression_ratio: bytes_in/bytes_out with three decimals, the
+ * parent's uint64-scaled single division (its 064895c overflow lesson
+ * baked in). Meaningful only after FINISH — a log-phase variable.
+ */
+static ngx_int_t
+ngx_http_compression_ratio_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *vv, uintptr_t data)
+{
+    uint64_t                     scaled;
+    ngx_http_compression_ctx_t  *ctx;
+
+    (void) data;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_compression_filter_module);
+
+    if (ctx == NULL || !ctx->done || ctx->bytes_out == 0) {
+        vv->not_found = 1;
+        return NGX_OK;
+    }
+
+    vv->data = ngx_pnalloc(r->pool, NGX_INT_T_LEN * 2 + 2);
+    if (vv->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    scaled = (uint64_t) ctx->bytes_in * 1000 / ctx->bytes_out;
+
+    vv->len = ngx_sprintf(vv->data, "%ui.%03ui",
+                          (ngx_uint_t) (scaled / 1000),
+                          (ngx_uint_t) (scaled % 1000))
+              - vv->data;
+
+    vv->valid = 1;
+    vv->no_cacheable = 1;
+    vv->not_found = 0;
+
+    return NGX_OK;
+}
+
+
+/* $compression_bytes_in / _bytes_out — data is the ctx offsetof() */
+static ngx_int_t
+ngx_http_compression_bytes_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *vv, uintptr_t data)
+{
+    size_t                       val;
+    ngx_http_compression_ctx_t  *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_compression_filter_module);
+
+    if (ctx == NULL || !ctx->done || ctx->bytes_out == 0) {
+        vv->not_found = 1;
+        return NGX_OK;
+    }
+
+    val = *(size_t *) ((char *) ctx + data);
+
+    vv->data = ngx_pnalloc(r->pool, NGX_SIZE_T_LEN);
+    if (vv->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    vv->len = ngx_sprintf(vv->data, "%uz", val) - vv->data;
+    vv->valid = 1;
+    vv->no_cacheable = 1;
+    vv->not_found = 0;
+
+    return NGX_OK;
+}
+
+
 static void *
 ngx_http_compression_create_conf(ngx_conf_t *cf)
 {
@@ -733,6 +861,7 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     conf->order = NULL;     /* NULL = inherit / shipped default */
     conf->bufs.num = NGX_CONF_UNSET;
     conf->bypass = NGX_CONF_UNSET_PTR;
+    conf->max_length = NGX_CONF_UNSET;
 
     for (i = 0; i < NGX_HTTP_COMPRESSION_CONF_SLOTS; i++) {
         conf->levels[i] = NGX_CONF_UNSET;
@@ -754,6 +883,7 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
+    ngx_conf_merge_value(conf->max_length, prev->max_length, NGX_CONF_UNSET);
 
     ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
     ngx_conf_merge_str_value(conf->bypass_vary, prev->bypass_vary, "");
@@ -1045,6 +1175,20 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         return ngx_http_next_header_filter(r);
     }
 
+    /* known body larger than the compression_max_length ceiling (the
+     * parents' zstd_max_length / brotli_max_length worker protection);
+     * the RUNNING cap in the body filter covers undeclared lengths */
+    if (conf->max_length != NGX_CONF_UNSET
+        && r->headers_out.content_length_n != -1
+        && r->headers_out.content_length_n > conf->max_length)
+    {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "compression: skip, body %O > compression_max_length "
+                       "%O", r->headers_out.content_length_n,
+                       (off_t) conf->max_length);
+        return ngx_http_next_header_filter(r);
+    }
+
     /*
      * PHASE3 bypass (parent zstd_bypass semantics). The operator-named
      * extra Vary field rides BOTH paths — the bypassed identity
@@ -1237,6 +1381,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     }
 
     ctx->bufs_num = (ngx_uint_t) conf->bufs.num;
+    ctx->max_length = conf->max_length;
 
     /* PHASE3: resolve this coding's tuning slot (concrete post-merge;
      * the dict variant shares the base coding's values) */
@@ -1486,6 +1631,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
         ngx_memcpy(ctx->ob->last, ctx->prologue, ctx->prologue_len);
         ctx->ob->last += ctx->prologue_len;
+        ctx->bytes_out += ctx->prologue_len;
         ctx->prologue_sent = 1;
     }
 
@@ -1577,8 +1723,31 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             if (io.in_consumed > 0) {
                 b->pos += io.in_consumed;
                 ctx->started = 1;
+                ctx->bytes_in += io.in_consumed;
+
+                /*
+                 * Length-independent input cap (parent parity): the
+                 * header gate only sees the DECLARED length; a chunked
+                 * or misdeclaring upstream can stream more. Compression
+                 * has started and the client holds a Content-Encoding
+                 * header, so the only safe action is failing the
+                 * request — protecting the worker beats completing one
+                 * runaway response.
+                 */
+                if (ctx->max_length != NGX_CONF_UNSET
+                    && (off_t) ctx->bytes_in > (off_t) ctx->max_length)
+                {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                  "compression: input exceeded "
+                                  "compression_max_length (%O) on a "
+                                  "response with no Content-Length; "
+                                  "aborting to protect the worker",
+                                  (off_t) ctx->max_length);
+                    return NGX_ERROR;
+                }
             }
             ctx->ob->last += io.out_produced;
+            ctx->bytes_out += io.out_produced;
 
             /*
              * ORDER MATTERS (review round 1's double-FINISH): the
