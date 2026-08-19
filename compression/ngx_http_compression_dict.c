@@ -11,10 +11,15 @@
 
 /*
  * Unification dividend, not a shortcut: the whole repo gets exactly one
- * SHA-256 implementation — the parent module's header-only one-shot
- * (EVP-accelerated when NGX_HTTP_ZSTD_HAVE_LIBCRYPTO is set; this
- * prototype's build glue doesn't detect libcrypto yet, so the portable
- * path runs — productization inherits the parent's detection).
+ * SHA-256 implementation — the parent module's header-only one-shot,
+ * EVP-accelerated when NGX_HTTP_ZSTD_HAVE_LIBCRYPTO is set. The macro
+ * keeps the parent's name because this header keys on it;
+ * compression/auto/detect defines it (probe, or nginx's own OpenSSL
+ * for static addons), and NGX_HTTP_COMPRESSION_NO_LIBCRYPTO=1 keeps
+ * the portable path. EVP matters MORE here than in the parent: the
+ * store computes every dictionary's hash at config load — supplied
+ * hashes included, the mandated compute doubling as the free audit —
+ * so there is no verbatim fast path to hide slow hashing behind.
  */
 #include "../ngx_http_zstd_sha256.h"
 
