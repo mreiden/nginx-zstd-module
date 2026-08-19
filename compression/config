@@ -1,15 +1,16 @@
-# nginx-compression build glue (phase 3: real library detection).
+# nginx-compression build glue: TWO modules, one addon (the parent
+# repo's filter/static pattern, and core nginx's own gzip /
+# gzip_static split).
 #
-# auto/detect probes libzstd and libbrotlienc with the parent repo's
-# hardened patterns (bare-directory ngx_module_incs, link flags only
-# through ngx_module_libs, MSVC path normalization) and — unlike the
-# parent, whose modules are useless without their library — treats a
-# missing library as a SHAPE, not an error: the backend roster is a
-# build-time variable (NGX_HTTP_COMPRESSION_HAVE_*, written into
-# ngx_auto_config.h via auto/define), the missing backend's TU
-# compiles to nothing, and static sidecar serving keeps working for
-# every coding. Every source file is always listed: the TUs
-# self-guard, which keeps the Makefile shape identical across builds.
+# auto/detect probes libzstd and libbrotlienc with the parent's
+# hardened patterns and treats a missing library as a SHAPE, not an
+# error (see the file). The libraries — and libcrypto's EVP, when
+# found — attach to the FILTER module only: the static module links
+# NOTHING by design. Static serving is file serving for every coding
+# (its .zst probe reads RFC 8878 format constants, not the libzstd
+# API), so a static-only deployment — a CDN edge, an internal
+# artifact host — loads a .so whose ldd shows nothing but libc, and
+# never installs the compression libraries at all.
 
 ngx_addon_name=ngx_http_compression_module
 
@@ -18,7 +19,7 @@ if test -n "$ngx_module_link"; then
     . $ngx_addon_dir/auto/detect
 
     ngx_module_type=HTTP_FILTER
-    ngx_module_name=ngx_http_compression_module
+    ngx_module_name=ngx_http_compression_filter_module
     ngx_module_incs="$ngx_compression_incs"
     ngx_module_deps="$ngx_addon_dir/ngx_http_compression.h \
                      $ngx_addon_dir/ngx_http_compression_ae.h \
@@ -26,10 +27,19 @@ if test -n "$ngx_module_link"; then
                      $ngx_addon_dir/../ngx_http_zstd_sha256.h"
     ngx_module_srcs="$ngx_addon_dir/ngx_http_compression_module.c \
                      $ngx_addon_dir/ngx_http_compression_dict.c \
-                     $ngx_addon_dir/ngx_http_compression_static.c \
                      $ngx_addon_dir/ngx_http_compression_zstd.c \
                      $ngx_addon_dir/ngx_http_compression_brotli.c"
     ngx_module_libs="$ngx_compression_libs"
+
+    . auto/module
+
+    ngx_module_type=HTTP
+    ngx_module_name=ngx_http_compression_static_module
+    ngx_module_incs=
+    ngx_module_deps="$ngx_addon_dir/ngx_http_compression.h \
+                     $ngx_addon_dir/ngx_http_compression_ae.h"
+    ngx_module_srcs="$ngx_addon_dir/ngx_http_compression_static.c"
+    ngx_module_libs=
 
     . auto/module
 else

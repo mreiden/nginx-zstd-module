@@ -17,6 +17,18 @@ not this code. Directives implemented: `compression on|off`,
 unknown or duplicate = config error; the list is the enable set),
 `compression_min_length`, `compression_types`.
 
+The addon builds TWO modules (the gzip/gzip_static split, kept
+because this pair replaces modules that ship split and because the
+static module must stay dependency-free):
+`ngx_http_compression_filter_module` (the dynamic filter — links the
+codec libraries and, when found, libcrypto for dictionary hashing)
+and `ngx_http_compression_static_module` (sidecar serving — links
+**nothing**; a static-only deployment such as a CDN edge or internal
+artifact host loads a .so whose ldd shows only libc, with no
+compression libraries installed at all). Dynamic builds emit two
+.so files and take one `load_module` line each; either loads without
+the other.
+
 Build (nginx >= 1.23.0):
 
 ```bash

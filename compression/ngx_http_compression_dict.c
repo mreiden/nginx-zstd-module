@@ -24,7 +24,7 @@
 #include "../ngx_http_zstd_sha256.h"
 
 
-extern ngx_module_t  ngx_http_compression_module;
+extern ngx_module_t  ngx_http_compression_filter_module;
 
 
 static ngx_int_t ngx_http_compression_hex_decode(ngx_str_t *hex,
@@ -96,7 +96,7 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     dicts = (ngx_array_t **) ((char *) conf + cmd->offset);
 
     cmcf = ngx_http_conf_get_module_main_conf(cf,
-                                              ngx_http_compression_module);
+                                              ngx_http_compression_filter_module);
 
     value = cf->args->elts;
     path = value[1];
@@ -337,7 +337,7 @@ ngx_http_compression_dicts_hashed_variable(ngx_http_request_t *r,
     u_char                            *p;
     ngx_http_compression_main_conf_t  *cmcf;
 
-    cmcf = ngx_http_get_module_main_conf(r, ngx_http_compression_module);
+    cmcf = ngx_http_get_module_main_conf(r, ngx_http_compression_filter_module);
 
     p = ngx_pnalloc(r->pool, NGX_INT_T_LEN);
     if (p == NULL) {

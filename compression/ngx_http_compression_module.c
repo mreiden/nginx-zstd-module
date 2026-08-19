@@ -93,14 +93,6 @@ static ngx_int_t ngx_http_compression_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
 
 
-static ngx_conf_enum_t  ngx_http_compression_static_enum[] = {
-    { ngx_string("off"), NGX_HTTP_COMPRESSION_STATIC_OFF },
-    { ngx_string("on"), NGX_HTTP_COMPRESSION_STATIC_ON },
-    { ngx_string("always"), NGX_HTTP_COMPRESSION_STATIC_ALWAYS },
-    { ngx_null_string, 0 }
-};
-
-
 static ngx_command_t  ngx_http_compression_commands[] = {
 
     { ngx_string("compression"),
@@ -173,25 +165,11 @@ static ngx_command_t  ngx_http_compression_commands[] = {
       offsetof(ngx_http_compression_conf_t, dicts),
       NULL },
 
-    { ngx_string("compression_static"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_enum_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_compression_conf_t, static_enable),
-      &ngx_http_compression_static_enum },
-
-    { ngx_string("compression_static_order"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
-      ngx_http_compression_static_order,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      0,
-      NULL },
-
     ngx_null_command
 };
 
 
-static ngx_http_module_t  ngx_http_compression_module_ctx = {
+static ngx_http_module_t  ngx_http_compression_filter_module_ctx = {
     ngx_http_compression_add_backends,     /* preconfiguration */
     ngx_http_compression_init,             /* postconfiguration */
 
@@ -206,9 +184,9 @@ static ngx_http_module_t  ngx_http_compression_module_ctx = {
 };
 
 
-ngx_module_t  ngx_http_compression_module = {
+ngx_module_t  ngx_http_compression_filter_module = {
     NGX_MODULE_V1,
-    &ngx_http_compression_module_ctx,      /* module context */
+    &ngx_http_compression_filter_module_ctx,      /* module context */
     ngx_http_compression_commands,         /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,
@@ -222,69 +200,9 @@ static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 static ngx_str_t  ngx_http_compression_gzip_token = ngx_string("gzip");
 
 
-/*
- * Vary: Accept-Encoding, requested once per response through whichever
- * mechanism this build has (see the header). Both the filter and the
- * static handler call this BEFORE their accept checks, so identity
- * fallbacks vary too.
- */
-ngx_int_t
-ngx_http_compression_vary(ngx_http_request_t *r)
-{
-#if (NGX_HTTP_GZIP)
-    r->gzip_vary = 1;
-    return NGX_OK;
-#else
-    ngx_table_elt_t  *v;
-
-    v = ngx_list_push(&r->headers_out.headers);
-    if (v == NULL) {
-        return NGX_ERROR;
-    }
-    v->hash = 1;
-    v->next = NULL;
-    ngx_str_set(&v->key, "Vary");
-    ngx_str_set(&v->value, "Accept-Encoding");
-    return NGX_OK;
-#endif
-}
-
-
-ngx_table_elt_t *
-ngx_http_compression_ae_header(ngx_http_request_t *r)
-{
-#if (NGX_HTTP_GZIP)
-    return r->headers_in.accept_encoding;
-#else
-    ngx_uint_t        i;
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h;
-
-    part = &r->headers_in.headers.part;
-    h = part->elts;
-
-    for (i = 0; /* void */; i++) {
-
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-
-        if (h[i].key.len == sizeof("Accept-Encoding") - 1
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Accept-Encoding",
-                               sizeof("Accept-Encoding") - 1) == 0)
-        {
-            return &h[i];
-        }
-    }
-
-    return NULL;
-#endif
-}
+/* the vary/ae_header helpers moved to ngx_http_compression_ae.h as
+ * header-statics with the filter/static module split: each module
+ * carries its own copy, so neither .so links the other's symbols */
 
 
 /*
@@ -776,7 +694,6 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     conf->enable = NGX_CONF_UNSET;
     conf->min_length = NGX_CONF_UNSET;
     conf->order = NULL;     /* NULL = inherit / shipped default */
-    conf->static_enable = NGX_CONF_UNSET_UINT;
     conf->bufs.num = NGX_CONF_UNSET;
     conf->bypass = NGX_CONF_UNSET_PTR;
 
@@ -867,20 +784,6 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
      */
     if (conf->dicts == NULL) {
         conf->dicts = prev->dicts;
-    }
-
-    /* PHASE2: static serving */
-    ngx_conf_merge_uint_value(conf->static_enable, prev->static_enable,
-                              NGX_HTTP_COMPRESSION_STATIC_OFF);
-
-    if (conf->static_order == NULL) {
-        conf->static_order = prev->static_order;
-    }
-
-    if (conf->static_order == NULL) {
-        if (ngx_http_compression_static_default_order(cf, conf) != NGX_OK) {
-            return NGX_CONF_ERROR;
-        }
     }
 
     if (conf->order == NULL) {
@@ -1073,7 +976,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     ngx_http_compression_tuning_t    tuning;
     ngx_http_compression_backend_t  *elected;
 
-    conf = ngx_http_get_module_loc_conf(r, ngx_http_compression_module);
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_compression_filter_module);
 
     /*
      * PHASE3: the parent zstd filter's status set — every 2xx except
@@ -1371,7 +1274,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         }
     }
 
-    ngx_http_set_ctx(r, ctx, ngx_http_compression_module);
+    ngx_http_set_ctx(r, ctx, ngx_http_compression_filter_module);
 
     /*
      * The copy filter must hand the body filter memory buffers —
@@ -1443,7 +1346,7 @@ ngx_http_compression_get_buf(ngx_http_request_t *r,
         if (ctx->ob == NULL) {
             return NGX_ERROR;
         }
-        ctx->ob->tag = (ngx_buf_tag_t) &ngx_http_compression_module;
+        ctx->ob->tag = (ngx_buf_tag_t) &ngx_http_compression_filter_module;
         ctx->allocated++;
         return NGX_OK;
     }
@@ -1467,7 +1370,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     ngx_http_compression_io_t    io;
     ngx_http_compression_ctx_t  *ctx;
 
-    ctx = ngx_http_get_module_ctx(r, ngx_http_compression_module);
+    ctx = ngx_http_get_module_ctx(r, ngx_http_compression_filter_module);
 
     if (ctx == NULL || ctx->done) {
         return ngx_http_next_body_filter(r, in);
@@ -1504,7 +1407,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
         cl = NULL;
         ngx_chain_update_chains(r->pool, &ctx->free, &ctx->busy, &cl,
-                                (ngx_buf_tag_t) &ngx_http_compression_module);
+                                (ngx_buf_tag_t) &ngx_http_compression_filter_module);
 
         ctx->nomem = 0;
     }
@@ -1766,7 +1669,7 @@ ship:
 
             cl = NULL;
             ngx_chain_update_chains(r->pool, &ctx->free, &ctx->busy, &cl,
-                                (ngx_buf_tag_t) &ngx_http_compression_module);
+                                (ngx_buf_tag_t) &ngx_http_compression_filter_module);
             return rc;
         }
 
@@ -1789,7 +1692,7 @@ ship:
     }
 
     ngx_chain_update_chains(r->pool, &ctx->free, &ctx->busy, &out,
-                            (ngx_buf_tag_t) &ngx_http_compression_module);
+                            (ngx_buf_tag_t) &ngx_http_compression_filter_module);
 
     if (ctx->done || !ctx->nomem) {
         /* finished, or the input was fully consumed this pass */
@@ -1814,19 +1717,9 @@ ship:
 static ngx_int_t
 ngx_http_compression_init(ngx_conf_t *cf)
 {
-    ngx_http_handler_pt        *h;
-    ngx_http_core_main_conf_t  *cmcf;
-
-    /* PHASE2: the static sidecar handler joins the content phase,
-     * exactly like gzip_static and the parent *_static modules */
-    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-
-    h = ngx_array_push(&cmcf->phases[NGX_HTTP_CONTENT_PHASE].handlers);
-    if (h == NULL) {
-        return NGX_ERROR;
-    }
-
-    *h = ngx_http_compression_static_handler;
+    /* the content-phase static handler registers itself from the
+     * static MODULE since the split; this module owns the filters */
+    (void) cf;
 
     ngx_http_next_header_filter = ngx_http_top_header_filter;
     ngx_http_top_header_filter = ngx_http_compression_header_filter;

@@ -553,6 +553,43 @@ hit an exact file size — invalid output and the wrong layer (files
 have no buffers), but the exact-size INSTINCT was the right one; it
 just belonged on the buffer knob.
 
+### 28. The module split: packaging is a design input (Mark's ldd)
+
+Phase 2 implemented the static handler INSIDE the filter's
+ngx_module_t — one .so, one conf struct, one load_module line. Mark's
+RHEL9 RPM build surfaced what that costs: ldd on the single module
+showed libzstd + libbrotlienc as NEEDED, so the packaged module
+Requires both libraries even for a deployment that only serves
+precompressed sidecars — while the code's own property (static
+serving calls no library, reads format constants) said it shouldn't.
+The RFC's original framing ("statics link no compression lib at
+all"), core nginx's gzip/gzip_static/gunzip precedent, the parent
+pair's packaging, and the goal of REPLACING modules that ship split
+all pointed the same way.
+
+Now two ngx_module_t in one addon config (the parent repo's own
+pattern): ngx_http_compression_filter_module (chassis, backends,
+dictionary store; links the codec libs + libcrypto) and
+ngx_http_compression_static_module (static.c; links NOTHING — its
+ldd shows libc and nothing else, verified, along with a static-only
+load_module smoke and a both-loaded coexistence smoke). The
+unification wins survive intact: the #76 latch-class protection was
+never about being one module (it comes from decline-and-fall-through
+in the handler), the vary/ae_header helpers moved into
+ngx_http_compression_ae.h as header-statics so each module carries
+its own copy and neither .so links the other's symbols, and the
+directives behave identically — all 417 suite assertions passed
+unchanged through the split.
+
+One parity gain came free: the static module's own conf merge now
+warns on "compression_static on" without "gzip_vary on" (parent
+zstd_static behavior; "always" exempt) — the unified module's warn
+had only covered the filter's enable.
+
+Lesson: ldd output is design feedback. A property the code holds
+("calls no library") that the PACKAGING cannot express ("links no
+library") isn't held yet.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep

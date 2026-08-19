@@ -249,4 +249,75 @@ ngx_http_compression_coding_weight(ngx_str_t *ae, ngx_str_t *coding,
 }
 
 
+/*
+ * Vary: Accept-Encoding, requested once per response through whichever
+ * mechanism this build has: with the gzip module, delegation via
+ * r->gzip_vary (core emits under "gzip_vary on"); without it, a
+ * literal push. Header-static like the parser above — since the
+ * filter/static MODULE SPLIT each module carries its own copy, so
+ * neither .so links symbols from the other (the static module links
+ * nothing at all, compression libraries included).
+ */
+static ngx_inline ngx_int_t
+ngx_http_compression_vary(ngx_http_request_t *r)
+{
+#if (NGX_HTTP_GZIP)
+    r->gzip_vary = 1;
+    return NGX_OK;
+#else
+    ngx_table_elt_t  *v;
+
+    v = ngx_list_push(&r->headers_out.headers);
+    if (v == NULL) {
+        return NGX_ERROR;
+    }
+    v->hash = 1;
+    v->next = NULL;
+    ngx_str_set(&v->key, "Vary");
+    ngx_str_set(&v->value, "Accept-Encoding");
+    return NGX_OK;
+#endif
+}
+
+
+/* the request's Accept-Encoding header: parsed field with the gzip
+ * module, list walk without (first header only — deliberate core-gzip
+ * parity, the defer decision must match core gzip's conclusion) */
+static ngx_inline ngx_table_elt_t *
+ngx_http_compression_ae_header(ngx_http_request_t *r)
+{
+#if (NGX_HTTP_GZIP)
+    return r->headers_in.accept_encoding;
+#else
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].key.len == sizeof("Accept-Encoding") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Accept-Encoding",
+                               sizeof("Accept-Encoding") - 1) == 0)
+        {
+            return &h[i];
+        }
+    }
+
+    return NULL;
+#endif
+}
+
+
 #endif /* NGX_HTTP_COMPRESSION_AE_H */

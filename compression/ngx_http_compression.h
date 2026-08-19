@@ -294,16 +294,12 @@ typedef struct {
 } ngx_http_compression_token_t;
 
 
-/* compression_static modes (parent *_static enum semantics) */
-#define NGX_HTTP_COMPRESSION_STATIC_OFF     0
-#define NGX_HTTP_COMPRESSION_STATIC_ON      1
-#define NGX_HTTP_COMPRESSION_STATIC_ALWAYS  2
-
-
 /*
- * The module's location configuration — in the header because the
- * filter chassis (module.c) and the static handler (static.c) share
- * it. See each directive's parser for the semantics.
+ * The FILTER module's location configuration. Since the module split
+ * (Mark's packaging call: the static module must be a dependency-free
+ * .so, and the pair replaces existing split-format modules) the
+ * static handler is its own ngx_module_t with its own private conf in
+ * static.c — this struct is the filter's alone again.
  */
 typedef struct {
     ngx_flag_t     enable;
@@ -326,16 +322,6 @@ typedef struct {
      * inherit.
      */
     ngx_array_t   *dicts;          /* of ngx_http_compression_dict_t * */
-
-    /*
-     * PHASE2: static sidecar serving. static_order is the enable set
-     * AND the probe order (of ngx_http_compression_static_coding_t *,
-     * see static.c); NULL = inherit / shipped default `br zstd gzip`
-     * — static prefers br because its CPU was spent at build time,
-     * the deliberate asymmetry with the filter default.
-     */
-    ngx_uint_t     static_enable;
-    ngx_array_t   *static_order;
 
     /*
      * PHASE3: per-request bypass predicates (parent zstd_bypass /
@@ -362,25 +348,11 @@ typedef struct {
 } ngx_http_compression_conf_t;
 
 
-extern ngx_module_t  ngx_http_compression_module;
+extern ngx_module_t  ngx_http_compression_filter_module;
 
-
-/*
- * Cross-TU helpers, defined in module.c. Both absorb the
- * NGX_HTTP_GZIP build split in ONE place: with the gzip module, Vary
- * is delegated via r->gzip_vary (core emits under "gzip_vary on") and
- * Accept-Encoding comes off r->headers_in; without it, the header is
- * pushed literally and Accept-Encoding is found by a list walk.
- */
-ngx_int_t ngx_http_compression_vary(ngx_http_request_t *r);
-ngx_table_elt_t *ngx_http_compression_ae_header(ngx_http_request_t *r);
-
-/* static.c exports, wired by module.c */
-char *ngx_http_compression_static_order(ngx_conf_t *cf, ngx_command_t *cmd,
-    void *conf);
-ngx_int_t ngx_http_compression_static_handler(ngx_http_request_t *r);
-ngx_int_t ngx_http_compression_static_default_order(ngx_conf_t *cf,
-    ngx_http_compression_conf_t *conf);
+/* the vary/ae_header helpers live in ngx_http_compression_ae.h as
+ * header-statics: each module of the split pair carries its own copy,
+ * so neither .so links symbols from the other */
 
 
 #endif /* NGX_HTTP_COMPRESSION_H */

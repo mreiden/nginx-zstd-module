@@ -30,6 +30,96 @@
 
 
 /*
+ * ITS OWN MODULE since the split (Mark's packaging call, gzip_static /
+ * parent-pair precedent): static serving must ship as a
+ * dependency-free .so — this TU calls no compression library, so a
+ * static-only deployment (CDN edge, internal artifact host) loads a
+ * module whose ldd shows nothing but libc. The filter module is not
+ * required to be present, loaded, or even built.
+ */
+
+#define NGX_HTTP_COMPRESSION_STATIC_OFF     0
+#define NGX_HTTP_COMPRESSION_STATIC_ON      1
+#define NGX_HTTP_COMPRESSION_STATIC_ALWAYS  2
+
+
+typedef struct {
+    ngx_uint_t     enable;
+    ngx_array_t   *order;   /* the enable set AND the probe order */
+} ngx_http_compression_static_conf_t;
+
+
+static char *ngx_http_compression_static_order(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_compression_static_default_order(ngx_conf_t *cf,
+    ngx_http_compression_static_conf_t *conf);
+static ngx_int_t ngx_http_compression_static_handler(ngx_http_request_t *r);
+static void *ngx_http_compression_static_create_conf(ngx_conf_t *cf);
+static char *ngx_http_compression_static_merge_conf(ngx_conf_t *cf,
+    void *parent, void *child);
+static ngx_int_t ngx_http_compression_static_init(ngx_conf_t *cf);
+
+
+static ngx_conf_enum_t  ngx_http_compression_static_enum[] = {
+    { ngx_string("off"), NGX_HTTP_COMPRESSION_STATIC_OFF },
+    { ngx_string("on"), NGX_HTTP_COMPRESSION_STATIC_ON },
+    { ngx_string("always"), NGX_HTTP_COMPRESSION_STATIC_ALWAYS },
+    { ngx_null_string, 0 }
+};
+
+
+static ngx_command_t  ngx_http_compression_static_commands[] = {
+
+    { ngx_string("compression_static"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_compression_static_conf_t, enable),
+      &ngx_http_compression_static_enum },
+
+    { ngx_string("compression_static_order"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      ngx_http_compression_static_order,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    ngx_null_command
+};
+
+
+static ngx_http_module_t  ngx_http_compression_static_module_ctx = {
+    NULL,                                    /* preconfiguration */
+    ngx_http_compression_static_init,        /* postconfiguration */
+
+    NULL,                                    /* create main configuration */
+    NULL,                                    /* init main configuration */
+
+    NULL,                                    /* create server configuration */
+    NULL,                                    /* merge server configuration */
+
+    ngx_http_compression_static_create_conf, /* create location config */
+    ngx_http_compression_static_merge_conf   /* merge location config */
+};
+
+
+ngx_module_t  ngx_http_compression_static_module = {
+    NGX_MODULE_V1,
+    &ngx_http_compression_static_module_ctx, /* module context */
+    ngx_http_compression_static_commands,    /* module directives */
+    NGX_HTTP_MODULE,                         /* module type */
+    NULL,                                    /* init master */
+    NULL,                                    /* init module */
+    NULL,                                    /* init process */
+    NULL,                                    /* init thread */
+    NULL,                                    /* exit thread */
+    NULL,                                    /* exit process */
+    NULL,                                    /* exit master */
+    NGX_MODULE_V1_PADDING
+};
+
+
+/*
  * RFC 8878 FORMAT constants, deliberately NOT taken from <zstd.h>:
  * static serving is file serving for every coding — a build without
  * libzstd (or without any compression library at all) still probes
@@ -82,11 +172,11 @@ static ngx_http_compression_static_coding_t
 };
 
 
-char *
+static char *
 ngx_http_compression_static_order(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf)
 {
-    ngx_http_compression_conf_t *ccf = conf;
+    ngx_http_compression_static_conf_t *ccf = conf;
 
     ngx_str_t                              *value;
     ngx_uint_t                              i, j, k;
@@ -94,13 +184,13 @@ ngx_http_compression_static_order(ngx_conf_t *cf, ngx_command_t *cmd,
 
     (void) cmd;
 
-    if (ccf->static_order != NULL && ccf->static_order->nelts > 0) {
+    if (ccf->order != NULL && ccf->order->nelts > 0) {
         return "is duplicate";
     }
 
-    ccf->static_order = ngx_array_create(cf->pool, cf->args->nelts - 1,
+    ccf->order = ngx_array_create(cf->pool, cf->args->nelts - 1,
                         sizeof(ngx_http_compression_static_coding_t *));
-    if (ccf->static_order == NULL) {
+    if (ccf->order == NULL) {
         return NGX_CONF_ERROR;
     }
 
@@ -129,8 +219,8 @@ ngx_http_compression_static_order(ngx_conf_t *cf, ngx_command_t *cmd,
         }
 
         /* the order list IS the enable set: once each */
-        list = ccf->static_order->elts;
-        for (j = 0; j < ccf->static_order->nelts; j++) {
+        list = ccf->order->elts;
+        for (j = 0; j < ccf->order->nelts; j++) {
             if (list[j] == c) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "duplicate coding \"%V\" in "
@@ -140,7 +230,7 @@ ngx_http_compression_static_order(ngx_conf_t *cf, ngx_command_t *cmd,
             }
         }
 
-        cp = ngx_array_push(ccf->static_order);
+        cp = ngx_array_push(ccf->order);
         if (cp == NULL) {
             return NGX_CONF_ERROR;
         }
@@ -153,22 +243,22 @@ ngx_http_compression_static_order(ngx_conf_t *cf, ngx_command_t *cmd,
 
 /* shipped default: br zstd gzip — static prefers br because its CPU
  * was spent at build time (the deliberate filter/static asymmetry) */
-ngx_int_t
+static ngx_int_t
 ngx_http_compression_static_default_order(ngx_conf_t *cf,
-    ngx_http_compression_conf_t *conf)
+    ngx_http_compression_static_conf_t *conf)
 {
     ngx_uint_t                              i;
     static ngx_uint_t                       def[3] = { 1, 0, 2 };
     ngx_http_compression_static_coding_t  **cp;
 
-    conf->static_order = ngx_array_create(cf->pool, 3,
+    conf->order = ngx_array_create(cf->pool, 3,
                          sizeof(ngx_http_compression_static_coding_t *));
-    if (conf->static_order == NULL) {
+    if (conf->order == NULL) {
         return NGX_ERROR;
     }
 
     for (i = 0; i < 3; i++) {
-        cp = ngx_array_push(conf->static_order);
+        cp = ngx_array_push(conf->order);
         if (cp == NULL) {
             return NGX_ERROR;
         }
@@ -343,7 +433,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
 }
 
 
-ngx_int_t
+static ngx_int_t
 ngx_http_compression_static_handler(ngx_http_request_t *r)
 {
     u_char                                 *p;
@@ -357,7 +447,7 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
     ngx_table_elt_t                        *h, *ae;
     ngx_open_file_info_t                    of;
     ngx_http_core_loc_conf_t               *clcf;
-    ngx_http_compression_conf_t            *conf;
+    ngx_http_compression_static_conf_t     *conf;
     ngx_http_compression_static_coding_t   *c, **order;
 
     if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
@@ -368,15 +458,16 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    conf = ngx_http_get_module_loc_conf(r, ngx_http_compression_module);
+    conf = ngx_http_get_module_loc_conf(r,
+                                        ngx_http_compression_static_module);
 
-    if (conf->static_enable == NGX_HTTP_COMPRESSION_STATIC_OFF) {
+    if (conf->enable == NGX_HTTP_COMPRESSION_STATIC_OFF) {
         return NGX_DECLINED;
     }
 
     ae = NULL;
 
-    if (conf->static_enable == NGX_HTTP_COMPRESSION_STATIC_ON) {
+    if (conf->enable == NGX_HTTP_COMPRESSION_STATIC_ON) {
         /*
          * Negotiated mode varies on Accept-Encoding — requested before
          * any existence probe so identity fallbacks vary too. "always"
@@ -397,13 +488,13 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
     log = r->connection->log;
 
-    order = conf->static_order->elts;
+    order = conf->order->elts;
 
-    for (i = 0; i < conf->static_order->nelts; i++) {
+    for (i = 0; i < conf->order->nelts; i++) {
 
         c = order[i];
 
-        if (conf->static_enable == NGX_HTTP_COMPRESSION_STATIC_ON) {
+        if (conf->enable == NGX_HTTP_COMPRESSION_STATIC_ON) {
             /* base codings accept the "*" wildcard, same as the
              * filter election */
             w = ngx_http_compression_coding_weight(&ae->value,
@@ -580,4 +671,91 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
     /* nothing served: the identity original (and possibly the dynamic
      * filter) takes over — no latches touched, by design */
     return NGX_DECLINED;
+}
+
+static void *
+ngx_http_compression_static_create_conf(ngx_conf_t *cf)
+{
+    ngx_http_compression_static_conf_t  *conf;
+
+    conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_compression_static_conf_t));
+    if (conf == NULL) {
+        return NULL;
+    }
+
+    conf->enable = NGX_CONF_UNSET_UINT;
+    conf->order = NULL;     /* NULL = inherit / shipped default */
+
+    return conf;
+}
+
+
+static char *
+ngx_http_compression_static_merge_conf(ngx_conf_t *cf, void *parent,
+    void *child)
+{
+    ngx_http_compression_static_conf_t *prev = parent;
+    ngx_http_compression_static_conf_t *conf = child;
+
+    ngx_conf_merge_uint_value(conf->enable, prev->enable,
+                              NGX_HTTP_COMPRESSION_STATIC_OFF);
+
+    if (conf->order == NULL) {
+        conf->order = prev->order;
+    }
+
+    if (conf->order == NULL) {
+        if (ngx_http_compression_static_default_order(cf, conf) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+#if (NGX_HTTP_GZIP)
+    /*
+     * Parent zstd_static parity, gained naturally with the split (the
+     * unified module's warn only covered the filter's enable):
+     * negotiated mode varies via r->gzip_vary delegation, which core
+     * emits only under "gzip_vary on" — warn when that is off.
+     * "always" is exempt, exactly like the parent: it deliberately
+     * does not vary.
+     */
+    if (conf->enable == NGX_HTTP_COMPRESSION_STATIC_ON) {
+        ngx_http_core_loc_conf_t  *clcf;
+
+        clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+
+        if (!clcf->gzip_vary) {
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "\"compression_static on\" without "
+                               "\"gzip_vary on\": negotiated static "
+                               "responses will carry no "
+                               "\"Vary: Accept-Encoding\", so a shared "
+                               "cache may serve a compressed response to "
+                               "a client that cannot decode it");
+        }
+    }
+#endif
+
+    return NGX_CONF_OK;
+}
+
+
+static ngx_int_t
+ngx_http_compression_static_init(ngx_conf_t *cf)
+{
+    ngx_http_handler_pt        *h;
+    ngx_http_core_main_conf_t  *cmcf;
+
+    /* the content phase, exactly like gzip_static and the parent
+     * *_static modules */
+    cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_CONTENT_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_compression_static_handler;
+
+    return NGX_OK;
 }
