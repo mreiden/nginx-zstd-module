@@ -1642,8 +1642,9 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 *last_out = cl;
                 last_out = &cl->next;
 
-                flush_seen = 0;
-                last_seen = 0;
+                /* the op consumed this link's data and flags; the
+                 * break frees the link and the next one recomputes
+                 * last_seen/flush_seen from its own buf */
                 break;
             }
 

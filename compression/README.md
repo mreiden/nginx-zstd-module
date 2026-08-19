@@ -17,11 +17,33 @@ not this code. Directives implemented: `compression on|off`,
 unknown or duplicate = config error; the list is the enable set),
 `compression_min_length`, `compression_types`.
 
-Build (needs system libzstd + libbrotli, nginx >= 1.23.0):
+Build (nginx >= 1.23.0):
 
 ```bash
 ./configure --add-module=/path/to/nginx-zstd-module/compression
 ```
+
+`compression/auto/detect` discovers the libraries with the parent
+repo's hardened patterns — dynamic link first, then pkg-config
+(`libzstd` needs `libzstd-dev` / `zstd-devel`; brotli needs
+`libbrotli-dev` / `brotli-devel`, in RHEL's CRB repo). A missing
+library is a **shape, not an error**: the build proceeds without that
+backend, its coding tokens fail at config load with a pointer at the
+build line, and static sidecar serving keeps working for every coding
+(the `.zst` probe reads format constants, not library APIs — even the
+zero-library build still subsumes gzip_static). Explicit paths via
+`ZSTD_INC`/`ZSTD_LIB` and `BROTLI_INC`/`BROTLI_LIB` (MSVC: cmake's
+`zstd_static.lib` and `brotlienc.lib`/`brotlicommon.lib`, POSIX path
+spellings normalized via cygpath — see `tools/build-windows.sh` for
+the zstd half of the Windows recipe); explicit paths that fail are a
+configure error, not a fallback. `NGX_HTTP_COMPRESSION_NO_ZSTD=1` /
+`NGX_HTTP_COMPRESSION_NO_BROTLI=1` opt out of a present library.
+
+CI (`.github/workflows/compression.yml`) runs the eight Test::Nginx
+suites plus both proxy-backed tools, the gzip-less no-compat build,
+the three reduced backend shapes through the real opt-outs, the
+genuine not-found detection path on a brotli-less runner, and strict
+clang-tidy analyzer checks with proper nginx include paths.
 
 Works with and without the core gzip module: gzip-less builds do their
 own Accept-Encoding lookup, push their own `Vary: Accept-Encoding`,
