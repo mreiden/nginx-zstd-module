@@ -1,19 +1,25 @@
-# nginx-compression phase-0 prototype build glue.
+# nginx-compression build glue (phase 3: real library detection).
 #
-# PROTOTYPE-GRADE ON PURPOSE: links system libzstd + libbrotli
-# unconditionally, no feature probes, no bundled fallbacks, no MSVC.
-# The production build system inherits the hardened auto/zstd patterns
-# from nginx-zstd-module (bare-directory ngx_module_incs — the
-# never-applied-include lesson — pkg-config -I stripping, EVP
-# detection); reproducing them here would just dilute the phase-0
-# deliverable, which is the backend interface.
+# auto/detect probes libzstd and libbrotlienc with the parent repo's
+# hardened patterns (bare-directory ngx_module_incs, link flags only
+# through ngx_module_libs, MSVC path normalization) and — unlike the
+# parent, whose modules are useless without their library — treats a
+# missing library as a SHAPE, not an error: the backend roster is a
+# build-time variable (NGX_HTTP_COMPRESSION_HAVE_*, written into
+# ngx_auto_config.h via auto/define), the missing backend's TU
+# compiles to nothing, and static sidecar serving keeps working for
+# every coding. Every source file is always listed: the TUs
+# self-guard, which keeps the Makefile shape identical across builds.
 
 ngx_addon_name=ngx_http_compression_module
 
 if test -n "$ngx_module_link"; then
+
+    . $ngx_addon_dir/auto/detect
+
     ngx_module_type=HTTP_FILTER
     ngx_module_name=ngx_http_compression_module
-    ngx_module_incs=
+    ngx_module_incs="$ngx_compression_incs"
     ngx_module_deps="$ngx_addon_dir/ngx_http_compression.h \
                      $ngx_addon_dir/ngx_http_compression_ae.h \
                      $ngx_addon_dir/ngx_http_compression_dict.h \
@@ -23,13 +29,13 @@ if test -n "$ngx_module_link"; then
                      $ngx_addon_dir/ngx_http_compression_static.c \
                      $ngx_addon_dir/ngx_http_compression_zstd.c \
                      $ngx_addon_dir/ngx_http_compression_brotli.c"
-    ngx_module_libs="-lzstd -lbrotlienc -lbrotlicommon"
+    ngx_module_libs="$ngx_compression_libs"
 
     . auto/module
 else
     cat << END
 
-$0: error: the nginx-compression prototype requires nginx >= 1.23.0
+$0: error: nginx-compression requires nginx >= 1.23.0
 (list-linked headers; the header additionally enforces this with a
 compile-time version check).
 
