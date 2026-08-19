@@ -1,6 +1,7 @@
 use Test::Nginx::Socket;
 use Digest::SHA qw(sha256 sha256_hex);
 use MIME::Base64 qw(encode_base64);
+use File::Temp qw(tempdir);
 
 # Phase-1b negotiation and wire format. Everything derives from the
 # dictionary constant below: its hash, the Available-Dictionary value,
@@ -15,6 +16,20 @@ use MIME::Base64 qw(encode_base64);
 # reference CLIs.
 
 our $dict    = "const shared = 'negotiation fixture material';\n" x 40;
+
+# a body + its .br sidecar for the static-vs-dictionary interplay
+# blocks (the brotli CLI is already a suite dependency elsewhere)
+our $src_js = "sidecar interplay body: " . ("shared material line\n" x 30);
+our $br_sidecar;
+{
+    my $tdir = tempdir(CLEANUP => 1);
+    open my $fh, '>', "$tdir/f" or die $!;
+    binmode $fh; print $fh $src_js; close $fh;
+    system("brotli -f -o $tdir/f.br $tdir/f") == 0 or die "brotli fixture";
+    open my $bh, '<', "$tdir/f.br" or die $!;
+    binmode $bh; local $/; $br_sidecar = <$bh>; close $bh;
+}
+
 our $hex     = sha256_hex($dict);
 our $raw     = sha256($dict);
 our $b64     = encode_base64($raw, "");
@@ -397,3 +412,92 @@ qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :} . ("A" x 45) . qq{:}
 Content-Encoding: zstd
 --- no_error_log
 [error]
+
+
+=== TEST 15: dict bypass — the real-browser case (sidecar present, dcz wins)
+# the production soak's finding: a browser holding the dictionary
+# sends browser-shaped AE + Available-Dictionary, but the static
+# module serves the .br sidecar before the filter can negotiate.
+# compression_static_dict_bypass stands the static handler aside for
+# exactly those requests; the filter then elects dcz with the
+# combined Vary line.
+--- user_files eval
+[ [ "f/app.js" => $::src_js ], [ "f/app.js.br" => $::br_sidecar ],
+  [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /f/ {
+        compression on;
+        compression_static on;
+        compression_static_dict_bypass on;
+        compression_min_length 1;
+        compression_types text/javascript;
+        default_type text/javascript;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /f/app.js
+--- more_headers eval
+qq{Accept-Encoding: gzip, deflate, br, zstd, dcb, dcz\nAvailable-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: dcz
+--- response_body_like eval
+$::dcz_re
+--- raw_response_headers_like eval
+qr/Vary: Accept-Encoding, Available-Dictionary/
+
+
+=== TEST 15b: control — without the bypass, the sidecar wins
+--- user_files eval
+[ [ "f/app.js" => $::src_js ], [ "f/app.js.br" => $::br_sidecar ],
+  [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /f/ {
+        compression on;
+        compression_static on;
+        compression_min_length 1;
+        compression_types text/javascript;
+        default_type text/javascript;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /f/app.js
+--- more_headers eval
+qq{Accept-Encoding: gzip, deflate, br, zstd, dcb, dcz\nAvailable-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: br
+--- response_body eval
+$::br_sidecar
+
+
+=== TEST 15c: bypass + store MISS pays runtime compression (the tradeoff)
+# an Available-Dictionary the store doesn't hold: static stood aside,
+# negotiation missed, the filter degrades to the base coding
+# dynamically — the sidecar is forfeited, by documented design
+--- user_files eval
+[ [ "f/app.js" => $::src_js ], [ "f/app.js.br" => $::br_sidecar ],
+  [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /f/ {
+        compression on;
+        compression_static on;
+        compression_static_dict_bypass on;
+        compression_min_length 1;
+        compression_types text/javascript;
+        default_type text/javascript;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /f/app.js
+--- more_headers eval
+qq{Accept-Encoding: gzip, deflate, br, zstd, dcb, dcz\nAvailable-Dictionary: :$::bad_b64:}
+--- response_headers
+Content-Encoding: zstd

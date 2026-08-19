@@ -590,6 +590,42 @@ Lesson: ldd output is design feedback. A property the code holds
 ("calls no library") that the PACKAGING cannot express ("links no
 library") isn't held yet.
 
+### 29. Sidecars vs dictionaries: the static module learns to step aside
+
+Found in the production soak, the first deployment ever to run
+precompressed sidecars AND dictionaries on the same assets (the
+parents have the same latent collision; nobody's config combined
+them): the static module serves the .br sidecar in the content phase
+before the filter — the only place dictionary negotiation lives —
+ever sees the request, so a browser holding the dictionary gets the
+171 KB sidecar instead of the ~800-byte delta.
+
+compression_static_dict_bypass on: the static handler declines when
+the request BOTH carries Available-Dictionary and explicitly accepts
+dcz or dcb (RFC 9842 spec-constant tokens, not registry lookups —
+this module links nothing, the filter's registry included). Opt-in
+per location, default off: deploy tooling emits it beside
+compression_dict_file, and a static-only deployment never serves
+identity to dict-capable clients by accident. It applies in always
+mode too (standing aside is the operator's explicit request), and
+the check runs BEFORE the Vary delegation so a declined request
+cannot carry a delegated AE line beside the filter's combined one
+(the split-Vary hazard from round 2). Documented tradeoff, pinned by
+test: an Available-Dictionary that misses the filter's store pays
+runtime compression instead of the sidecar — rare by construction,
+since clients only advertise dictionaries whose match pattern covers
+the URL. The long-term richer answer stays on the ideas list:
+precompressed delta sidecars (.dcz/.dcb per dictionary x asset),
+which would need negotiation IN the static module and a sidecar per
+pair — post-merge material at best.
+
+Also attributed during the same soak session, for the record: core
+gzip's legacy Accept-Encoding scanner tolerates a space BEFORE
+"gzip" but not after — on (malformed, comma-less) input like
+"gzip dcz" vs "dcz gzip" the two orderings behave differently, and
+that asymmetry is core's, not this module's; our strict parser
+scores both malformed elements zero and defers.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep

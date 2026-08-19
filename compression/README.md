@@ -126,6 +126,18 @@ both libraries compiles, elects what remains, rejects absent codings
 with a pointer at the build, and still serves every static sidecar —
 static serving reads format constants, not library APIs.
 
+`compression_static_dict_bypass on` resolves the sidecar-vs-dictionary
+collision found in production: the static module serves a
+precompressed sidecar before the filter can negotiate dcz/dcb, so a
+browser holding the dictionary would get the full sidecar instead of
+the delta. With the bypass on, the static handler stands aside for
+requests that both carry `Available-Dictionary` and explicitly accept
+a dictionary coding (both modes, `always` included). Opt-in per
+location — emit it beside `compression_dict_file` — and default off,
+so static-only deployments never serve identity to dict-capable
+clients. Tradeoff: a dictionary miss pays runtime compression instead
+of the sidecar.
+
 Bypass predicates round out the phase-3 filter directives:
 `compression_bypass $var ...` serves identity when any predicate
 variable resolves non-empty and not `"0"` (the parents' zstd_bypass /

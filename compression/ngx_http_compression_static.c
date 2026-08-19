@@ -46,6 +46,7 @@
 typedef struct {
     ngx_uint_t     enable;
     ngx_array_t   *order;   /* the enable set AND the probe order */
+    ngx_flag_t     dict_bypass;
 } ngx_http_compression_static_conf_t;
 
 
@@ -82,6 +83,13 @@ static ngx_command_t  ngx_http_compression_static_commands[] = {
       ngx_http_compression_static_order,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
+      NULL },
+
+    { ngx_string("compression_static_dict_bypass"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_compression_static_conf_t, dict_bypass),
       NULL },
 
     ngx_null_command
@@ -159,6 +167,16 @@ typedef struct {
     ngx_int_t  (*check)(ngx_http_request_t *r, ngx_open_file_info_t *of,
                         ngx_http_core_loc_conf_t *clcf, ngx_str_t *path);
 } ngx_http_compression_static_coding_t;
+
+
+/*
+ * RFC 9842 dictionary-coding tokens, for the dict-bypass check. Spec
+ * constants like the format magics above — NOT registry lookups: this
+ * module links nothing, the filter's registry included (the split's
+ * whole point).
+ */
+static ngx_str_t  ngx_http_compression_static_dcz = ngx_string("dcz");
+static ngx_str_t  ngx_http_compression_static_dcb = ngx_string("dcb");
 
 
 static ngx_http_compression_static_coding_t
@@ -444,6 +462,7 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
     ngx_log_t                              *log;
     ngx_uint_t                              i, level;
     ngx_chain_t                             out;
+    ngx_list_part_t                        *part;
     ngx_table_elt_t                        *h, *ae;
     ngx_open_file_info_t                    of;
     ngx_http_core_loc_conf_t               *clcf;
@@ -463,6 +482,71 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
 
     if (conf->enable == NGX_HTTP_COMPRESSION_STATIC_OFF) {
         return NGX_DECLINED;
+    }
+
+    /*
+     * PHASE3 (found in the production soak): a request that both
+     * HOLDS a dictionary (Available-Dictionary) and explicitly
+     * accepts a dictionary coding can be served dramatically smaller
+     * by the FILTER module's dcz/dcb delta path than by any
+     * precompressed sidecar — but this handler runs first in the
+     * content phase and would serve the sidecar before negotiation
+     * ever happens. compression_static_dict_bypass makes this
+     * handler stand aside for exactly those requests, in BOTH on and
+     * always modes. Opt-in per location (deploy tooling emits it
+     * beside compression_dict_file), default off so a static-only
+     * deployment never serves identity to dict-capable clients. The
+     * check runs BEFORE the Vary delegation below on purpose: a
+     * declined request must not carry a delegated AE line beside the
+     * filter's combined one (the split-Vary cache hazard). Documented
+     * tradeoff: an Available-Dictionary that misses the filter's
+     * store pays runtime compression instead of the sidecar — rare
+     * by construction, since clients only advertise dictionaries
+     * whose match pattern covers the URL.
+     */
+    if (conf->dict_bypass) {
+
+        part = &r->headers_in.headers.part;
+        h = part->elts;
+
+        for (i = 0; /* void */; i++) {
+
+            if (i >= part->nelts) {
+                if (part->next == NULL) {
+                    h = NULL;
+                    break;
+                }
+                part = part->next;
+                h = part->elts;
+                i = 0;
+            }
+
+            if (h[i].key.len == sizeof("Available-Dictionary") - 1
+                && ngx_strncasecmp(h[i].key.data,
+                                   (u_char *) "Available-Dictionary",
+                                   sizeof("Available-Dictionary") - 1) == 0)
+            {
+                h = &h[i];
+                break;
+            }
+        }
+
+        if (h != NULL) {
+            ae = ngx_http_compression_ae_header(r);
+
+            if (ae != NULL
+                && ae->value.len != 0
+                && (ngx_http_compression_coding_weight(&ae->value,
+                        &ngx_http_compression_static_dcz, 0) > 0
+                    || ngx_http_compression_coding_weight(&ae->value,
+                        &ngx_http_compression_static_dcb, 0) > 0))
+            {
+                ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "compression static: standing aside for "
+                               "dictionary negotiation");
+                return NGX_DECLINED;
+            }
+        }
     }
 
     ae = NULL;
@@ -685,6 +769,7 @@ ngx_http_compression_static_create_conf(ngx_conf_t *cf)
 
     conf->enable = NGX_CONF_UNSET_UINT;
     conf->order = NULL;     /* NULL = inherit / shipped default */
+    conf->dict_bypass = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -699,6 +784,7 @@ ngx_http_compression_static_merge_conf(ngx_conf_t *cf, void *parent,
 
     ngx_conf_merge_uint_value(conf->enable, prev->enable,
                               NGX_HTTP_COMPRESSION_STATIC_OFF);
+    ngx_conf_merge_value(conf->dict_bypass, prev->dict_bypass, 0);
 
     if (conf->order == NULL) {
         conf->order = prev->order;

@@ -704,3 +704,101 @@ GET /page/x.shtml
 before[]after
 --- no_error_log eval
 qr/zero size buf/
+
+
+=== TEST 28: dict bypass stands aside on AD + explicit dict token
+# the static module alone (filter unconfigured): declining means
+# identity — the negotiation it defers to lives in the other module
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_dict_bypass on;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: br, dcz
+Available-Dictionary: :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+
+
+=== TEST 29: default off — the sidecar wins despite AD (unchanged behavior)
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: br, dcz
+Available-Dictionary: :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:
+--- response_headers
+Content-Encoding: br
+
+
+=== TEST 30: bypass without an Available-Dictionary serves the sidecar
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_dict_bypass on;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: br, dcz
+--- response_headers
+Content-Encoding: br
+
+
+=== TEST 31: bypass with AD but no dict token in AE serves the sidecar
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_dict_bypass on;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: br
+Available-Dictionary: :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:
+--- response_headers
+Content-Encoding: br
+
+
+=== TEST 32: bypass overrides always mode too
+# always ignores Accept-Encoding for SIDECAR SELECTION, but standing
+# aside for dictionary negotiation is the operator's explicit request
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- config
+    location /st/ {
+        compression_static always;
+        compression_static_dict_bypass on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: dcb
+Available-Dictionary: :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
