@@ -197,6 +197,43 @@ ngx_module_t  ngx_http_compression_filter_module = {
 static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
 static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 
+
+/*
+ * Default compression_types, mirrored from the parent zstd filter
+ * (parent parity for migrators — the phase-0 html-only default was a
+ * silent regression against it, caught reading GetPageSpeed's fork
+ * via issue #123; the wasm/wgsl entries ride along, text-like formats
+ * under non-text media types). The DIRECTIVE parser's post value
+ * stays ngx_http_html_default_types: an explicitly configured list
+ * keeps nginx's long-standing "text/html plus the configured types"
+ * behaviour.
+ */
+static ngx_str_t  ngx_http_compression_default_types[] = {
+    ngx_string("text/html"),
+    ngx_string("text/plain"),
+    ngx_string("text/css"),
+    ngx_string("text/csv"),
+    ngx_string("application/json"),
+    ngx_string("application/x-ndjson"),
+    ngx_string("application/json-seq"),
+    ngx_string("application/javascript"),
+    ngx_string("text/xml"),
+    ngx_string("application/xml"),
+    ngx_string("application/xml+rss"),
+    ngx_string("text/javascript"),
+    ngx_string("image/svg+xml"),
+    ngx_string("application/atom+xml"),
+    ngx_string("application/ld+json"),
+    ngx_string("application/manifest+json"),
+    ngx_string("application/problem+json"),
+    ngx_string("application/rss+xml"),
+    ngx_string("application/vnd.api+json"),
+    ngx_string("application/xhtml+xml"),
+    ngx_string("application/wasm"),
+    ngx_string("text/wgsl"),
+    ngx_null_string
+};
+
 static ngx_str_t  ngx_http_compression_gzip_token = ngx_string("gzip");
 
 
@@ -765,7 +802,7 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (ngx_http_merge_types(cf, &conf->types_keys, &conf->types,
                              &prev->types_keys, &prev->types,
-                             ngx_http_html_default_types)
+                             ngx_http_compression_default_types)
         != NGX_OK)
     {
         return NGX_CONF_ERROR;
@@ -1330,11 +1367,28 @@ ngx_http_compression_get_buf(ngx_http_request_t *r,
     }
 
     if (ctx->free != NULL) {
-        /* update_chains reset pos/last to start when it reclaimed */
         cl = ctx->free;
         ctx->free = cl->next;
         ctx->ob = cl->buf;
         ngx_free_chain(r->pool, cl);
+
+        /*
+         * ngx_chain_update_chains() reset pos/last when it reclaimed —
+         * but NOT the control flags: a buffer shipped at a
+         * FLUSH-completion comes back with flush=1 still set, and the
+         * full-buffer ship path assigns no flags, so the stale flag
+         * would force a spurious downstream flush on an unrelated
+         * later buffer. The parent's get_buf clears these (its P2
+         * fix); the first cut of this port missed the four lines, and
+         * GetPageSpeed's fork independently rediscovered the same bug
+         * class in the tokers line (their 9edfc34, via issue #123) —
+         * three codebases, one lesson.
+         */
+        ctx->ob->flush = 0;
+        ctx->ob->sync = 0;
+        ctx->ob->last_buf = 0;
+        ctx->ob->last_in_chain = 0;
+        ctx->ob->shadow = NULL;
 
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "compression: reused output buf %p", ctx->ob);

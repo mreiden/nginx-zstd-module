@@ -523,3 +523,106 @@ Accept-Encoding: zstd
 --- raw_response_headers_unlike: Content-Encoding
 --- no_error_log
 [error]
+
+
+
+=== TEST 21a: application/wasm compresses by DEFAULT (parent-parity types)
+# the phase-0 html-only default was a silent regression against the
+# parent's rich default list (caught via issue #123's fork read);
+# wasm is the canary — text-like content under a non-text media type
+--- config
+    location /t {
+        compression on;
+        default_type application/wasm;
+        gzip_vary on;
+        return 200 "wasm-shaped body long enough to clear min_length\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 21b: application/octet-stream does NOT compress by default
+# the default list is deliberate, not a wildcard
+--- config
+    location /t {
+        compression on;
+        default_type application/octet-stream;
+        gzip_vary on;
+        return 200 "octet-stream body long enough to clear min_length\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+=== TEST 21c: an explicit compression_types still replaces the defaults
+# text/plain is IN the default list but absent from this explicit one:
+# it must not compress (the directive replaces, text/html seeding aside)
+--- config
+    location /t {
+        compression on;
+        compression_types text/css;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "plain body long enough to clear the min_length gate\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+=== TEST 22a: a quoted parameter cannot smuggle a coding token
+# gzip;foo="bar,zstd" — the comma and the token live INSIDE a quoted
+# string; a naive comma-splitter sees `zstd"` and elects zstd for a
+# client that never offered it (vector from GetPageSpeed's fork suite,
+# via issue #123; our parser already handled it — now it's pinned)
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "quoted-string vector body long enough here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: gzip;foo="bar,zstd"
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+=== TEST 22b: ...and a real token after the quoted parameter still elects
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "quoted-string vector body long enough here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: gzip;foo="bar,zstd", zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
