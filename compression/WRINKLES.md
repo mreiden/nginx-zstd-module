@@ -521,6 +521,38 @@ Both tools need the module compiled in (checked via nginx -V);
 slow-drain additionally requires --with-debug and says so instead of
 passing vacuously. CI wiring for both remains with the CI item.
 
+### 27. The exact-boundary corner is PINNED (Mark's inversion)
+
+The FLUSH/FINISH-lands-exactly-at-ob->end case was recorded twice
+below as honestly unpinnable: compressed sizes are not controllable,
+so the suites and test_flush_paths could only patrol the
+neighborhood. Mark's insight during the phase-3 soak inverts the
+problem: the compressed size of a DETERMINISTIC input is itself a
+deterministic value C, and the buffer size became an operator
+directive in this very phase — so instead of steering content onto a
+fixed boundary, MOVE THE BOUNDARY ONTO THE CONTENT.
+tools/test_exact_boundary.py measures C per coding with a generous
+buffer, restarts nginx with compression_buffers 2 <C> (and C/2, which
+produces a full-buffer ship AT the boundary mid-op and then
+done-at-boundary; plus C+-1/C+-2 neighbors), and asserts the module's
+new witness line — "finish landed exactly at buffer end", logged only
+when an op completes with its last byte parked on ob->end — fired for
+every exact case, with every case decoding byte-exact. First run: C =
+16394 (zstd) / 16388 (br) for the 16 KB fixture, witness x4, all
+neighbors clean.
+
+Preconditions the tool asserts rather than assumes: the fixture is
+small enough that both encoders buffer ALL input through PROCESS and
+emit the entire stream at FINISH (nothing reaches ob earlier — if
+that drifts, the witness count comes up short and the tool fails
+loudly). The FLUSH-at-boundary variant would need the same trick
+against a measured first-flush segment; left as a patrol in
+test_flush_paths for now. For the record: the seed idea arrived as a
+generated script that padded random bytes AFTER a brotli stream to
+hit an exact file size — invalid output and the wrong layer (files
+have no buffers), but the exact-size INSTINCT was the right one; it
+just belonged on the buffer knob.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep
@@ -540,7 +572,9 @@ skippable-lead exemption. The directio property from the parent's
 is now witnessed in-suite (aligned-probe debug line + decline, at
 default and 16k alignment).
 
-Honestly NOT deterministically pinned: a FLUSH/FINISH landing at
+Honestly NOT deterministically pinned AT THE TIME (see 27 — the
+FINISH case is now pinned by tools/test_exact_boundary.py): a
+FLUSH/FINISH landing at
 exactly `ob->end` (the round-1 double-FINISH class) — compressed
 sizes aren't controllable, so the multi-buffer roundtrips exercise
 the neighborhood every run without guaranteeing the exact byte; and

@@ -1636,6 +1636,25 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             if (io.done && op != NGX_HTTP_COMPRESSION_OP_PROCESS) {
                 ngx_buf_t  *ob;
 
+                /*
+                 * The round-1 double-FINISH corner's observable
+                 * witness: the op completed with its last byte parked
+                 * exactly at ob->end. tools/test_exact_boundary.py
+                 * FORCES this case (measure the deterministic
+                 * compressed size C, re-run with compression_buffers
+                 * sized to C) and asserts this line — upgrading the
+                 * boundary from a patrolled neighborhood to a pinned
+                 * point.
+                 */
+                if (ctx->ob->last == ctx->ob->end) {
+                    ngx_log_debug1(NGX_LOG_DEBUG_HTTP,
+                                   r->connection->log, 0,
+                                   "compression: %s landed exactly at "
+                                   "buffer end",
+                                   op == NGX_HTTP_COMPRESSION_OP_FINISH
+                                       ? "finish" : "flush");
+                }
+
                 if (op == NGX_HTTP_COMPRESSION_OP_FINISH) {
                     ctx->done = 1;
                 }
