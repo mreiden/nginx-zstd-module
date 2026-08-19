@@ -21,6 +21,10 @@
  * branch is shaped the way it is.
  */
 
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_http.h>
+
 #include "ngx_http_compression.h"
 #include "ngx_http_compression_ae.h"
 

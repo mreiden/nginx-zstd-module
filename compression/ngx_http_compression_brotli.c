@@ -5,6 +5,10 @@
  * it; the interface survived without brotli-specific slots.
  */
 
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_http.h>
+
 #include "ngx_http_compression.h"
 
 #if (NGX_HTTP_COMPRESSION_HAVE_BROTLI)

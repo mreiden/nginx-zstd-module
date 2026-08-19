@@ -6,6 +6,10 @@
  * shortcuts are marked "PHASE0:" and collected in WRINKLES.md.
  */
 
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_http.h>
+
 #include "ngx_http_compression.h"
 #include "ngx_http_compression_ae.h"
 #include "ngx_http_compression_dict.h"

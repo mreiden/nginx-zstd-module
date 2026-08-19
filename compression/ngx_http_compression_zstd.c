@@ -4,6 +4,10 @@
  * ngx_http_compression.h for the contract each hook satisfies.
  */
 
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_http.h>
+
 #include "ngx_http_compression.h"
 
 #if (NGX_HTTP_COMPRESSION_HAVE_ZSTD)
