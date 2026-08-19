@@ -583,6 +583,21 @@ the empty-FLUSH special-buf path, which needs a mid-stream flush a
 tools at productization (the parent repo's pattern), not to prose
 claims of coverage.
 
+## Post-merge follow-ups (agreed, deliberately deferred)
+
+- **tools/build-windows.sh** grows the compression module: the brotli
+  half of the recipe (submodule init of brotli/deps/brotli, the cmake
+  static build with CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded to match
+  nginx's /MT, BROTLI_INC/BROTLI_LIB exports) beside the existing
+  zstd half. Deferred until AFTER the phase-3 merge on purpose: the
+  script pins repo+ref, and those pins are only correct once the work
+  lands upstream — extending it now would pin a review branch.
+- **Registry sidecar_ext field**: derive the static coding table from
+  the backend registry instead of the literal table in static.c, so a
+  new coding lands in static serving automatically. Post-stage-3 by
+  agreement — registry plumbing, unrelated to the filter work under
+  review.
+
 ## Phase-0 shortcuts (not findings — deliberate scope cuts)
 
 status set is 200-only (real module inherits the zstd filter's set);
