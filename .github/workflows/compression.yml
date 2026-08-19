@@ -82,18 +82,20 @@ jobs:
           tar -xzf "nginx-${NGINX_VERSION}.tar.gz"
           cd "nginx-${NGINX_VERSION}"
           ./configure --with-debug \
+            --with-http_sub_module --with-http_addition_module \
             --add-module="$GITHUB_WORKSPACE/compression" > configure.log
           grep -q "ZStandard" configure.log
           make -j"$(nproc)"
 
-      - name: Run the eight Test::Nginx suites
+      - name: Run the Test::Nginx suites
         run: |
           set -euo pipefail
           export TEST_NGINX_BINARY="$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx"
           prove compression/t/00-election.t compression/t/01-dict-store.t \
                 compression/t/02-dict-negotiation.t compression/t/03-static.t \
                 compression/t/04-roundtrip.t compression/t/05-tuning.t \
-                compression/t/06-buffers.t compression/t/07-bypass.t
+                compression/t/06-buffers.t compression/t/07-bypass.t \
+                compression/t/08-filter-order.t
 
       - name: Mid-stream flush paths (unbuffered proxy)
         run: |
