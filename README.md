@@ -4,6 +4,7 @@
 [![Valgrind](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/valgrind.yml)
 [![CI Deep](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/ci-deep.yml)
 [![CodeQL](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/codeql.yml)
+[![compression](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/compression.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/compression.yml)
 
 📖 **Background reading:**
 - [zstd nginx module: what it does, bugs fixed](https://deb.myguard.nl/2026/05/zstd-nginx-module-what-it-does-bugs-fixed/)
@@ -919,8 +920,8 @@ identically whether the hash was supplied or computed.
 
 # Testing & CI
 
-Six workflows guard the module (badges at the top): five gate every
-push & PR, and CI Deep runs the exhaustive monthly pass. A seventh,
+Seven workflows guard the module (badges at the top): six gate every
+push & PR, and CI Deep runs the exhaustive monthly pass. An eighth,
 [`bump.yml`](.github/workflows/bump.yml) (Bump), runs weekly but only
 opens a version-bump PR — it does not gate anything itself.
 
@@ -931,6 +932,7 @@ opens a version-bump PR — it does not gate anything itself.
 | **Fuzzing** | every push & PR | A 120-second libFuzzer regression run for the `ngx_http_zstd_accept_encoding()` / `ngx_http_zstd_eval_qvalue()` RFC 9110 `Accept-Encoding`/q-value parser. The fuzz target is sliced from the shipped header at build time, so there is no copy drift. See [`fuzz/README.md`](fuzz/README.md). |
 | **Valgrind** | every push & PR | A 60-second Memcheck-lite soak against a debug nginx build, catching uninitialised-value reads and leaks that ASAN cannot. |
 | **CodeQL** | every push & PR + monthly | GitHub's semantic C/C++ analysis (`security-extended` query pack) over the filter/static module sources. |
+| **compression** ([`compression.yml`](.github/workflows/compression.yml)) | every push & PR | Guards the unified [nginx-compression module](compression/) being built on the #117 branch (RFC #109). Five jobs: the full Test::Nginx suites (ten files, 630 assertions) plus the Python proxy-behavior tools; a gzip-less `--without-http_gzip_module` build **without** `--with-compat` (which would silently force gzip back on); a build-shape matrix through the codec opt-outs (no-zstd, no-brotli, neither — each asserting the opted-out library never reaches the link line); brotli-less auto-detection; and strict clang-tidy over the module sources with real nginx include paths. |
 | **CI Deep** | monthly + manual dispatch | The exhaustive run: a `build-flavors` matrix that compiles and runs the full `Test::Nginx::Socket` suite against **nginx mainline, nginx stable, and Angie** (the only workflow that builds Angie at all), hours-long fuzzing on the same target, full Memcheck and Helgrind soaks (a valgrind soak is ~20–50× slower than native), and the same security scanners. |
 | **Bump** ([`bump.yml`](.github/workflows/bump.yml)) | weekly + manual dispatch | Checks nginx.org/angie.software for newer nginx-stable/Angie releases than what's pinned in CI Deep's `build-flavors` matrix, and opens a PR (never pushes directly to protected `master`) with the updated pin + a freshly-verified sha256 digest. Does not gate merges itself — normal required checks review the PR. |
 
