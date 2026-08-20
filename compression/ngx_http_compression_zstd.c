@@ -12,6 +12,17 @@
 
 #if (NGX_HTTP_COMPRESSION_HAVE_ZSTD)
 
+/*
+ * ZSTD_getCParams (the level->parameters table read the browser
+ * window cap needs) sits behind the static-linking-only gate. The
+ * symbol is exported by every distribution libzstd and has been
+ * shape-stable since 1.4; the parent repo already compiles with this
+ * define on its explicit-path builds.
+ */
+#ifndef ZSTD_STATIC_LINKING_ONLY
+#define ZSTD_STATIC_LINKING_ONLY  1
+#endif
+
 #include <zstd.h>
 
 
@@ -29,6 +40,10 @@
 #define NGX_HTTP_COMPRESSION_ZSTD_LEVEL_MIN  0
 #endif
 #define NGX_HTTP_COMPRESSION_ZSTD_LEVEL_MAX  22
+
+/* the 8 MB window browsers enforce for Content-Encoding: zstd
+ * (RFC 8878 §3.1.1.1.2) — same limit the static probe serves by */
+#define NGX_HTTP_COMPRESSION_ZSTD_BROWSER_WLOG  23
 
 
 typedef struct {
@@ -80,18 +95,52 @@ ngx_http_compression_zstd_create(ngx_http_request_t *r,
 
     /*
      * The window is a per-request memory CEILING (parent
-     * zstd_window_log semantics): unset (0) leaves the level's own
-     * default. PHASE3 note: the parent's dcz path additionally sizes
-     * the window UP to dictionary + expected content so the far end
-     * of a large dictionary keeps matching — that computation joins
+     * zstd_window_log semantics) when the operator set it. When they
+     * did NOT, the effective window is capped at the browser limit —
+     * an INTENTIONAL DEVIATION from the parent (Mark's call, 2026-08-19):
+     * on an UNPLEDGED stream (chunked proxying, SSI — no
+     * Content-Length) the frame header declares the parameter's
+     * window, and every browser rejects anything above 8 MB (RFC 8878
+     * §3.1.1.1.2) before decoding a byte. Levels 20+ default past the
+     * limit, and long-distance matching would default to 128 MB at
+     * ANY level — the dynamic twin of the vite/128MB static incident.
+     * The cap is min(level default, 23): a ceiling, never a floor, so
+     * low levels keep their smaller windows and memory profile.
+     * Pledged responses are unaffected either way (their headers
+     * declare the content size), and an explicit compression_window
+     * still wins verbatim for operators serving non-browser clients.
+     *
+     * PHASE3 note: the parent's dcz path additionally sizes the
+     * window UP to dictionary + expected content so the far end of a
+     * large dictionary keeps matching — that computation joins
      * attach_dictionary when the prepared-dictionary work lands; an
      * explicit operator ceiling must still win there, as here.
      */
-    if (tuning->window_bits > 0
-        && ZSTD_isError(ZSTD_CCtx_setParameter(z->cctx, ZSTD_c_windowLog,
-                                               (int) tuning->window_bits)))
-    {
-        return NGX_ERROR;
+    if (tuning->window_bits > 0) {
+        if (ZSTD_isError(ZSTD_CCtx_setParameter(z->cctx, ZSTD_c_windowLog,
+                                                (int) tuning->window_bits)))
+        {
+            return NGX_ERROR;
+        }
+
+    } else {
+        ZSTD_compressionParameters  cp;
+
+        cp = ZSTD_getCParams((int) tuning->level, 0, 0);
+
+        if (cp.windowLog > NGX_HTTP_COMPRESSION_ZSTD_BROWSER_WLOG) {
+            if (ZSTD_isError(ZSTD_CCtx_setParameter(z->cctx,
+                                 ZSTD_c_windowLog,
+                                 NGX_HTTP_COMPRESSION_ZSTD_BROWSER_WLOG)))
+            {
+                return NGX_ERROR;
+            }
+
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "compression: zstd window capped to browser "
+                           "limit (level default %ui exceeds it)",
+                           (ngx_uint_t) cp.windowLog);
+        }
     }
 
     *bctx = z;

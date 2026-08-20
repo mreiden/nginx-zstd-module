@@ -17,6 +17,14 @@ my $tmp = tempdir(CLEANUP => 1);
 
 our $src = "tuning fixture body: compressible repeated text line\n" x 40;
 
+# the browser-window-cap blocks serve an SSI page (Content-Length
+# stripped = unpledged stream, the shape that stamps the parameter
+# window into the frame header)
+our $wbig  = "window cap fixture line\n" x 3000;
+our $wpage = "top[" . $wbig . "]bottom\n";
+
+our %srcs = ( default => $src, wpage => $wpage );
+
 sub spew { open my $h, '>', $_[0] or die "$_[0]: $!"; binmode $h; print $h $_[1]; close $h }
 sub slurp { open my $h, '<', $_[0] or die "$_[0]: $!"; binmode $h; local $/; <$h> }
 
@@ -30,6 +38,9 @@ sub cli_decode {
 our %decoders = (
     zstd => sub { cli_decode("zstd -dq -c", $_[0]) },
     br   => sub { cli_decode("brotli -d -c", $_[0]) },
+    # the BROWSER: refuses any frame declaring a window over 8 MB —
+    # the window-cap blocks decode through this limit on purpose
+    zstd8m => sub { cli_decode("zstd -dq -c -M8MB", $_[0]) },
 );
 
 add_response_body_check(sub {
@@ -39,11 +50,14 @@ add_response_body_check(sub {
     my $how = $block->decode_with or return;
     chomp $how;
 
+    my $key = $block->expect_src // "default";
+    chomp $key;
+
     my $dec = $decoders{$how} ? $decoders{$how}->($body) : undef;
 
     Test::More::is(
         defined $dec ? sha256_hex($dec) : "(decode failed)",
-        sha256_hex($src),
+        sha256_hex($srcs{$key}),
         $block->name . " - $how roundtrip decodes byte-exact"
     );
 });
@@ -361,3 +375,120 @@ Content-Encoding: zstd
 zstd
 --- error_log eval
 qr/compression: create zstd level 1 window_bits 0/
+
+
+=== TEST 19: unpledged stream at level 22 stays browser-decodable (the cap)
+# INTENTIONAL DEVIATION from the parent (Mark's call): with no
+# Content-Length to pledge, the frame header declares the parameter
+# window — level 22 defaults to 128m, which every browser rejects.
+# When compression_window is unset the effective window caps at the
+# 8m browser limit; the decoder here enforces exactly that limit, so
+# this block FAILS on the uncapped build.
+--- log_level: debug
+--- user_files eval
+[ [ "w/page.shtml" => qq{top[<!--#include virtual="/w/big.html" -->]bottom\n} ],
+  [ "w/big.html" => $::wbig ] ]
+--- config
+    location /w/ {
+        ssi on;
+        default_type text/html;
+        compression on;
+        compression_level zstd 22;
+        compression_min_length 1;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /w/page.shtml
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- decode_with
+zstd8m
+--- expect_src
+wpage
+--- error_log eval
+qr/zstd window capped to browser limit/
+
+
+=== TEST 19b: an explicit compression_window wins over the cap
+# operators serving non-browser clients keep the full window; the
+# plain decoder (no memory limit) proves the stream is still valid
+--- log_level: debug
+--- user_files eval
+[ [ "w/page.shtml" => qq{top[<!--#include virtual="/w/big.html" -->]bottom\n} ],
+  [ "w/big.html" => $::wbig ] ]
+--- config
+    location /w/ {
+        ssi on;
+        default_type text/html;
+        compression on;
+        compression_level zstd 22;
+        compression_window zstd 64m;
+        compression_min_length 1;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /w/page.shtml
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- decode_with
+zstd
+--- expect_src
+wpage
+--- no_error_log eval
+qr/zstd window capped/
+
+
+=== TEST 20a: zstd level 1 (practical minimum) produces a valid stream
+--- user_files eval
+[ [ "t/body.txt" => $::src ] ]
+--- config
+    location /t/ {
+        compression on;
+        compression_level zstd 1;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /t/body.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- decode_with
+zstd
+--- no_error_log
+[error]
+
+
+=== TEST 20b: zstd level 22 (maximum) produces a valid stream
+--- user_files eval
+[ [ "t/body.txt" => $::src ] ]
+--- config
+    location /t/ {
+        compression on;
+        compression_level zstd 22;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /t/body.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- decode_with
+zstd
+--- no_error_log
+[error]
