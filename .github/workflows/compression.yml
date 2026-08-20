@@ -246,11 +246,17 @@ jobs:
             > configure.log
           if [ -n "$NGX_HTTP_COMPRESSION_NO_ZSTD" ]; then
             grep -q "#define NGX_HTTP_COMPRESSION_HAVE_ZSTD  0" objs/ngx_auto_config.h
-            ! grep -q -- "-lzstd" objs/Makefile
+            if grep -q -- "-lzstd" objs/Makefile; then
+              echo "opted-out zstd still in the link line" >&2
+              exit 1
+            fi
           fi
           if [ -n "$NGX_HTTP_COMPRESSION_NO_BROTLI" ]; then
             grep -q "#define NGX_HTTP_COMPRESSION_HAVE_BROTLI  0" objs/ngx_auto_config.h
-            ! grep -q -- "brotlienc" objs/Makefile
+            if grep -q -- "brotlienc" objs/Makefile; then
+              echo "opted-out brotli still in the link line" >&2
+              exit 1
+            fi
           fi
           make -j"$(nproc)"
 
@@ -412,10 +418,12 @@ jobs:
           # Annex-K memcpy/memset advisory every nginx module trips
           # through the ngx_memcpy/ngx_memzero macros — noise, not
           # analysis. Everything else is strict.
+          read -ra codec_cflags \
+            <<< "$(pkg-config --cflags libzstd libbrotlienc 2>/dev/null || true)"
           clang-tidy --quiet \
             --checks='-*,clang-analyzer-*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \
             --warnings-as-errors='*' \
             "$GITHUB_WORKSPACE"/compression/ngx_http_compression_*.c -- \
             -I src/core -I src/event -I src/event/modules -I src/os/unix \
             -I src/http -I src/http/modules -I objs \
-            $(pkg-config --cflags libzstd libbrotlienc 2>/dev/null)
+            "${codec_cflags[@]}"
