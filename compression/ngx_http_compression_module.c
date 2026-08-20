@@ -118,7 +118,8 @@ static ngx_conf_enum_t  ngx_http_compression_http_version_enum[] = {
 static ngx_command_t  ngx_http_compression_commands[] = {
 
     { ngx_string("compression"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF
+                        |NGX_HTTP_LIF_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_compression_conf_t, enable),
@@ -303,15 +304,17 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
     ngx_str_t                      b64, dst;
     ngx_uint_t                     i;
     ngx_list_part_t               *part;
-    ngx_table_elt_t               *h, *ad;
+    ngx_table_elt_t               *h, *ad, *sfs;
     ngx_http_compression_dict_t  **list;
 
     if (conf->dicts == NULL || conf->dicts->nelts == 0) {
         return NULL;
     }
 
-    /* no built-in field for Available-Dictionary: generic list walk */
+    /* no built-in fields for Available-Dictionary or Sec-Fetch-Site:
+     * one generic list walk collects both */
     ad = NULL;
+    sfs = NULL;
     part = &r->headers_in.headers.part;
     h = part->elts;
 
@@ -332,11 +335,40 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
                                sizeof("Available-Dictionary") - 1) == 0)
         {
             ad = &h[i];
-            break;
+
+        } else if (h[i].key.len == sizeof("Sec-Fetch-Site") - 1
+                   && ngx_strncasecmp(h[i].key.data,
+                                      (u_char *) "Sec-Fetch-Site",
+                                      sizeof("Sec-Fetch-Site") - 1) == 0)
+        {
+            sfs = &h[i];
         }
     }
 
     if (ad == NULL || ad->value.len == 0) {
+        return NULL;
+    }
+
+    /*
+     * Sec-Fetch-Site gate (parent parity, RFC 9842 §8.3 territory,
+     * caught by the parent-suite audit): dictionaries are
+     * same-origin-partitioned secrets — a cross-site response
+     * compressed against one leaks it. When the header is present it
+     * must say "same-origin" or "none"; browsers always send it, so
+     * absence means a non-browser client where the cross-origin read
+     * model does not apply.
+     */
+    if (sfs != NULL
+        && !(sfs->value.len == sizeof("same-origin") - 1
+             && ngx_strncasecmp(sfs->value.data, (u_char *) "same-origin",
+                                sizeof("same-origin") - 1) == 0)
+        && !(sfs->value.len == sizeof("none") - 1
+             && ngx_strncasecmp(sfs->value.data, (u_char *) "none",
+                                sizeof("none") - 1) == 0))
+    {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "compression: dict skip, Sec-Fetch-Site \"%V\"",
+                       &sfs->value);
         return NULL;
     }
 
@@ -1178,7 +1210,13 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         || (r->headers_out.status > 299
             && r->headers_out.status != NGX_HTTP_FORBIDDEN
             && r->headers_out.status != NGX_HTTP_NOT_FOUND)
-        || r->header_only
+        /*
+         * NO r->header_only skip (parent-audit find): a HEAD response
+         * must advertise the same Content-Encoding its GET would
+         * produce — core gzip does, and skipping made HEAD and GET
+         * disagree. The body filter sees no body on HEAD and simply
+         * never runs the encoder.
+         */
         /*
          * Protocol floor (Mark's call, gzip_http_version parity,
          * default 1.1): an RFC 1945-era client is gzip-at-best, and

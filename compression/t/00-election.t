@@ -823,3 +823,71 @@ Accept-Encoding: gzip, zstd
 Content-Encoding: gzip
 --- no_error_log
 [error]
+
+
+
+=== TEST 26a: HEAD advertises the same Content-Encoding its GET would
+# parent-audit find: the phase-0 header_only skip made HEAD and GET
+# disagree about the representation; core gzip advertises on HEAD
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "head parity fixture body long enough to compress\n";
+    }
+--- request
+HEAD /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 26b: the compression flag works inside an if-block (LIF parity)
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        if ($arg_off) {
+            compression off;
+        }
+        return 200 "if-block fixture body long enough to compress here\n";
+    }
+--- request
+GET /t?off=1
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+=== TEST 26c: ...and stays on outside the if-arm
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        if ($arg_off) {
+            compression off;
+        }
+        return 200 "if-block fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]

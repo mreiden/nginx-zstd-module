@@ -501,3 +501,90 @@ GET /f/app.js
 qq{Accept-Encoding: gzip, deflate, br, zstd, dcb, dcz\nAvailable-Dictionary: :$::bad_b64:}
 --- response_headers
 Content-Encoding: zstd
+
+
+=== TEST 16: Sec-Fetch-Site cross-site refuses the dictionary coding
+# parent parity (RFC 9842 security considerations): dictionaries are
+# same-origin-partitioned secrets — a cross-site response compressed
+# against one leaks it. Refusal degrades to the base coding.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "sec-fetch fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: cross-site}
+--- response_headers
+Content-Encoding: zstd
+
+
+=== TEST 16b: Sec-Fetch-Site same-origin is allowed
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "sec-fetch fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: same-origin}
+--- response_headers
+Content-Encoding: dcz
+
+
+=== TEST 16c: Sec-Fetch-Site none (address-bar navigation) is allowed
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "sec-fetch fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: none}
+--- response_headers
+Content-Encoding: dcz
+
+
+=== TEST 16d: same-site (subdomain) is refused — same-ORIGIN partitioning
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "sec-fetch fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: same-site}
+--- response_headers
+Content-Encoding: zstd
