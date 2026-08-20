@@ -258,3 +258,23 @@ qq{    compression_dict_file html/a.dict } . ("0" x 65) . qq{;\n}
 invalid dictionary hash
 --- no_error_log
 [alert]
+
+
+=== TEST 14: a dictionary above the 8 MB browser window warns at load
+# parent parity: content beyond the window cannot reference the far
+# end of the dictionary; loading proceeds, the operator is told
+--- user_files eval
+[ [ "big.dict" => ("x" x 8388609) ] ]
+--- http_config
+    compression_dict_file html/big.dict;
+--- config
+    location /t {
+        compression on;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "oversized dictionary fixture body long enough\n";
+    }
+--- request
+GET /t
+--- error_log
+larger than the 8 MB window browsers enforce

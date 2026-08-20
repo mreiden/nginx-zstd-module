@@ -95,7 +95,7 @@ jobs:
                 compression/t/02-dict-negotiation.t compression/t/03-static.t \
                 compression/t/04-roundtrip.t compression/t/05-tuning.t \
                 compression/t/06-buffers.t compression/t/07-bypass.t \
-                compression/t/08-filter-order.t
+                compression/t/08-filter-order.t compression/t/09-ae-parser.t
 
       - name: Mid-stream flush paths (unbuffered proxy)
         run: |

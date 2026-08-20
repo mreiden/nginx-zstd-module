@@ -891,3 +891,223 @@ Accept-Encoding: zstd
 Content-Encoding: zstd
 --- no_error_log
 [error]
+
+
+
+=== TEST 27a: an upstream 206 is never compressed (status set)
+# a 206 that reaches the filter already sliced must pass untouched —
+# compressing the slice would corrupt the representation
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 206 "partial content fixture body long enough here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 206
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+=== TEST 27a2: Range + compressible = full 200, compressed (gzip parity)
+# dynamic compression and byte ranges do not compose: once the filter
+# sets Content-Encoding the range filter stands down, exactly like
+# core gzip — the client gets the complete compressed representation
+--- user_files eval
+[ [ "r/plain.txt" => ("range fixture line\n" x 40) ] ]
+--- config
+    location /r/ {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /r/plain.txt
+--- more_headers
+Accept-Encoding: zstd
+Range: bytes=0-9
+--- error_code: 200
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 27a3: without compression in play, the same range slices (206)
+--- user_files eval
+[ [ "r/plain.txt" => ("range fixture line\n" x 40) ] ]
+--- config
+    location /r/ {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /r/plain.txt
+--- more_headers
+Range: bytes=0-9
+--- error_code: 206
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body chomp
+range fixt
+--- no_error_log
+[error]
+
+
+=== TEST 27b: Content-Encoding is emitted exactly once on the wire
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "single content-encoding fixture body long enough\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- raw_response_headers_unlike eval
+qr/Content-Encoding:.*Content-Encoding:/s
+--- no_error_log
+[error]
+
+
+=== TEST 27c: a zero-length proxied body neither spins nor corrupts
+# the parent's infinite-loop regression class: an empty upstream body
+# through the filter must FINISH cleanly (an empty frame is valid)
+--- config
+    location /t {
+        compression on;
+        compression_min_length 0;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        proxy_pass http://127.0.0.1:$TEST_NGINX_SERVER_PORT/empty;
+    }
+    location /empty {
+        default_type text/plain;
+        return 200 "";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 200
+--- no_error_log
+[error]
+
+
+=== TEST 28a: omitted compression_types includes text/wgsl
+--- config
+    location /t {
+        compression on;
+        default_type text/wgsl;
+        gzip_vary on;
+        return 200 "wgsl shader-shaped fixture body long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 28b: omitted compression_types includes text/csv
+--- config
+    location /t {
+        compression on;
+        default_type text/csv;
+        gzip_vary on;
+        return 200 "csv,fixture,body,long,enough,to,compress,meaningfully\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 28c: omitted compression_types includes application/x-ndjson
+--- config
+    location /t {
+        compression on;
+        default_type application/x-ndjson;
+        gzip_vary on;
+        return 200 "{\"ndjson\":\"fixture body long enough to compress\"}\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 28d: omitted compression_types includes application/json-seq
+--- config
+    location /t {
+        compression on;
+        default_type application/json-seq;
+        gzip_vary on;
+        return 200 "{\"jsonseq\":\"fixture body long enough to compress\"}\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 29a: compression on without gzip_vary warns at config load
+--- config
+    location /t {
+        compression on;
+        default_type text/html;
+        return 200 "warn fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- error_log
+"gzip_vary on"
+
+
+=== TEST 29b: compression on WITH gzip_vary does not warn
+--- config
+    location /t {
+        compression on;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "warn fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- no_error_log eval
+qr/gzip_vary/

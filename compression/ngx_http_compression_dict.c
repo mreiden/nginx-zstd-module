@@ -246,6 +246,24 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
 
+        /*
+         * Parent parity (its zstd-03:13): a dictionary larger than
+         * the 8 MB window browsers enforce cannot be fully referenced
+         * — with the unpledged-window cap, dcz matches beyond the
+         * window's reach are silently lost. Loading proceeds (the
+         * near end still helps, and dcb's window rules differ), but
+         * the operator should know their dictionary is bigger than
+         * its useful range.
+         */
+        if (entry->bytes.len > 8 * 1024 * 1024) {
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "dictionary \"%V\" is %uz bytes — larger "
+                               "than the 8 MB window browsers enforce for "
+                               "Content-Encoding: zstd; content beyond the "
+                               "window cannot reference it", &path,
+                               entry->bytes.len);
+        }
+
         if (supplied) {
             ngx_memcpy(entry->sha256, want,
                        NGX_HTTP_COMPRESSION_SHA256_LEN);

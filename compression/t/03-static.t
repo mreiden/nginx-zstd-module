@@ -802,3 +802,33 @@ Available-Dictionary: :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:
 --- raw_response_headers_unlike: Content-Encoding
 --- response_body eval
 $::src
+
+
+=== TEST 33a: compression_static on without gzip_vary warns at config load
+# parent zstd_static parity, gained with the module split: negotiated
+# mode varies via delegation, which core emits only under gzip_vary
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- error_log
+"compression_static on" without "gzip_vary on"
+
+
+=== TEST 33b: compression_static always does not warn (it never varies)
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- config
+    location /st/ {
+        compression_static always;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- no_error_log eval
+qr/compression_static on/

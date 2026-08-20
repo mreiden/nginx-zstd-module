@@ -588,3 +588,24 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: same-site}
 --- response_headers
 Content-Encoding: zstd
+
+
+=== TEST 17: dcz;q=0 is an explicit refusal despite a matching dictionary
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "refusal fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz;q=0\nAvailable-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: zstd
