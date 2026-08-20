@@ -74,6 +74,17 @@ and the supplied-hash fast path. The branch also carries the full
 ngx_brotli hardened-fork history under `brotli/` (subtree merge; the
 fork point is the merge's second parent).
 
+The `optional` keyword on `compression_dict_file <path> [sha256]
+[optional]` demotes deploy-race load failures to warnings instead of
+refusing to start (an intentional deviation from the RFC's fail-fatal
+rule, at the operator's insistence): missing/empty/unreadable
+dictionaries are skipped — clients holding them degrade to the base
+coding — while a stale or conflicting supplied hash is re-keyed to
+the file's computed truth so clients holding the real file still
+negotiate. Malformed hex stays fatal either way. Deploy tooling
+should emit `optional` on generated lines; hand-written critical
+entries stay strict by omitting it.
+
 **Phase 2** adds unified static sidecar serving: `compression_static
 off|on|always` and `compression_static_order` (tokens `zstd`/`br`/
 `gzip`; the list is the enable set AND the probe order; default

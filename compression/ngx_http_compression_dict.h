@@ -64,6 +64,9 @@ typedef struct {
     ngx_str_t    sha256_hex;   /* lowercase; negotiation + compare key */
     unsigned     supplied:1;   /* hash arrived via config, verbatim */
     unsigned     verified:1;   /* a computed pass confirmed the hash */
+    unsigned     optional:1;   /* any line for this path said
+                                * "optional": load failures demote to
+                                * warnings (sticky across lines) */
 } ngx_http_compression_dict_t;
 
 

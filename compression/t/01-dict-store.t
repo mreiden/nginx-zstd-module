@@ -278,3 +278,105 @@ invalid dictionary hash
 GET /t
 --- error_log
 larger than the 8 MB window browsers enforce
+
+
+=== TEST 15: a MISSING optional dictionary warns and the server starts
+# the operator-insistence demotion (intentional RFC deviation): a
+# botched deploy must not take the site down — clients holding the
+# absent dictionary degrade to the base coding
+--- config
+    location /t {
+        compression on;
+        compression_dict_file html/does-not-exist.dict optional;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "optional-missing fixture body long enough here\n";
+    }
+--- request
+GET /t
+--- error_code: 200
+--- error_log
+skipping optional dictionary
+
+
+=== TEST 16: a missing dictionary WITHOUT optional still refuses to start
+--- config
+    location /t {
+        compression on;
+        compression_dict_file html/does-not-exist.dict;
+        default_type text/html;
+        return 200 "strict-missing fixture body long enough here\n";
+    }
+--- must_die
+--- error_log
+open() dictionary
+
+
+=== TEST 17: an EMPTY optional dictionary warns and the server starts
+--- user_files eval
+[ [ "empty.dict" => "" ] ]
+--- config
+    location /t {
+        compression on;
+        compression_dict_file html/empty.dict optional;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "optional-empty fixture body long enough here\n";
+    }
+--- request
+GET /t
+--- error_code: 200
+--- error_log
+skipping optional dictionary
+
+
+=== TEST 18: same-hash different-path with optional aliases and warns
+--- user_files eval
+[ [ "a.dict" => ("alias fixture dictionary content\n" x 20) ],
+  [ "b.dict" => ("alias fixture dictionary content\n" x 20) ] ]
+--- config
+    location /t {
+        compression on;
+        compression_dict_file html/a.dict;
+        compression_dict_file html/b.dict optional;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "alias fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- error_code: 200
+--- error_log
+using the existing entry
+
+
+=== TEST 19: a duplicate optional line in one list warns and skips
+--- user_files eval
+[ [ "a.dict" => ("dup fixture dictionary content\n" x 20) ] ]
+--- config
+    location /t {
+        compression on;
+        compression_dict_file html/a.dict optional;
+        compression_dict_file html/a.dict optional;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "dup fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- error_code: 200
+--- error_log
+skipping the duplicate
+
+
+=== TEST 20: garbage where the hash belongs stays FATAL even with optional
+# a typo is a config bug to fix once, not a deploy race to ride out
+--- user_files eval
+[ [ "a.dict" => ("typo fixture dictionary content\n" x 20) ] ]
+--- config
+    location /t {
+        compression_dict_file html/a.dict zzzz optional;
+    }
+--- must_die
+--- error_log
+invalid dictionary hash "zzzz"

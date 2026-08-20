@@ -626,6 +626,37 @@ gzip's legacy Accept-Encoding scanner tolerates a space BEFORE
 that asymmetry is core's, not this module's; our strict parser
 scores both malformed elements zero and defers.
 
+### 30. The "optional" dictionary keyword (operator-insistence deviation)
+
+An INTENTIONAL DEVIATION from this RFC's own fail-fatal rule, at the
+operator's insistence (Mark's scenario, verbatim reasoning: the first
+time a deploy goes wrong and the site is down while someone hunts for
+the config line to comment out, dictionaries get mandated away
+forever). The key observation making it safe: the RUNTIME failure
+mode of a missing dictionary is graceful by construction — clients
+holding it negotiate nothing and receive the base coding — so the
+fatal-at-load rule was buying loudness, not safety. Loud and fatal
+are different things.
+
+compression_dict_file <path> [sha256] [optional]: per-line keyword
+(no global-mode ordering dependence; deploy tooling emits it on
+generated lines, hand-written critical entries stay strict). Under
+it, deploy-race failures demote to warnings with the safest
+per-case semantics: missing/unreadable/empty/short-read lines are
+SKIPPED (degrade); a stale supplied hash is RE-KEYED to the file's
+computed truth (clients holding the real file still negotiate —
+strictly better than skipping); conflicting supplied values likewise
+resolve to the computed truth; same-hash-different-path ALIASES to
+the existing entry (same hash = same bytes = interchangeable); a
+duplicate line in one list skips. The optional bit is sticky per
+path across lines. Malformed hex stays FATAL even with the keyword:
+a typo is a config bug to fix once, not a deploy race to ride out.
+
+Pinned: every demotion (skip/alias/duplicate/empty), the strict
+paths unchanged, the typo-stays-fatal rule, and truth-wins
+END-TO-END — a wrong supplied hash plus optional re-keys, and a
+client presenting the REAL file's hash gets dcz.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep

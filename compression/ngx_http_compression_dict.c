@@ -85,7 +85,7 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_str_t                          *value, path, hex;
     ngx_fd_t                            fd;
     ssize_t                             n;
-    ngx_uint_t                          i, supplied;
+    ngx_uint_t                          i, supplied, optional;
     ngx_file_info_t                     info;
     ngx_http_compression_dict_t       **d, *entry, **dp, **list;
     ngx_http_compression_main_conf_t   *cmcf;
@@ -100,16 +100,49 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     value = cf->args->elts;
     path = value[1];
-    supplied = (cf->args->nelts == 3);
+
+    /*
+     * Optional arguments in either order: a 64-hex sha256 and/or the
+     * "optional" keyword — the operator-insistence demotion (Mark's
+     * outage scenario, an INTENTIONAL DEVIATION from the RFC's
+     * fail-fatal rule): a dictionary that cannot be loaded as
+     * declared warns and degrades instead of refusing to start the
+     * server. Deploy tooling emits it on generated lines; hand-written
+     * critical entries stay strict by omitting it. Anything that is
+     * neither the keyword nor a plausible hash falls through to the
+     * hash validator below, which names the real problem.
+     */
+    supplied = 0;
+    optional = 0;
+
+    for (i = 2; i < cf->args->nelts; i++) {
+        if (value[i].len == sizeof("optional") - 1
+            && ngx_strncmp(value[i].data, "optional",
+                           sizeof("optional") - 1) == 0)
+        {
+            optional = 1;
+
+        } else if (supplied) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "duplicate dictionary hash argument \"%V\"",
+                               &value[i]);
+            return NGX_CONF_ERROR;
+
+        } else {
+            supplied = 1;
+            hex = value[i];
+        }
+    }
 
     /*
      * Validate the supplied hash BEFORE touching the filesystem (the
      * parent repo's ordering pin): a malformed hash next to a
      * nonexistent path must report the hash, not the open failure —
-     * the operator fixes their config once, not twice.
+     * the operator fixes their config once, not twice. Malformed hex
+     * stays FATAL even with "optional": a typo is a config bug to fix
+     * once, not a deploy race to ride out.
      */
     if (supplied) {
-        hex = value[2];
         if (ngx_http_compression_hex_decode(&hex, want) != NGX_OK) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "invalid dictionary hash \"%V\": want %d "
@@ -160,12 +193,28 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            NGX_HTTP_COMPRESSION_SHA256_LEN)
                 != 0)
             {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "conflicting sha256 for dictionary "
-                                   "\"%V\": \"%V\" does not match the "
-                                   "hash already recorded for this file",
-                                   &path, &value[2]);
-                return NGX_CONF_ERROR;
+                if (!optional && !entry->optional) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "conflicting sha256 for dictionary "
+                                       "\"%V\": \"%V\" does not match the "
+                                       "hash already recorded for this "
+                                       "file", &path, &hex);
+                    return NGX_CONF_ERROR;
+                }
+
+                /* optional: the file's computed truth outranks BOTH
+                 * declared values — serving keys stay correct */
+                ngx_http_zstd_sha256(entry->bytes.data, entry->bytes.len,
+                                     entry->sha256);
+                cmcf->dicts_hashed++;
+                entry->verified = 1;
+                ngx_http_compression_hex_encode(entry->sha256,
+                                     NGX_HTTP_COMPRESSION_SHA256_LEN,
+                                     entry->sha256_hex.data);
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "conflicting sha256 values for optional "
+                                   "dictionary \"%V\"; the file's computed "
+                                   "hash wins", &path);
             }
 
             if (!entry->supplied) {
@@ -189,12 +238,27 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            NGX_HTTP_COMPRESSION_SHA256_LEN)
                 != 0)
             {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "dictionary \"%V\": the supplied "
-                                   "sha256 does not match the file's "
-                                   "actual hash (stale hash from an "
-                                   "earlier deploy?)", &path);
-                return NGX_CONF_ERROR;
+                if (!optional && !entry->optional) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "dictionary \"%V\": the supplied "
+                                       "sha256 does not match the file's "
+                                       "actual hash (stale hash from an "
+                                       "earlier deploy?)", &path);
+                    return NGX_CONF_ERROR;
+                }
+
+                /* optional: `want` holds the computed truth — re-key
+                 * the entry so clients holding the REAL file still
+                 * negotiate */
+                ngx_memcpy(entry->sha256, want,
+                           NGX_HTTP_COMPRESSION_SHA256_LEN);
+                ngx_http_compression_hex_encode(entry->sha256,
+                                     NGX_HTTP_COMPRESSION_SHA256_LEN,
+                                     entry->sha256_hex.data);
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "optional dictionary \"%V\": stale "
+                                   "supplied sha256; the file's computed "
+                                   "hash wins", &path);
             }
 
             entry->verified = 1;
@@ -208,6 +272,13 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         fd = ngx_open_file(path.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
         if (fd == NGX_INVALID_FILE) {
+            if (optional) {
+                ngx_conf_log_error(NGX_LOG_WARN, cf, ngx_errno,
+                                   "skipping optional dictionary \"%V\": "
+                                   "open() failed; clients holding it "
+                                   "degrade to the base coding", &path);
+                return NGX_CONF_OK;
+            }
             ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
                                "open() dictionary \"%V\" failed", &path);
             return NGX_CONF_ERROR;
@@ -215,6 +286,12 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         if (ngx_fd_info(fd, &info) == NGX_FILE_ERROR || ngx_file_size(&info) == 0) {
             ngx_close_file(fd);
+            if (optional) {
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "skipping optional dictionary \"%V\": "
+                                   "empty or unreadable", &path);
+                return NGX_CONF_OK;
+            }
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "dictionary \"%V\" is empty or unreadable",
                                &path);
@@ -240,6 +317,13 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         ngx_close_file(fd);
 
         if (n != (ssize_t) entry->bytes.len) {
+            if (optional) {
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "skipping optional dictionary \"%V\": "
+                                   "read() returned %z of %uz bytes",
+                                   &path, n, entry->bytes.len);
+                return NGX_CONF_OK;
+            }
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "read() dictionary \"%V\": %z of %uz bytes",
                                &path, n, entry->bytes.len);
@@ -302,18 +386,36 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            NGX_HTTP_COMPRESSION_SHA256_LEN)
                 == 0)
             {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "dictionary \"%V\" has the same hash "
-                                   "as \"%V\"", &path, &d[i]->path);
-                return NGX_CONF_ERROR;
+                if (!optional && !d[i]->optional) {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "dictionary \"%V\" has the same "
+                                       "hash as \"%V\"", &path,
+                                       &d[i]->path);
+                    return NGX_CONF_ERROR;
+                }
+
+                /* optional: same hash = same bytes = interchangeable —
+                 * alias to the entry already in the store */
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "optional dictionary \"%V\" has the "
+                                   "same hash as \"%V\"; using the "
+                                   "existing entry", &path, &d[i]->path);
+                entry = d[i];
+                break;
             }
         }
 
-        dp = ngx_array_push(&cmcf->store);
-        if (dp == NULL) {
-            return NGX_CONF_ERROR;
+        if (i == cmcf->store.nelts) {
+            dp = ngx_array_push(&cmcf->store);
+            if (dp == NULL) {
+                return NGX_CONF_ERROR;
+            }
+            *dp = entry;
         }
-        *dp = entry;
+    }
+
+    if (optional) {
+        entry->optional = 1;    /* sticky across lines for this path */
     }
 
     /* ── append to this level's list (pointer into the store) ──────── */
@@ -329,6 +431,13 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     list = (*dicts)->elts;
     for (i = 0; i < (*dicts)->nelts; i++) {
         if (list[i] == entry) {
+            if (optional || entry->optional) {
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "optional dictionary \"%V\" already in "
+                                   "this list; skipping the duplicate",
+                                   &path);
+                return NGX_CONF_OK;
+            }
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "duplicate dictionary \"%V\" in this "
                                "\"compression_dict_file\" list", &path);

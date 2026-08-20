@@ -609,3 +609,30 @@ GET /t
 qq{Accept-Encoding: zstd, dcz;q=0\nAvailable-Dictionary: :$::b64:}
 --- response_headers
 Content-Encoding: zstd
+
+
+=== TEST 18: optional truth-wins — a stale supplied hash re-keys the entry
+# the deploy-race shape: the generated line's hash predates the file's
+# current bytes. With optional, the computed truth replaces it and a
+# client holding the REAL file still negotiates dcz; strict mode would
+# have refused to start.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config eval
+qq{compression_dict_file html/app.dict 0000000000000000000000000000000000000000000000000000000000000000 optional;\ncompression_dict_file html/app.dict;}
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "truth-wins fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: dcz
+--- error_log
+the file's computed hash wins

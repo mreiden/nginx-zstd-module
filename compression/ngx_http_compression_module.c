@@ -196,7 +196,7 @@ static ngx_command_t  ngx_http_compression_commands[] = {
       &ngx_http_html_default_types[0] },
 
     { ngx_string("compression_dict_file"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE12,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE123,
       ngx_http_compression_dict_file,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_compression_conf_t, dicts),
