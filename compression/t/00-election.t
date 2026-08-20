@@ -752,3 +752,74 @@ Content-Encoding: zstd
 Accept-Encoding: zstd
 --- response_body_like eval
 [qr/./, qr/ratio=\d+\.\d{3} in=1150 out=\d+/]
+
+
+
+=== TEST 25a: HTTP/1.0 requests defer — identity by default
+# the protocol floor (gzip_http_version parity, default 1.1): an
+# RFC 1945-era client is gzip-at-best, so the election never runs and
+# core gzip's own version rule applies (also 1.1 by default -> identity)
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "http/1.0 floor fixture body long enough to compress\n";
+    }
+--- request
+GET /t HTTP/1.0
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+=== TEST 25b: the floor is an operator choice — 1.0 compresses when lowered
+--- config
+    location /t {
+        compression on;
+        compression_http_version 1.0;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "http/1.0 floor fixture body long enough to compress\n";
+    }
+--- request
+GET /t HTTP/1.0
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 25c: the version skip is a DEFERRAL, not a veto
+# core gzip below still applies its own rules: with gzip_http_version
+# lowered, an HTTP/1.0 gzip client gets gzip from the core filter —
+# "as good as it gets" working end to end
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        gzip on;
+        gzip_min_length 1;
+        gzip_types text/plain;
+        gzip_http_version 1.0;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "http/1.0 floor fixture body long enough to compress\n";
+    }
+--- request
+GET /t HTTP/1.0
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+Content-Encoding: gzip
+--- no_error_log
+[error]

@@ -218,6 +218,7 @@ def main() -> int:
                 f"""        location /{c['loc']}/ {{
             compression on;
             compression_order {name};
+            compression_http_version 1.0;
             compression_min_length 1;
             compression_types application/octet-stream;
             gzip_vary on;

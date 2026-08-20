@@ -305,6 +305,12 @@ typedef struct {
     ngx_flag_t     enable;
     ssize_t        min_length;
     ssize_t        max_length;    /* NGX_CONF_UNSET = no ceiling */
+    ngx_uint_t     http_version;  /* minimum protocol version, default
+                                   * 1.1 (gzip_http_version parity):
+                                   * HTTP/1.0 requests DEFER to core
+                                   * gzip — RFC 1945-era clients are
+                                   * gzip-at-best, and 1.0 often means
+                                   * an ancient intermediary */
     ngx_hash_t     types;
     ngx_array_t   *types_keys;
     ngx_array_t   *order;          /* of ngx_http_compression_token_t */

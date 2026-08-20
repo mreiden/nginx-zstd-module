@@ -138,6 +138,12 @@ so static-only deployments never serve identity to dict-capable
 clients. Tradeoff: a dictionary miss pays runtime compression instead
 of the sidecar.
 
+`compression_http_version 1.0|1.1` (default `1.1`, gzip_http_version
+parity — Mark's call from the soak): HTTP/1.0 requests defer to core
+gzip untouched, since an RFC 1945-era client is gzip-at-best and 1.0
+frequently means an ancient intermediary. The skip is a deferral, not
+a veto — lowering `gzip_http_version` still serves those clients gzip.
+
 `compression_max_length <size>` is the parents' worker-protection
 ceiling: declared bodies above it skip compression, and a running
 input counter enforces the same limit on chunked/undeclared streams

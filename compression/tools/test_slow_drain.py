@@ -146,6 +146,7 @@ def main() -> int:
             alias {html}/;
             compression on;
             compression_order {name};
+            compression_http_version 1.0;
             compression_buffers 2;
             compression_min_length 1;
             compression_types application/octet-stream;

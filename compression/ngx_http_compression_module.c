@@ -108,6 +108,13 @@ static ngx_int_t ngx_http_compression_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
 
 
+static ngx_conf_enum_t  ngx_http_compression_http_version_enum[] = {
+    { ngx_string("1.0"), NGX_HTTP_VERSION_10 },
+    { ngx_string("1.1"), NGX_HTTP_VERSION_11 },
+    { ngx_null_string, 0 }
+};
+
+
 static ngx_command_t  ngx_http_compression_commands[] = {
 
     { ngx_string("compression"),
@@ -158,6 +165,13 @@ static ngx_command_t  ngx_http_compression_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
       NULL },
+
+    { ngx_string("compression_http_version"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_compression_conf_t, http_version),
+      &ngx_http_compression_http_version_enum },
 
     { ngx_string("compression_max_length"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
@@ -862,6 +876,7 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     conf->bufs.num = NGX_CONF_UNSET;
     conf->bypass = NGX_CONF_UNSET_PTR;
     conf->max_length = NGX_CONF_UNSET;
+    conf->http_version = NGX_CONF_UNSET_UINT;
 
     for (i = 0; i < NGX_HTTP_COMPRESSION_CONF_SLOTS; i++) {
         conf->levels[i] = NGX_CONF_UNSET;
@@ -884,6 +899,8 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
     ngx_conf_merge_value(conf->max_length, prev->max_length, NGX_CONF_UNSET);
+    ngx_conf_merge_uint_value(conf->http_version, prev->http_version,
+                              NGX_HTTP_VERSION_11);
 
     ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
     ngx_conf_merge_str_value(conf->bypass_vary, prev->bypass_vary, "");
@@ -1162,6 +1179,15 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
             && r->headers_out.status != NGX_HTTP_FORBIDDEN
             && r->headers_out.status != NGX_HTTP_NOT_FOUND)
         || r->header_only
+        /*
+         * Protocol floor (Mark's call, gzip_http_version parity,
+         * default 1.1): an RFC 1945-era client is gzip-at-best, and
+         * HTTP/1.0 frequently means an ancient intermediary. Skipping
+         * WITHOUT a latch is a deferral — core gzip below applies its
+         * own gzip_http_version rule, which is as good as it gets for
+         * those clients.
+         */
+        || r->http_version < conf->http_version
         || (r->headers_out.content_encoding != NULL
             && r->headers_out.content_encoding->value.len != 0)
         || ngx_http_test_content_type(r, &conf->types) == NULL)

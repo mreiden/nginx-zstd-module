@@ -118,6 +118,7 @@ def write_conf(root: pathlib.Path, port: int,
             alias {root}/html/;
             compression on;
             compression_order {coding};
+            compression_http_version 1.0;
             {bufs}
             compression_min_length 1;
             compression_types application/octet-stream;
