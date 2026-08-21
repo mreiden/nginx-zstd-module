@@ -565,6 +565,14 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
     b->last_buf = (r == r->main) ? 1 : 0;
     b->last_in_chain = 1;
 
+    /* gzip_static parity: a zero-length file served in a subrequest
+     * yields a buf with neither in_file nor last_buf — sync marks it
+     * so the output chain doesn't reject it as a zero-size buf. Only
+     * reachable when the frame-header probe is compiled out (no
+     * pread(2) / NGX_WIN32); with the probe active, sub-4-byte files
+     * never get this far. */
+    b->sync = (b->last_buf || b->in_file) ? 0 : 1;
+
     b->file->fd = of.fd;
     b->file->name = path;
     b->file->log = log;
