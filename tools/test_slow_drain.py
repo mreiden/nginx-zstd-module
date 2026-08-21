@@ -78,6 +78,18 @@ def parse_args() -> argparse.Namespace:
                    help="Front-end nginx port.")
     p.add_argument("--backend-port", type=int, default=18096,
                    help="Mock slow-headers upstream port.")
+    p.add_argument("--log-level", choices=("debug", "warn"),
+                   default="debug",
+                   help="Location error_log level. Witnesses are only "
+                        "asserted at debug. Use warn under sanitizer "
+                        "builds: UBSAN (-fno-sanitize-recover) fatally "
+                        "traps nginx core's own debug logging — every "
+                        "\"%%V?%%V\" line passes r->args={0,NULL} into "
+                        "ngx_sprintf_str's nonnull argument on "
+                        "query-less URIs (ngx_string.c:586) — so a "
+                        "sanitized nginx cannot log at debug at all. "
+                        "The forced paths still run; only their log "
+                        "proof is skipped.")
     return p.parse_args()
 
 
@@ -245,9 +257,17 @@ def main() -> int:
         html.mkdir(parents=True)
         (html / "big").write_bytes(drain_body)
 
+        # The location error_log level is a flag (see --log-level):
+        # sanitizer builds fatally trap nginx core's own debug logging
+        # (the "%V?%V" lines pass NULL for empty args — latent in core,
+        # first hit by this tool because nothing else in CI ran a
+        # sanitized binary at debug level), so the ASAN job runs at
+        # warn and skips the witness assertions. The forced paths run
+        # regardless of log level; the roundtrip oracles keep gating.
+        lvl = args.log_level
         conf = root / "nginx.conf"
         conf.write_text(f"""worker_processes 1;
-{load}error_log {root}/logs/error.log debug;
+{load}error_log {root}/logs/error.log warn;
 pid {root}/nginx.pid;
 events {{ worker_connections 64; }}
 http {{
@@ -260,10 +280,12 @@ http {{
     server {{
         listen 127.0.0.1:{args.port} sndbuf=16384;
         location /drain/ {{
+            error_log {root}/logs/error.log {lvl};
             alias {html}/;
             zstd_buffers 2 8k;
         }}
         location /px {{
+            error_log {root}/logs/error.log {lvl};
             proxy_pass http://127.0.0.1:{args.backend_port};
             proxy_buffering off;
         }}
@@ -336,6 +358,10 @@ http {{
 
             elog = (root / "logs" / "error.log").read_text(
                 "utf-8", "replace")
+            if args.log_level != "debug":
+                print("  witnesses skipped (--log-level warn: sanitizer "
+                      "builds cannot log at debug — paths still forced, "
+                      "roundtrips still gate)")
             # The upstream FLUSH special is unconditional per response,
             # so every successful proxied request owes one content-less
             # completion — a lower bound, not an exact pin, because
@@ -343,9 +369,12 @@ http {{
             # mid-relay (and those only log content-less when they too
             # meet an empty encoder). The nomem count depends on drain
             # scheduling, so only its existence is pinned.
-            for witness, path_name, floor in (
+            witness_floors = ()
+            if args.log_level == "debug":
+                witness_floors = (
                     (NOMEM_WITNESS, "buffer-cap/nomem", 1),
-                    (FLUSH_WITNESS, "content-less flush", PROXY_REPEAT)):
+                    (FLUSH_WITNESS, "content-less flush", PROXY_REPEAT))
+            for witness, path_name, floor in witness_floors:
                 n = elog.count(witness)
                 if n < floor:
                     failures.append(
@@ -372,8 +401,10 @@ http {{
                     if "[debug]" not in ln)[-3000:] + "\n")
                 return 1
 
-            print("OK: forced backpressure and data-less flushes both "
-                  "witnessed, streams byte-exact")
+            proof = ("witnessed" if args.log_level == "debug"
+                     else "roundtripped (witnesses skipped)")
+            print(f"OK: forced backpressure and data-less flushes both "
+                  f"{proof}, streams byte-exact")
             return 0
         finally:
             proc.terminate()

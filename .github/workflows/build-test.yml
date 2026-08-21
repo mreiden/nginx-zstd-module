@@ -1465,8 +1465,16 @@ jobs:
           # Backpressure pause/resume under sanitizers: the nomem and
           # empty-flush paths share lifetime history with the
           # truncation class, so drive them deliberately here too.
+          # --log-level warn: a UBSAN nginx (-fno-sanitize-recover)
+          # fatally traps core's own debug logging (the "%V?%V" lines
+          # pass NULL for empty r->args into ngx_sprintf_str's nonnull
+          # arg), so the sanitized binary cannot log at debug at all.
+          # The tool still forces both paths and byte-checks the
+          # streams; the log-witness assertions run in the tests and
+          # coverage jobs, whose binaries are not sanitized.
           python3 tools/test_slow_drain.py \
-            --nginx-binary "$TEST_NGINX_BINARY" --port 18110 --backend-port 18111
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18110 --backend-port 18111 \
+            --log-level warn
           # Matrix under ASAN/UBSAN at repeat=1 (252 cells) — the
           # truncation/zero-size-buf/livelock class has UB+lifetime
           # history, so exercise the full circumstance matrix with
