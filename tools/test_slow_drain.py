@@ -185,11 +185,16 @@ def http_get(port: int, path: str, slow: bool,
     s.close()
     head, _, body = raw.partition(b"\r\n\r\n")
     headers = head.decode("latin1", "replace")
+    status = headers.splitlines()[0] if headers else "<no response>"
+    if " 200 " not in f"{status} ":
+        raise RuntimeError(f"{path}: expected 200, got {status!r} "
+                           f"({len(body)}B body)")
     m = re.search(r"(?im)^content-encoding:\s*(\S+)", headers)
     got = m.group(1) if m else None
     if got != "zstd":
         raise RuntimeError(f"{path}: Content-Encoding {got!r}, "
-                           f"wanted 'zstd'")
+                           f"wanted 'zstd' (status {status!r}, "
+                           f"{len(body)}B body)")
     return body
 
 
@@ -266,12 +271,30 @@ http {{
 }}
 """, encoding="utf-8")
 
+        # nginx's own stdout/stderr to a file, not a PIPE: nothing
+        # drains a pipe here (deadlock risk on a chatty ASan abort),
+        # and on failure the tail is the diagnosis.
+        nlog_path = root / "logs" / "nginx-stdout.log"
+        nlog = open(nlog_path, "w", encoding="utf-8")
         proc = subprocess.Popen(
             [str(nginx), "-p", str(root), "-c", str(conf),
              "-g", "daemon off; master_process off;"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            stdout=nlog, stderr=subprocess.STDOUT, text=True)
+
+        def alive_or_die(when: str) -> None:
+            """Fail with nginx's captured output if the process exited —
+            a bind conflict or sanitizer abort otherwise masquerades as
+            responses from a stale listener on the same port."""
+            if proc.poll() is not None:
+                nlog.flush()
+                tail = nlog_path.read_text("utf-8", "replace")[-2000:]
+                raise RuntimeError(
+                    f"nginx exited (rc={proc.returncode}) {when}; "
+                    f"output tail:\n{tail}")
+
         try:
             wait_port(args.port)
+            alive_or_die("during startup")
             failures: list[str] = []
 
             # 1. slow-drain: force the buffer cap and the writer-driven
@@ -291,6 +314,8 @@ http {{
                           f"in {took:.1f}s, decoded byte-exact")
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"slow-drain: {exc}")
+
+            alive_or_die("after the slow-drain scenario")
 
             # 2. proxied data-less flush: every response starts with the
             #    upstream FLUSH special hitting an empty encoder
@@ -335,6 +360,16 @@ http {{
                 sys.stderr.write(f"slow-drain FAILED ({len(failures)}):\n")
                 for f in failures:
                     sys.stderr.write(f"  - {f}\n")
+                # CI runs are not reproducible interactively: ship the
+                # evidence with the verdict.
+                nlog.flush()
+                sys.stderr.write("--- nginx stdout/stderr tail:\n")
+                sys.stderr.write(
+                    nlog_path.read_text("utf-8", "replace")[-2000:] + "\n")
+                sys.stderr.write("--- error.log tail (non-debug):\n")
+                sys.stderr.write("\n".join(
+                    ln for ln in elog.splitlines()
+                    if "[debug]" not in ln)[-3000:] + "\n")
                 return 1
 
             print("OK: forced backpressure and data-less flushes both "
@@ -347,6 +382,7 @@ http {{
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=30)
+            nlog.close()
             backend.stop()
 
 
