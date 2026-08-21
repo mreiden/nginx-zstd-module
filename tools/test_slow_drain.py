@@ -41,6 +41,7 @@ CLI for decoding.
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import re
 import socket
@@ -64,6 +65,7 @@ FLUSH_WITNESS = "content-less flush completed"
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse the CLI arguments (binary, module path, ports, zstd CLI)."""
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--nginx-binary", required=True,
                    help="nginx (or angie) binary to launch.")
@@ -81,6 +83,7 @@ def parse_args() -> argparse.Namespace:
 
 def detect_module(explicit: str | None, nginx: pathlib.Path,
                   name: str) -> pathlib.Path | None:
+    """Resolve a dynamic-module .so: explicit path, or beside the binary."""
     if explicit:
         return pathlib.Path(explicit)
     sib = nginx.parent / name
@@ -88,6 +91,7 @@ def detect_module(explicit: str | None, nginx: pathlib.Path,
 
 
 def fixture_bytes(n: int) -> bytes:
+    """Deterministic pseudorandom (incompressible) fixture of n bytes."""
     buf = bytearray(n)
     x = (n * 2654435761) & 0xFFFFFFFF
     for i in range(n):
@@ -97,6 +101,7 @@ def fixture_bytes(n: int) -> bytes:
 
 
 def wait_port(port: int, timeout: float = 10.0) -> None:
+    """Block until something accepts connections on 127.0.0.1:port."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -113,6 +118,7 @@ class SlowHeaderBackend(threading.Thread):
     reaches the filter before a single body byte does."""
 
     def __init__(self, port: int, body: bytes) -> None:
+        """Bind the listener up front so wait-for-port has a target."""
         super().__init__(daemon=True)
         self.port = port
         self.body = body
@@ -122,6 +128,7 @@ class SlowHeaderBackend(threading.Thread):
         self.srv.listen(8)
 
     def run(self) -> None:
+        """Accept loop: headers immediately, body in two paused halves."""
         while True:
             try:
                 conn, _ = self.srv.accept()
@@ -149,11 +156,14 @@ class SlowHeaderBackend(threading.Thread):
                 conn.close()
 
     def stop(self) -> None:
+        """Close the listener; the accept loop exits on the next OSError."""
         self.srv.close()
 
 
 def http_get(port: int, path: str, slow: bool,
              timeout: float = 120.0) -> bytes:
+    """GET path expecting Content-Encoding: zstd; slow=True throttles
+    reads through a small SO_RCVBUF to create real backpressure."""
     s = socket.create_connection(("127.0.0.1", port), timeout)
     s.settimeout(timeout)
     if slow:
@@ -184,6 +194,7 @@ def http_get(port: int, path: str, slow: bool,
 
 
 def main() -> int:
+    """Launch nginx + mock backend, run both scenarios, check witnesses."""
     args = parse_args()
     nginx = pathlib.Path(args.nginx_binary)
     if not nginx.exists():
@@ -201,6 +212,7 @@ def main() -> int:
     load = f"load_module {filter_so};\n" if filter_so else ""
 
     def decode(blob: bytes) -> bytes:
+        """Decompress with the zstd CLI; a nonzero exit means truncation."""
         r = subprocess.run([args.zstd_bin, "-d", "-q", "-c"], input=blob,
                            capture_output=True)
         if r.returncode != 0:
@@ -214,7 +226,14 @@ def main() -> int:
     backend = SlowHeaderBackend(args.backend_port, proxy_body)
     backend.start()
 
+    # mkdtemp gives 0700: when nginx runs as root (the ASAN job) the
+    # workers drop privileges and cannot traverse into the fixture
+    # tree — /drain/big then serves uncompressed instead of erroring.
+    # Same lines the sibling tools carry, dropped once in the port and
+    # caught by exactly that job.
+    os.umask(0o022)
     with tempfile.TemporaryDirectory(prefix="zstd-drain-") as td:
+        os.chmod(td, 0o755)
         root = pathlib.Path(td)
         (root / "logs").mkdir()
         html = root / "html" / "d"
@@ -292,15 +311,23 @@ http {{
 
             elog = (root / "logs" / "error.log").read_text(
                 "utf-8", "replace")
-            for witness, path_name in (
-                    (NOMEM_WITNESS, "buffer-cap/nomem"),
-                    (FLUSH_WITNESS, "content-less flush")):
+            # The upstream FLUSH special is unconditional per response,
+            # so every successful proxied request owes one content-less
+            # completion — a lower bound, not an exact pin, because
+            # nginx may legally emit further data-less specials
+            # mid-relay (and those only log content-less when they too
+            # meet an empty encoder). The nomem count depends on drain
+            # scheduling, so only its existence is pinned.
+            for witness, path_name, floor in (
+                    (NOMEM_WITNESS, "buffer-cap/nomem", 1),
+                    (FLUSH_WITNESS, "content-less flush", PROXY_REPEAT)):
                 n = elog.count(witness)
-                if n == 0:
+                if n < floor:
                     failures.append(
-                        f"witness missing: {witness!r} never logged — "
-                        f"the {path_name} path did not run (geometry "
-                        f"drift, or the filter's debug lines changed)")
+                        f"witness short: {witness!r} x{n}, expected at "
+                        f"least x{floor} — the {path_name} path did not "
+                        f"run as forced (geometry drift, or the "
+                        f"filter's debug lines changed)")
                 else:
                     print(f"  witness: {witness!r} x{n}")
 
