@@ -108,11 +108,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt tuning lives in a conf file rather than per-invocation -o
-          # flags, so apt-get calls from nested scripts inherit it too.
-          # builder02 shares the box across jobs and never talks to the
-          # Azure mirror: keep timeouts loose enough that a loaded runner
-          # idling a connection isn't a step failure.
+          # builder02 apt profile: loose timeouts — the box runs jobs
+          # concurrently and never talks to the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -309,11 +306,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt tuning lives in a conf file rather than per-invocation -o
-          # flags, so apt-get calls from nested scripts inherit it too.
-          # builder02 shares the box across jobs and never talks to the
-          # Azure mirror: keep timeouts loose enough that a loaded runner
-          # idling a connection isn't a step failure.
+          # builder02 apt profile: loose timeouts — the box runs jobs
+          # concurrently and never talks to the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -481,11 +475,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          # apt tuning lives in a conf file rather than per-invocation -o
-          # flags, so apt-get calls from nested scripts inherit it too.
-          # builder02 shares the box across jobs and never talks to the
-          # Azure mirror: keep timeouts loose enough that a loaded runner
-          # idling a connection isn't a step failure.
+          # builder02 apt profile: loose timeouts — the box runs jobs
+          # concurrently and never talks to the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -650,11 +641,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt tuning lives in a conf file rather than per-invocation -o
-          # flags, so apt-get calls from nested scripts inherit it too.
-          # builder02 shares the box across jobs and never talks to the
-          # Azure mirror: keep timeouts loose enough that a loaded runner
-          # idling a connection isn't a step failure.
+          # builder02 apt profile: loose timeouts — the box runs jobs
+          # concurrently and never talks to the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -907,11 +895,9 @@ jobs:
         timeout-minutes: 5
         run: |
           # ubuntu-latest resolves apt through azure.archive.ubuntu.com,
-          # whose outage shape is ~2 minutes of default Acquire timeout per
-          # index file before the runner's mirror list falls back (the #117
-          # cancellations). Short idle timeouts and a single retry make
-          # that failover cheap; a conf file rather than -o flags also
-          # covers apt-get calls from nested scripts.
+          # whose outage shape is ~2 minutes of default Acquire timeout
+          # per index file before the runner's mirror list falls back
+          # (the #117 cancellations); short timeouts make that cheap.
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "1";' \
@@ -1066,11 +1052,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt tuning lives in a conf file rather than per-invocation -o
-          # flags, so apt-get calls from nested scripts inherit it too.
-          # builder02 shares the box across jobs and never talks to the
-          # Azure mirror: keep timeouts loose enough that a loaded runner
-          # idling a connection isn't a step failure.
+          # builder02 apt profile: loose timeouts — the box runs jobs
+          # concurrently and never talks to the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1179,11 +1162,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt tuning lives in a conf file rather than per-invocation -o
-          # flags, so apt-get calls from nested scripts inherit it too.
-          # builder02 shares the box across jobs and never talks to the
-          # Azure mirror: keep timeouts loose enough that a loaded runner
-          # idling a connection isn't a step failure.
+          # builder02 apt profile: loose timeouts — the box runs jobs
+          # concurrently and never talks to the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1446,11 +1426,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt tuning lives in a conf file rather than per-invocation -o
-          # flags, so apt-get calls from nested scripts inherit it too.
-          # builder02 shares the box across jobs and never talks to the
-          # Azure mirror: keep timeouts loose enough that a loaded runner
-          # idling a connection isn't a step failure.
+          # builder02 apt profile: loose timeouts — the box runs jobs
+          # concurrently and never talks to the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1632,11 +1609,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt tuning lives in a conf file rather than per-invocation -o
-          # flags, so apt-get calls from nested scripts inherit it too.
-          # builder02 shares the box across jobs and never talks to the
-          # Azure mirror: keep timeouts loose enough that a loaded runner
-          # idling a connection isn't a step failure.
+          # builder02 apt profile: loose timeouts — the box runs jobs
+          # concurrently and never talks to the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
