@@ -1867,6 +1867,13 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                     if (ob == NULL) {
                         return NGX_ERROR;
                     }
+
+                    ngx_log_debug1(NGX_LOG_DEBUG_HTTP,
+                                   r->connection->log, 0,
+                                   "compression: content-less %s shipped "
+                                   "as special buf",
+                                   op == NGX_HTTP_COMPRESSION_OP_FINISH
+                                       ? "finish" : "flush");
                 }
 
                 ob->flush = ctx->done ? 0 : 1;

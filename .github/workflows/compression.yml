@@ -102,7 +102,7 @@ jobs:
           python3 compression/tools/test_flush_paths.py \
             --nginx-binary "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx"
 
-      - name: Slow-drain backpressure (genuine recycling pause)
+      - name: Slow-drain backpressure + data-less flush (genuine recycling pause)
         run: |
           python3 compression/tools/test_slow_drain.py \
             --nginx-binary "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx"

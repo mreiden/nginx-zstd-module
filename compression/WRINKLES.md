@@ -657,6 +657,46 @@ paths unchanged, the typo-stays-fatal rule, and truth-wins
 END-TO-END — a wrong supplied hash plus optional re-keys, and a
 client presenting the REAL file's hash gets dcz.
 
+### 31. The data-less flush pin, and what porting it upstream found
+
+The standalone repo ported this branch's test_slow_drain.py to fix a
+coverage flake (its PR #125), and the port journey paid back in both
+directions. Ported back here:
+
+- **Determinism for the content-less flush**: nginx's non-buffered
+  upstream path sends a data-less NGX_HTTP_FLUSH special before
+  relaying any body (ngx_http_upstream_send_response,
+  ngx_http_upstream.c:3657). A mock backend that sends headers alone
+  and body strictly later guarantees the special reaches an EMPTY
+  encoder — turning the empty-flush special-buf branch (the
+  zero-size-temp-buf alert avoidance) from unwitnessed incidental
+  coverage into a pinned, per-response assertion. The branch gained
+  its witness line ("content-less flush shipped as special buf").
+- **A live per-backend asymmetry**: only zstd's completion is
+  content-less — a fresh zstd encoder flushes to zero bytes, while
+  brotli's first flush emits its stream-header bits, so brotli's
+  completion carries content and rides a data buf. The witness floor
+  is therefore the ZSTD response count; brotli runs the same scenario
+  with the roundtrip oracle only. (The phase-0 "done is defined
+  per-op, per-backend" contract lesson, observable in a log line.)
+- **Harness hardening from the flake hunt**: status-line asserted
+  before Content-Encoding, nginx stdout/stderr captured to a file
+  (never a PIPE nothing drains), an alive_or_die() liveness check so
+  a bind conflict or sanitizer abort can't masquerade as responses
+  from a stale listener, and failures ship the nginx-output and
+  error.log tails with the verdict.
+- **--log-level warn for sanitizer builds**: getting the twin tool
+  through the standalone repo's ASAN job uncovered that a UBSAN
+  nginx (-fno-sanitize-recover) fatally traps nginx core's own debug
+  logging — %V on an empty {0, NULL} string passes NULL into
+  ngx_sprintf_str's nonnull memcpy on every query-less request.
+  Reported upstream with a fix (nginx/nginx#1671, PR #1672; four
+  more core UB instances surfaced by running nginx-tests under UBSAN
+  once patched). Until the fix reaches the built nginx, any future
+  sanitizer job here must run this tool with --log-level warn —
+  paths still forced, roundtrips still gate, witness assertions
+  skipped. Retire the flag when the upstream fix lands.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep
