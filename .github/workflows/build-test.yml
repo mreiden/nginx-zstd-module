@@ -108,8 +108,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 install -y \
+          # apt tuning lives in a conf file rather than per-invocation -o
+          # flags, so apt-get calls from nested scripts inherit it too.
+          # builder02 shares the box across jobs and never talks to the
+          # Azure mirror: keep timeouts loose enough that a loaded runner
+          # idling a connection isn't a step failure.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y \
             build-essential \
             libpcre2-dev \
             zlib1g-dev \
@@ -298,8 +309,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 install -y \
+          # apt tuning lives in a conf file rather than per-invocation -o
+          # flags, so apt-get calls from nested scripts inherit it too.
+          # builder02 shares the box across jobs and never talks to the
+          # Azure mirror: keep timeouts loose enough that a loaded runner
+          # idling a connection isn't a step failure.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y \
             build-essential \
             pkg-config \
             libzstd-dev \
@@ -459,8 +481,19 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 install -y build-essential pkg-config \
+          # apt tuning lives in a conf file rather than per-invocation -o
+          # flags, so apt-get calls from nested scripts inherit it too.
+          # builder02 shares the box across jobs and never talks to the
+          # Azure mirror: keep timeouts loose enough that a loaded runner
+          # idling a connection isn't a step failure.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config \
             libpcre2-dev zlib1g-dev wget cmake python3 \
             python3-requests zstd
 
@@ -617,8 +650,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 install -y build-essential pkg-config libzstd-dev \
+          # apt tuning lives in a conf file rather than per-invocation -o
+          # flags, so apt-get calls from nested scripts inherit it too.
+          # builder02 shares the box across jobs and never talks to the
+          # Azure mirror: keep timeouts loose enough that a loaded runner
+          # idling a connection isn't a step failure.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libzstd-dev \
             libpcre2-dev zlib1g-dev wget binutils
 
       - name: Cache nginx source tarball
@@ -856,9 +900,26 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
+        # A slow-rather-than-dead mirror can still crawl past every
+        # Acquire timeout; cap the step so a stall fails HERE, named,
+        # with the log intact — instead of the 15-minute job cap
+        # swallowing it (the #117 failure shape).
+        timeout-minutes: 5
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 install -y build-essential libzstd-dev \
+          # ubuntu-latest resolves apt through azure.archive.ubuntu.com,
+          # whose outage shape is ~2 minutes of default Acquire timeout per
+          # index file before the runner's mirror list falls back (the #117
+          # cancellations). Short idle timeouts and a single retry make
+          # that failover cheap; a conf file rather than -o flags also
+          # covers apt-get calls from nested scripts.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "1";' \
+            'Acquire::http::Timeout "10";' \
+            'Acquire::https::Timeout "10";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y build-essential libzstd-dev \
             libpcre2-dev zlib1g-dev wget curl
 
       - name: Cache nginx source tarball
@@ -1005,8 +1066,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 install -y build-essential pkg-config libzstd-dev \
+          # apt tuning lives in a conf file rather than per-invocation -o
+          # flags, so apt-get calls from nested scripts inherit it too.
+          # builder02 shares the box across jobs and never talks to the
+          # Azure mirror: keep timeouts loose enough that a loaded runner
+          # idling a connection isn't a step failure.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libzstd-dev \
             libpcre2-dev zlib1g-dev wget
 
       - name: Cache nginx source tarball
@@ -1107,8 +1179,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 install -y \
+          # apt tuning lives in a conf file rather than per-invocation -o
+          # flags, so apt-get calls from nested scripts inherit it too.
+          # builder02 shares the box across jobs and never talks to the
+          # Azure mirror: keep timeouts loose enough that a loaded runner
+          # idling a connection isn't a step failure.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y \
             libperl-dev \
             cpanminus \
             libzstd1 \
@@ -1371,8 +1454,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 install -y python3 python3-requests zstd libzstd1 \
+          # apt tuning lives in a conf file rather than per-invocation -o
+          # flags, so apt-get calls from nested scripts inherit it too.
+          # builder02 shares the box across jobs and never talks to the
+          # Azure mirror: keep timeouts loose enough that a loaded runner
+          # idling a connection isn't a step failure.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-requests zstd libzstd1 \
             libperl-dev cpanminus
 
       - name: Download ASAN nginx binary
@@ -1559,8 +1653,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 install -y build-essential pkg-config libzstd-dev \
+          # apt tuning lives in a conf file rather than per-invocation -o
+          # flags, so apt-get calls from nested scripts inherit it too.
+          # builder02 shares the box across jobs and never talks to the
+          # Azure mirror: keep timeouts loose enough that a loaded runner
+          # idling a connection isn't a step failure.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libzstd-dev \
             libpcre2-dev zlib1g-dev libssl-dev libperl-dev cpanminus \
             python3 python3-requests zstd lcov wget
 
