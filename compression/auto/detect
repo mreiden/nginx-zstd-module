@@ -91,7 +91,15 @@ if [ -n "$ZSTD_INC" -o -n "$ZSTD_LIB" ]; then
     if [ $ngx_found = no ] && [ "$NGX_CC_NAME" != "msvc" ]; then
         # dynamic retry (gcc-spelled flags; cl drops -L/-l with D9002)
         ngx_feature="ZStandard dynamic library in $ZSTD_INC and $ZSTD_LIB"
-        ngx_compression_zstd_L="-L$ZSTD_LIB -lzstd -Wl,-rpath,$ZSTD_LIB"
+        if [ "${NGX_PLATFORM:-}" = win32 ]; then
+            # MinGW emits PE/COFF: no ELF runtime search path to encode,
+            # and -rpath is rejected or ignored by binutils depending on
+            # version (parent's 211844a). The DLL must be beside
+            # nginx.exe or on the DLL search path at runtime.
+            ngx_compression_zstd_L="-L$ZSTD_LIB -lzstd"
+        else
+            ngx_compression_zstd_L="-L$ZSTD_LIB -lzstd -Wl,-rpath,$ZSTD_LIB"
+        fi
 
         SAVED_CC_TEST_FLAGS=$CC_TEST_FLAGS
         CC_TEST_FLAGS="$ngx_compression_zstd_I $CC_TEST_FLAGS"
@@ -215,7 +223,12 @@ if [ -n "$BROTLI_INC" -o -n "$BROTLI_LIB" ]; then
 
     if [ $ngx_found = no ] && [ "$NGX_CC_NAME" != "msvc" ]; then
         ngx_feature="Brotli dynamic libraries in $BROTLI_INC and $BROTLI_LIB"
-        ngx_compression_brotli_L="-L$BROTLI_LIB -lbrotlienc -lbrotlicommon -Wl,-rpath,$BROTLI_LIB"
+        if [ "${NGX_PLATFORM:-}" = win32 ]; then
+            # same MinGW PE/COFF rule as the zstd branch above
+            ngx_compression_brotli_L="-L$BROTLI_LIB -lbrotlienc -lbrotlicommon"
+        else
+            ngx_compression_brotli_L="-L$BROTLI_LIB -lbrotlienc -lbrotlicommon -Wl,-rpath,$BROTLI_LIB"
+        fi
 
         SAVED_CC_TEST_FLAGS=$CC_TEST_FLAGS
         CC_TEST_FLAGS="$ngx_compression_brotli_I $CC_TEST_FLAGS"

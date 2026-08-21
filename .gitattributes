@@ -7,6 +7,7 @@
 # has smudged the checkout to CRLF.
 config text eol=lf
 auto/* text eol=lf
+**/auto/* text eol=lf
 */config text eol=lf
 *.sh text eol=lf
 *.t text eol=lf
