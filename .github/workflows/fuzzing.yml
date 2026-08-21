@@ -35,8 +35,19 @@ jobs:
 
       - name: Install clang + libFuzzer
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 install -y clang
+          # apt tuning lives in a conf file rather than per-invocation -o
+          # flags, so apt-get calls from nested scripts inherit it too.
+          # builder02 shares the box across jobs and never talks to the
+          # Azure mirror: keep timeouts loose enough that a loaded runner
+          # idling a connection isn't a step failure.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y clang
 
       - name: Build fuzz target
         run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz/fuzz_accept_encoding"

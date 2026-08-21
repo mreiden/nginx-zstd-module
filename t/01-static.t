@@ -28,19 +28,21 @@ run_tests();
 # COVERAGE NOTES on gaps found by the git-history CI audit
 # (kept above __DATA__ so they are not parsed into any test block):
 #
-# Gap 2 — f7e2ef3 ("clear Accept-Ranges in static module"):
-# deliberately NOT covered by a black-box test here. The static
-# handler serves a local file and never sets r->allow_ranges (in this
-# nginx, only the upstream/proxy path sets it — see
-# ngx_http_upstream.c, and ngx_http_range_filter_module.c bails unless
-# r->allow_ranges). ngx_http_clear_accept_ranges() in the static
-# module is therefore purely defensive: no request reachable through
-# zstd_static alone makes the pre-fix and fixed builds differ
-# (empirically verified — identical 200, no Accept-Ranges, no
-# Content-Range, on both a pre-f7e2ef3 and a fixed .so). A Perl test
-# asserting !Accept-Ranges would PASS on the buggy build too, i.e. be
-# blind. Per the project's fail-first discipline we do not add a test
-# that cannot fail on the unfixed code.
+# Gap 2 — f7e2ef3 ("clear Accept-Ranges in static module"), since
+# REVERSED: the handler now opts IN via r->allow_ranges = 1, covered
+# fail-first by TESTS 36–37. The history, for the record: f7e2ef3's
+# clear was a no-op (the handler never set r->allow_ranges, and
+# ngx_http_range_filter_module.c bails without it — empirically
+# verified at the time: identical responses on pre-fix and fixed
+# builds), and its rationale misread the RFC it cited. RFC 9110 §14.2
+# has ranges address the SELECTED REPRESENTATION — under
+# Content-Encoding: zstd, the .zst bytes — which is not an
+# "undecipherable fragment" hazard but exactly the coherent,
+# resumable-download semantics gzip_static has always provided by
+# setting r->allow_ranges = 1 (strong validator, byte-identical
+# representation on disk). The filter module's clear remains correct
+# for the opposite reason: a stream generated on the fly has nothing
+# stable to seek into.
 #
 # Gap 3 — HTTP/2 transport axis (8281baa bug-B class):
 # the build enables --with-http_v2_module but nothing tests the h2
@@ -897,3 +899,57 @@ Content-Encoding: zstd
 --- error_code: 200
 --- no_error_log
 decompression window
+
+
+
+=== TEST 36: a served sidecar advertises Accept-Ranges: bytes
+# gzip_static parity (see gzip_static's r->allow_ranges = 1): the
+# representation is the .zst bytes and the validator is strong, so
+# static-side ranges are coherent — resumable downloads included.
+# Fails on builds without the opt-in: no allow_ranges, no header.
+--- config
+    location /test {
+        zstd_static on;
+        root ../../t/suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+Content-Encoding: zstd
+Accept-Ranges: bytes
+--- no_error_log
+[error]
+
+
+
+=== TEST 37: byte ranges slice the sidecar's bytes (206 + Content-Range)
+# RFC 9110 §14.2: ranges address the SELECTED REPRESENTATION — under
+# Content-Encoding: zstd that is the .zst bytes themselves, which a
+# client can fetch, resume and concatenate before decompressing. The
+# fixture is TEST 35's crafted 12-byte frame (magic + 1 KB window +
+# raw "hi\n" block), so the slice is byte-pinned: the first four bytes
+# are the frame magic. Unfixed code ignores Range and answers 200.
+--- config
+    location /rg/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> rg/tiny.js\ntiny origin body\n>>> rg/tiny.js.zst\n"
+. pack("C*", 0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x19, 0x00, 0x00)
+. "hi\n"
+--- request
+GET /rg/tiny.js
+--- more_headers
+Accept-Encoding: zstd
+Range: bytes=0-3
+--- error_code: 206
+--- response_headers
+Content-Encoding: zstd
+Content-Range: bytes 0-3/12
+--- response_body eval
+pack("C*", 0x28, 0xB5, 0x2F, 0xFD)
+--- no_error_log
+[error]
