@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Deterministic drivers for the two timing-dependent filter paths.
+
+Ported from the unified-module branch (#117), where the same tool
+pins the recycling pause path. The trigger was the coverage floor:
+the gcov job's 82% gate assumes two code paths that only ran when CI
+load happened to produce the right races, and one run (PR #124,
+nginx pin bump) lost every race at once — 8 lines vanished, 82.6%
+fell to 81.9%, and an unrelated two-line env change failed the
+floor. Comparing that run's lcov tracefile against the previous
+green run identified exactly the lines; this tool makes both paths
+run on purpose so the floor measures tests, not scheduler luck.
+
+The two paths, and how they are forced:
+
+1. **The nomem entry block** (busy-buffer recovery at the top of the
+   body filter): needs ``zstd_buffers`` exhausted while the client
+   cannot drain, then a writer-driven re-invocation. A local socket
+   drains instantly, which is why no Test::Nginx block can reach it.
+   Forced here with ``zstd_buffers 2 8k``, a ~1 MB incompressible
+   body, ``sndbuf=16384`` on the listener, a small client-side
+   SO_RCVBUF, and deliberately slow reads. Witness:
+   "zstd get_buf: no free buffer, nomem set" — plus a byte-exact
+   decode proving the pause/resume seams preserved the stream.
+
+2. **The content-less flush completion** (empty out_buf, flush
+   pending, encoder fully drained — the #116-era livelock guard):
+   needs a flush to reach the filter while the encoder holds
+   nothing. nginx's non-buffered upstream path sends exactly that —
+   ``ngx_http_upstream_send_response`` emits a data-less
+   NGX_HTTP_FLUSH special before relaying any body — but only a
+   backend that sends its headers alone and its body strictly later
+   makes the special arrive with an empty encoder. The mock backend
+   here sleeps between headers and body to guarantee it. Witness:
+   "content-less flush completed", once per proxied response.
+
+Requires an nginx binary built ``--with-debug`` (the witnesses are
+ngx_log_debug lines) with the zstd filter module, plus the ``zstd``
+CLI for decoding.
+"""
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+DRAIN_SIZE = 1_000_000
+READ_CHUNK = 16384
+READ_DELAY = 0.02
+
+PROXY_PART = 40_000
+PROXY_REPEAT = 8
+HEADER_BODY_GAP = 0.3
+INTER_PART_GAP = 0.15
+
+NOMEM_WITNESS = "no free buffer, nomem set"
+FLUSH_WITNESS = "content-less flush completed"
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--nginx-binary", required=True,
+                   help="nginx (or angie) binary to launch.")
+    p.add_argument("--filter-module",
+                   help="Path to ngx_http_zstd_filter_module.so "
+                        "(auto-detected next to the binary if omitted).")
+    p.add_argument("--zstd-bin", default="zstd",
+                   help="zstd CLI used for decompression.")
+    p.add_argument("--port", type=int, default=18095,
+                   help="Front-end nginx port.")
+    p.add_argument("--backend-port", type=int, default=18096,
+                   help="Mock slow-headers upstream port.")
+    return p.parse_args()
+
+
+def detect_module(explicit: str | None, nginx: pathlib.Path,
+                  name: str) -> pathlib.Path | None:
+    if explicit:
+        return pathlib.Path(explicit)
+    sib = nginx.parent / name
+    return sib if sib.exists() else None
+
+
+def fixture_bytes(n: int) -> bytes:
+    buf = bytearray(n)
+    x = (n * 2654435761) & 0xFFFFFFFF
+    for i in range(n):
+        x = (x * 1103515245 + 12345) & 0xFFFFFFFF
+        buf[i] = (x >> 16) & 0xFF
+    return bytes(buf)
+
+
+def wait_port(port: int, timeout: float = 10.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), 0.5):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise RuntimeError(f"nothing listening on 127.0.0.1:{port}")
+
+
+class SlowHeaderBackend(threading.Thread):
+    """Sends 200 + headers immediately, then the body only after a
+    pause — so nginx's non-buffered data-less FLUSH special always
+    reaches the filter before a single body byte does."""
+
+    def __init__(self, port: int, body: bytes) -> None:
+        super().__init__(daemon=True)
+        self.port = port
+        self.body = body
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", port))
+        self.srv.listen(8)
+
+    def run(self) -> None:
+        while True:
+            try:
+                conn, _ = self.srv.accept()
+            except OSError:
+                return
+            try:
+                conn.settimeout(10)
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    piece = conn.recv(4096)
+                    if not piece:
+                        break
+                    buf += piece
+                conn.sendall(b"HTTP/1.1 200 OK\r\n"
+                             b"Content-Type: application/octet-stream\r\n"
+                             b"Connection: close\r\n\r\n")
+                time.sleep(HEADER_BODY_GAP)
+                half = len(self.body) // 2
+                conn.sendall(self.body[:half])
+                time.sleep(INTER_PART_GAP)
+                conn.sendall(self.body[half:])
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    def stop(self) -> None:
+        self.srv.close()
+
+
+def http_get(port: int, path: str, slow: bool,
+             timeout: float = 120.0) -> bytes:
+    s = socket.create_connection(("127.0.0.1", port), timeout)
+    s.settimeout(timeout)
+    if slow:
+        # Without a small SO_RCVBUF the kernel buffers the whole
+        # compressed response client-side and nginx never feels the
+        # backpressure this test exists to create.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
+    req = (f"GET {path} HTTP/1.0\r\n"
+           f"Host: t\r\nAccept-Encoding: zstd\r\n\r\n")
+    s.sendall(req.encode("latin1"))
+    raw = b""
+    while True:
+        piece = s.recv(READ_CHUNK)
+        if not piece:
+            break
+        raw += piece
+        if slow:
+            time.sleep(READ_DELAY)
+    s.close()
+    head, _, body = raw.partition(b"\r\n\r\n")
+    headers = head.decode("latin1", "replace")
+    m = re.search(r"(?im)^content-encoding:\s*(\S+)", headers)
+    got = m.group(1) if m else None
+    if got != "zstd":
+        raise RuntimeError(f"{path}: Content-Encoding {got!r}, "
+                           f"wanted 'zstd'")
+    return body
+
+
+def main() -> int:
+    args = parse_args()
+    nginx = pathlib.Path(args.nginx_binary)
+    if not nginx.exists():
+        raise FileNotFoundError(nginx)
+
+    v = subprocess.run([str(nginx), "-V"], capture_output=True, text=True)
+    if "zstd" not in v.stderr:
+        raise RuntimeError("nginx -V shows no zstd module")
+    if "--with-debug" not in v.stderr:
+        raise RuntimeError("the witnesses are ngx_log_debug lines: "
+                           "this tool needs an nginx built --with-debug")
+
+    filter_so = detect_module(args.filter_module, nginx,
+                              "ngx_http_zstd_filter_module.so")
+    load = f"load_module {filter_so};\n" if filter_so else ""
+
+    def decode(blob: bytes) -> bytes:
+        r = subprocess.run([args.zstd_bin, "-d", "-q", "-c"], input=blob,
+                           capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError(
+                "zstd decode failed (truncated/corrupt stream): "
+                + r.stderr.decode("utf-8", "replace").strip())
+        return r.stdout
+
+    drain_body = fixture_bytes(DRAIN_SIZE)
+    proxy_body = fixture_bytes(2 * PROXY_PART)
+    backend = SlowHeaderBackend(args.backend_port, proxy_body)
+    backend.start()
+
+    with tempfile.TemporaryDirectory(prefix="zstd-drain-") as td:
+        root = pathlib.Path(td)
+        (root / "logs").mkdir()
+        html = root / "html" / "d"
+        html.mkdir(parents=True)
+        (html / "big").write_bytes(drain_body)
+
+        conf = root / "nginx.conf"
+        conf.write_text(f"""worker_processes 1;
+{load}error_log {root}/logs/error.log debug;
+pid {root}/nginx.pid;
+events {{ worker_connections 64; }}
+http {{
+    access_log off;
+    default_type application/octet-stream;
+    zstd on;
+    zstd_min_length 1;
+    zstd_types application/octet-stream;
+    gzip_vary on;
+    server {{
+        listen 127.0.0.1:{args.port} sndbuf=16384;
+        location /drain/ {{
+            alias {html}/;
+            zstd_buffers 2 8k;
+        }}
+        location /px {{
+            proxy_pass http://127.0.0.1:{args.backend_port};
+            proxy_buffering off;
+        }}
+    }}
+}}
+""", encoding="utf-8")
+
+        proc = subprocess.Popen(
+            [str(nginx), "-p", str(root), "-c", str(conf),
+             "-g", "daemon off; master_process off;"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            wait_port(args.port)
+            failures: list[str] = []
+
+            # 1. slow-drain: force the buffer cap and the writer-driven
+            #    re-entry through the nomem entry block
+            try:
+                t0 = time.time()
+                body = http_get(args.port, "/drain/big", slow=True)
+                took = time.time() - t0
+                plain = decode(body)
+                if plain != drain_body:
+                    failures.append(
+                        f"slow-drain: decoded {len(plain)}B, expected "
+                        f"{len(drain_body)}B — the pause/resume seams "
+                        f"corrupted or truncated the stream")
+                else:
+                    print(f"  slow-drain: {len(body)}B compressed drained "
+                          f"in {took:.1f}s, decoded byte-exact")
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"slow-drain: {exc}")
+
+            # 2. proxied data-less flush: every response starts with the
+            #    upstream FLUSH special hitting an empty encoder
+            ok = 0
+            for i in range(PROXY_REPEAT):
+                try:
+                    body = http_get(args.port, "/px", slow=False)
+                    if decode(body) != proxy_body:
+                        failures.append(f"proxy #{i}: decode mismatch")
+                        break
+                    ok += 1
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"proxy #{i}: {exc}")
+                    break
+            if ok:
+                print(f"  proxy: {ok}/{PROXY_REPEAT} unbuffered responses "
+                      f"decoded byte-exact")
+
+            elog = (root / "logs" / "error.log").read_text(
+                "utf-8", "replace")
+            for witness, path_name in (
+                    (NOMEM_WITNESS, "buffer-cap/nomem"),
+                    (FLUSH_WITNESS, "content-less flush")):
+                n = elog.count(witness)
+                if n == 0:
+                    failures.append(
+                        f"witness missing: {witness!r} never logged — "
+                        f"the {path_name} path did not run (geometry "
+                        f"drift, or the filter's debug lines changed)")
+                else:
+                    print(f"  witness: {witness!r} x{n}")
+
+            if failures:
+                sys.stderr.write(f"slow-drain FAILED ({len(failures)}):\n")
+                for f in failures:
+                    sys.stderr.write(f"  - {f}\n")
+                return 1
+
+            print("OK: forced backpressure and data-less flushes both "
+                  "witnessed, streams byte-exact")
+            return 0
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=30)
+            backend.stop()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(2)
