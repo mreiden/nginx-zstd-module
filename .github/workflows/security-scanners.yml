@@ -33,8 +33,19 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Install dependencies
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 install -y flawfinder clang-tidy python3 python3-pip pipx nginx-dev
+          # apt tuning lives in a conf file rather than per-invocation -o
+          # flags, so apt-get calls from nested scripts inherit it too.
+          # builder02 shares the box across jobs and never talks to the
+          # Azure mirror: keep timeouts loose enough that a loaded runner
+          # idling a connection isn't a step failure.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y flawfinder clang-tidy python3 python3-pip pipx nginx-dev
           # semgrep: isolate via pipx (PEP 668 blocks a bare pip3 install into the
           # system Python on the Ubuntu 24.04 self-hosted runner). Fall back to a
           # user pip install with --break-system-packages if pipx is unavailable.

@@ -43,8 +43,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 install -y \
+          # apt tuning lives in a conf file rather than per-invocation -o
+          # flags, so apt-get calls from nested scripts inherit it too.
+          # builder02 shares the box across jobs and never talks to the
+          # Azure mirror: keep timeouts loose enough that a loaded runner
+          # idling a connection isn't a step failure.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y \
             build-essential curl libpcre2-dev libzstd-dev pkg-config \
             valgrind wget zlib1g-dev zstd
 

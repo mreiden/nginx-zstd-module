@@ -53,9 +53,25 @@ jobs:
           echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
+        # A slow-rather-than-dead mirror can still crawl past every
+        # Acquire timeout; cap the step so a stall fails HERE, named,
+        # with the log intact, instead of eating the job cap.
+        timeout-minutes: 5
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update
-          sudo apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 install -y build-essential pkg-config libzstd-dev \
+          # ubuntu-latest resolves apt through azure.archive.ubuntu.com,
+          # whose outage shape is ~2 minutes of default Acquire timeout per
+          # index file before the runner's mirror list falls back (the #117
+          # cancellations). Short idle timeouts and a single retry make
+          # that failover cheap; a conf file rather than -o flags also
+          # covers apt-get calls from nested scripts.
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "1";' \
+            'Acquire::http::Timeout "10";' \
+            'Acquire::https::Timeout "10";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libzstd-dev \
             libpcre2-dev zlib1g-dev wget
 
       - name: Cache nginx source tarball
