@@ -33,11 +33,8 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Install dependencies
         run: |
-          # apt tuning lives in a conf file rather than per-invocation -o
-          # flags, so apt-get calls from nested scripts inherit it too.
-          # builder02 shares the box across jobs and never talks to the
-          # Azure mirror: keep timeouts loose enough that a loaded runner
-          # idling a connection isn't a step failure.
+          # builder02 apt profile: loose timeouts — the box runs jobs
+          # concurrently and never talks to the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
