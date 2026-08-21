@@ -1323,6 +1323,14 @@ jobs:
             --nginx-binary "$TEST_NGINX_BINARY" \
             --port 18086 --backend-port 18087
           echo "✓ proxy_buffering-off truncation regression passed"
+          # Deterministic drivers for the two timing-dependent paths
+          # (buffer-cap nomem recovery, content-less flush) that the
+          # coverage floor previously measured only when CI load
+          # produced the right races — see tools/test_slow_drain.py.
+          python3 tools/test_slow_drain.py \
+            --nginx-binary "$TEST_NGINX_BINARY" \
+            --port 18100 --backend-port 18101
+          echo "✓ slow-drain backpressure + data-less flush passed"
 
       - name: Run broad compression correctness matrix
         timeout-minutes: 12
@@ -1548,6 +1556,19 @@ jobs:
           python3 tools/test_terminal_frame.py --nginx-binary "$TEST_NGINX_BINARY" --port 18093
           python3 tools/test_proxy_unbuffered_truncation.py \
             --nginx-binary "$TEST_NGINX_BINARY" --port 18094 --backend-port 18095
+          # Backpressure pause/resume under sanitizers: the nomem and
+          # empty-flush paths share lifetime history with the
+          # truncation class, so drive them deliberately here too.
+          # --log-level warn: a UBSAN nginx (-fno-sanitize-recover)
+          # fatally traps core's own debug logging (the "%V?%V" lines
+          # pass NULL for empty r->args into ngx_sprintf_str's nonnull
+          # arg), so the sanitized binary cannot log at debug at all.
+          # The tool still forces both paths and byte-checks the
+          # streams; the log-witness assertions run in the tests and
+          # coverage jobs, whose binaries are not sanitized.
+          python3 tools/test_slow_drain.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18110 --backend-port 18111 \
+            --log-level warn
           # Matrix under ASAN/UBSAN at repeat=1 (252 cells) — the
           # truncation/zero-size-buf/livelock class has UB+lifetime
           # history, so exercise the full circumstance matrix with
@@ -1751,6 +1772,14 @@ jobs:
             --nginx-binary "$TEST_NGINX_BINARY" --port 19098 --backend-port 19099
           python3 tools/test_proxy_unbuffered_truncation.py \
             --nginx-binary "$TEST_NGINX_BINARY" --port 19094 --backend-port 19095
+          # The reason this tool exists: the floor below assumes the
+          # nomem-recovery and content-less-flush lines are covered,
+          # but they only ran when builder02's load produced the right
+          # races (8 lines = 0.67pp; the floor's headroom is 0.6pp —
+          # one unlucky run failed an unrelated two-line PR). This
+          # forces both paths every run.
+          python3 tools/test_slow_drain.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 19110 --backend-port 19111
           python3 tools/test_terminal_frame.py --nginx-binary "$TEST_NGINX_BINARY" --port 19093
           python3 tools/test_window_cap.py \
             --nginx-binary "$TEST_NGINX_BINARY" --port 19104 --backend-port 19105
