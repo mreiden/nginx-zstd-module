@@ -24,6 +24,73 @@ this code started by not knowing nginx internals either.
 - [ ] All CI checks green. No skipping, no "it works on my machine".
 - [ ] Commit messages: imperative subject, body explains *why*.
       No AI co-author trailers.
+- [ ] The local hook is enabled (see below) — it runs the same checks the
+      Lint job runs, so you find them in a second instead of a CI round-trip.
+
+## Enable the local hook
+
+The repository ships its own pre-commit hook. It is **not** active in a fresh
+clone — git never enables hooks automatically — so turn it on once:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+`.githooks/pre-commit` then runs **two** gates on every commit, and fails on
+either:
+
+1. `ci/linter/run-all.sh --staged` — the same `ci/linter/` checkers the **Lint**
+   workflow runs (nginx-convention, shell, Python, Perl, YAML, spelling, and the
+   CI-policy checkers).
+2. the `.pre-commit-config.yaml` hooks — secret detection (gitleaks,
+   detect-private-key), the C SAST gates (flawfinder, semgrep, cppcheck),
+   ast-grep, ruff, actionlint and shellcheck.
+
+Neither list is a superset of the other, which is why the hook runs both.
+
+**`pre-commit` itself is a hard prerequisite.** When `.pre-commit-config.yaml`
+is present and the `pre-commit` binary is missing, the hook exits 2 and blocks
+the commit rather than warning — a gate that skips itself when its tool is
+absent reports green while checking nothing. The same applies to a missing
+linter: `run-all.sh` exits 2 and the commit is blocked.
+
+Install everything the hook calls — `pre-commit` included — with:
+
+```sh
+ci/linter/install-linters.sh          # apt + pipx + cpan + upstream binaries
+ci/linter/install-linters.sh --check  # report what is present; non-zero if any
+                                      # required tool is missing
+```
+
+`--check` exits non-zero when a tool is missing, so it is safe to use as a gate
+in your own scripts — a tool that is absent is never reported as clean.
+
+Verify the hook is actually live before trusting it — this gate was green and
+inert for days once, because `core.hooksPath` makes the copy
+`pre-commit install` writes into `.git/hooks/` unreachable while every surface
+a human checks still looks installed:
+
+```sh
+printf 'probe   \n\nno newline at eof' > _p.txt
+git add _p.txt && git commit -m probe -- _p.txt   # expect BLOCKED
+git reset -q HEAD _p.txt; rm -f _p.txt
+```
+
+Both `trim trailing whitespace` and `fix end of files` must report Failed. If
+the commit lands, `.pre-commit-config.yaml` is not being consulted.
+
+Timing: the hook takes ~0.5s for a docs-only change and ~3.6s when a C file is
+staged (semgrep is most of that). To run the full set by hand without
+committing:
+
+```sh
+ci/linter/run-all.sh                  # every checker over the tracked tree
+LINT_ONLY="sh python" ci/linter/run-all.sh   # narrow to named checkers
+```
+
+One trap worth knowing: `run-all.sh` enumerates files with `git ls-files`, so a
+**new untracked file is invisible to it** and the run reads green while checking
+nothing. `git add -N` the file first.
 
 ## How CI works here
 
