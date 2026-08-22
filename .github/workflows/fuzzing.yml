@@ -35,8 +35,8 @@ jobs:
 
       - name: Install clang + libFuzzer
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose
+          # timeouts — shared box, never the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \

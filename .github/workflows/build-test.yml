@@ -108,8 +108,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose
+          # timeouts — shared box, never the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -306,8 +306,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose
+          # timeouts — shared box, never the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -475,8 +475,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose
+          # timeouts — shared box, never the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -641,8 +641,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose
+          # timeouts — shared box, never the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -897,7 +897,7 @@ jobs:
           # ubuntu-latest resolves apt through azure.archive.ubuntu.com,
           # whose outage shape is ~2 minutes of default Acquire timeout
           # per index file before the runner's mirror list falls back
-          # (the #117 cancellations); short timeouts make that cheap.
+          # (#117); the bare apt-get lines below rely on this file.
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "1";' \
@@ -1052,8 +1052,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose
+          # timeouts — shared box, never the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1162,8 +1162,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose
+          # timeouts — shared box, never the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1434,8 +1434,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose
+          # timeouts — shared box, never the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1630,8 +1630,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose
+          # timeouts — shared box, never the Azure mirror (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
