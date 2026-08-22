@@ -15,10 +15,71 @@ name: CI
 #                decision it would inform -- schedule + dispatch only.
 #   bump.yml     the version-bump bot; opens PRs, is not a gate on one.
 #
-# The two long-runners that ARE members are bounded and stay bounded:
+# The long-runners that ARE members are bounded and stay bounded:
 #   fuzzing.yml   -max_total_time=120   (2 minutes)
 #   valgrind.yml  soak.sh <nginx> 60 4  (60 seconds at concurrency 4)
-# If either grows an open-ended budget it belongs in ci-deep.yml instead.
+#   asan.yml      soak.sh <nginx> 60 4  (60 seconds at concurrency 4)
+# If any grows an open-ended budget it belongs in ci-deep.yml instead.
+#
+# ── LANES (step 29) ─────────────────────────────────────────────────────────
+# Real runner: builder02, 6 concurrent self-hosted slots (systemctl list-units
+# | grep ci-ephemeral -> ci-ephemeral@{docker-01,docker-02,runner-01..04}).
+#
+# Measured from run 32540884342 (2026-08-22, PR "adopt-skeleton-pr1"), re-derive with:
+#   gh run view <id> -R myguard-labs/nginx-zstd-module --json jobs \
+#     -q '.jobs[] | [.name, .conclusion,
+#                    (((.completedAt|fromdate)-(.startedAt|fromdate))|tostring)+"s",
+#                    .startedAt, .completedAt] | @tsv'
+#
+# Self-hosted-pool jobs and durations (lint = ubuntu-latest hosted,
+# windows-build = windows-latest hosted -- neither takes a builder02 slot,
+# rule 5, not laned):
+#   build-test/resolve            7s   build-test/validation        149s
+#   build-test/build             173s  build-test/build-old-libzstd 148s
+#   build-test/linkage            93s  build-test/cvary-interop      73s
+#   build-test/build-asan         68s  build-test/coverage          243s
+#   build-test/tests             141s  build-test/tests-asan        182s
+#   codeql                       164s  security-scanners            114s
+#   fuzzing                      147s  valgrind                     119s
+#   asan (asan-soak)              68s
+#
+# RULE 1 (longest job = the budget): resolve(7s)->build(173s)->tests(141s) =
+# 321s is the longest chain in this whole PR gate's self-hosted work; nothing
+# is chained behind it.
+#
+# RULE 2/3 (fewest lanes, four max) -- applied so far, WITHIN build-test.yml
+# only (see limitation below): build-old-libzstd now runs needs:
+# [resolve, validation] with if: ${{ !cancelled() }} instead of needs: resolve
+# alone, so it takes validation's freed slot (t=149s) instead of adding to
+# the t=7s pile-on. That is Lane D: validation(149s) -> build-old-libzstd(148s)
+# = 297s, under the 321s budget. build-test.yml's own peak concurrency after
+# resolve drops from 7 to 6 (== the real slot count) with this one change.
+#
+# RULE 4 (a lane is not a slot; count real slots): even at 6-of-6 inside
+# build-test.yml alone, the OTHER four self-hosted ci.yml members --
+# codeql, security-scanners, fuzzing, valgrind, asan -- start at the SAME
+# t=0 (they have no needs: on build-test.yml and cannot: needs: on a uses:
+# job blocks on that job's ENTIRE called workflow finishing, which would
+# serialize the whole 321s build-test.yml chain behind whichever member
+# went first -- collapsing exactly the parallelism lanes exist to keep).
+# GitHub Actions has no job-level needs: that crosses a reusable-workflow-
+# call boundary, only within one workflow file's own job graph. Real peak
+# here is 11 self-hosted-pool jobs against 6 slots at t=7s (build-test's 6
+# plus codeql/security-scanners/fuzzing/valgrind/asan's 5), sustained for
+# most of each job's ~70-250s runtime -- NOT the brief startup blip rule 4
+# tolerates. This is WORSE than the reference module's own "peak 7 against
+# 6" case it warns against.
+#
+# RULE 3/limitation: closing that gap needs either (a) folding codeql/
+# security-scanners/fuzzing/valgrind/asan's single jobs into build-test.yml's
+# own job graph so real needs: lanes can span all of them, or (b) a second
+# self-hosted pool / more ci-ephemeral slots. Both are decisions beyond one
+# bounded lane-map item -- tracked in memory/labs/http-zstd/TODO.md and
+# ci/skeleton-findings.md with this measurement as the evidence. Do not
+# read "4 lanes" below as solved; it is the safe, verified SUBSET that
+# landed without risking build-test.yml's other ~1800 lines blind.
+#
+# Any lane change rewrites this comment in the same commit.
 
 on:
   pull_request:
@@ -33,6 +94,12 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    name: Lint
+    uses: ./.github/workflows/lint.yml
+    permissions:
+      contents: read
+
   build-test:
     name: Build & Test
     uses: ./.github/workflows/build-test.yml
@@ -40,6 +107,12 @@ jobs:
       contents: read
 
   security-scanners:
+    # Lower-case "scanners" deliberately: this string is half of the check
+    # context ("Security scanners / Security scanners") that ruleset 16557047
+    # requires on master. Step 20's Security Scanners spelling governs the
+    # README badge and CI table, not this job name -- the reference sets no
+    # name: here at all. Renaming it orphans the required context, and the PR
+    # then waits forever on a check that will never report again.
     name: Security scanners
     uses: ./.github/workflows/security-scanners.yml
     permissions:
@@ -53,7 +126,7 @@ jobs:
     # like a CodeQL fault.
     permissions:
       contents: read
-      security-events: write
+      security-events: write # required to upload CodeQL's SARIF results
 
   fuzzing:
     name: Fuzzing
@@ -64,6 +137,12 @@ jobs:
   valgrind:
     name: Valgrind
     uses: ./.github/workflows/valgrind.yml
+    permissions:
+      contents: read
+
+  asan:
+    name: A/UBSan
+    uses: ./.github/workflows/asan.yml
     permissions:
       contents: read
 

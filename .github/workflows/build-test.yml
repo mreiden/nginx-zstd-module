@@ -84,6 +84,8 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       # Lint the workflow files themselves. actionlint validates GitHub
       # Actions expression contexts (e.g. "env is not allowed in a job
@@ -143,6 +145,13 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/ci/tools"
           python3 -m unittest -v test_test_encoding test_test_package_artifact
+
+      # Cheapest test layer over the real Accept-Encoding decision function:
+      # no nginx build tree, no network, sub-second. Regenerates and links
+      # the shipped src/ngx_http_zstd_common.h via ci/fuzz/extract_parser.sh
+      # (see ci/tests/unit/run.sh header) so a stale copy can never pass.
+      - name: Accept-Encoding parser unit tests (real decision TU)
+        run: bash "$GITHUB_WORKSPACE/ci/tests/unit/run.sh"
           echo "✓ Python harness unit tests passed"
 
       # Audit sha e289021 F1/F7 regression coverage: no nginx build needed,
@@ -296,6 +305,8 @@ jobs:
 
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Cache apt packages
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -347,26 +358,34 @@ jobs:
 
       - name: Download server source tarball
         if: steps.src-tarball.outputs.cache-hit != 'true'
-        run: wget -q -O "${{ matrix.dir }}.tar.gz" "${{ matrix.url }}"
+        env:
+          MATRIX_DIR: ${{ matrix.dir }}
+          MATRIX_URL: ${{ matrix.url }}
+        run: wget -q -O "$MATRIX_DIR.tar.gz" "$MATRIX_URL"
 
       - name: Verify nginx tarball PGP signature
         if: matrix.flavor == 'nginx'
+        env:
+          MATRIX_DIR: ${{ matrix.dir }}
+          MATRIX_URL: ${{ matrix.url }}
         run: |
           set -euo pipefail
-          wget -q -O "${{ matrix.dir }}.tar.gz.asc" "${{ matrix.url }}.asc"
+          wget -q -O "$MATRIX_DIR.tar.gz.asc" "$MATRIX_URL.asc"
           gnupghome="$(mktemp -d)"
           export GNUPGHOME="$gnupghome"
           chmod 700 "$gnupghome"
           for keyfile in ci/tools/keys/*.key; do
             gpg --quiet --import "$keyfile" 2>/dev/null
           done
-          gpg --quiet --verify "${{ matrix.dir }}.tar.gz.asc" "${{ matrix.dir }}.tar.gz"
+          gpg --quiet --verify "$MATRIX_DIR.tar.gz.asc" "$MATRIX_DIR.tar.gz"
           rm -rf "$gnupghome"
 
       - name: Configure (full debug build)
+        env:
+          MATRIX_DIR: ${{ matrix.dir }}
         run: |
-          tar -xzf "${{ matrix.dir }}.tar.gz"
-          cd "${{ matrix.dir }}"
+          tar -xzf "$MATRIX_DIR.tar.gz"
+          cd "$MATRIX_DIR"
           # Full debug compile flags:
           #   --with-debug          nginx debug logging (ngx_log_debug*)
           #   -g3                   max debug info incl. macro definitions
@@ -396,8 +415,10 @@ jobs:
             --add-module="$GITHUB_WORKSPACE"
 
       - name: Strict compile of module sources (warnings as errors)
+        env:
+          MATRIX_DIR: ${{ matrix.dir }}
         run: |
-          cd "${{ matrix.dir }}"
+          cd "$MATRIX_DIR"
           NGINX_CFLAGS=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' objs/Makefile)
           ALL_INCS=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); gsub(/\\$/, "", line); printf "%s ", line; if (!/\\$/) exit}' objs/Makefile)
           for src in \
@@ -416,8 +437,10 @@ jobs:
           echo "✓ All module sources compile cleanly with strict flags"
 
       - name: Build binary with module
+        env:
+          MATRIX_DIR: ${{ matrix.dir }}
         run: |
-          cd "${{ matrix.dir }}"
+          cd "$MATRIX_DIR"
           NGINX_CFLAGS=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' objs/Makefile)
           make -j"$(nproc)" modules \
             CFLAGS="$NGINX_CFLAGS -Wall -Wextra -Wshadow -Wstrict-aliasing \
@@ -433,9 +456,12 @@ jobs:
           echo "✓ nginx binary built (libcrypto EVP SHA-256 detected)"
 
       - name: Verify built binary
+        env:
+          MATRIX_DIR: ${{ matrix.dir }}
+          MATRIX_FLAVOR: ${{ matrix.flavor }}
         run: |
-          ls -la "${{ matrix.dir }}/objs/${{ matrix.flavor }}"
-          "${{ matrix.dir }}/objs/${{ matrix.flavor }}" -V 2>&1
+          ls -la "$MATRIX_DIR/objs/$MATRIX_FLAVOR"
+          "$MATRIX_DIR/objs/$MATRIX_FLAVOR" -V 2>&1
 
       - name: Upload server binary artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -472,6 +498,8 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -609,7 +637,7 @@ jobs:
       - name: Smoke test (decode-and-compare) against libzstd 1.4.x
         run: |
           cd "$GITHUB_WORKSPACE"
-          # Re-use the existing decode-and-byte-compare smoke test so
+          # Reuse the existing decode-and-byte-compare smoke test so
           # the fallback paths are not just compiled but actually
           # exercised at run time — compression must produce a
           # byte-exact body when decompressed.
@@ -1049,6 +1077,8 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -1152,6 +1182,8 @@ jobs:
 
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Cache apt packages
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -1205,9 +1237,12 @@ jobs:
           echo "PERL5LIB=$HOME/perl5/lib/perl5:$PERL5LIB" >> "$GITHUB_ENV"
 
       - name: Run filter module tests
+        env:
+          RUN_ID: ${{ github.run_id }}
+          JOB_NAME: ${{ github.job }}
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-filter-${{ github.run_id }}-${{ github.job }}"
+          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-filter-${RUN_ID}-${JOB_NAME}"
           mkdir -p "$TEST_NGINX_SERVROOT"
           cd "$GITHUB_WORKSPACE"
           perl ci/t/00-filter.t 2>&1 | sed 's/^Error:/Err:/' | tee ci/t/filter-tests.log
@@ -1215,9 +1250,12 @@ jobs:
           echo "✓ Filter module: All tests passed"
 
       - name: Run config-load warning tests
+        env:
+          RUN_ID: ${{ github.run_id }}
+          JOB_NAME: ${{ github.job }}
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-confwarn-${{ github.run_id }}-${{ github.job }}"
+          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-confwarn-${RUN_ID}-${JOB_NAME}"
           rm -rf "$TEST_NGINX_SERVROOT"
           mkdir -p "$TEST_NGINX_SERVROOT"
           cd "$GITHUB_WORKSPACE"
@@ -1229,9 +1267,12 @@ jobs:
           echo "✓ Config-load warning tests passed"
 
       - name: Run static module tests
+        env:
+          RUN_ID: ${{ github.run_id }}
+          JOB_NAME: ${{ github.job }}
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static-${{ github.run_id }}-${{ github.job }}"
+          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static-${RUN_ID}-${JOB_NAME}"
           mkdir -p "$TEST_NGINX_SERVROOT"
           touch -d @1541504307 "$GITHUB_WORKSPACE/ci/t/suite/test" "$GITHUB_WORKSPACE/ci/t/suite/test.zst"
           cd "$GITHUB_WORKSPACE"
@@ -1240,9 +1281,12 @@ jobs:
           echo "✓ Static module: All tests passed"
 
       - name: Run dcz negotiation tests
+        env:
+          RUN_ID: ${{ github.run_id }}
+          JOB_NAME: ${{ github.job }}
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-dcz-${{ github.run_id }}-${{ github.job }}"
+          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-dcz-${RUN_ID}-${JOB_NAME}"
           rm -rf "$TEST_NGINX_SERVROOT"
           mkdir -p "$TEST_NGINX_SERVROOT"
           cd "$GITHUB_WORKSPACE"
@@ -1431,6 +1475,8 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -1481,15 +1527,17 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=0:abort_on_error=0:exitcode=0:log_path=/tmp/asan-zstd
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
+          RUN_ID: ${{ github.run_id }}
+          JOB_NAME: ${{ github.job }}
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
           rm -f /tmp/asan-zstd.*
           cd "$GITHUB_WORKSPACE"
-          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-asan-${{ github.run_id }}-${{ github.job }}"
+          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-asan-${RUN_ID}-${JOB_NAME}"
           mkdir -p "$TEST_NGINX_SERVROOT"
           perl ci/t/00-filter.t > ci/t/filter-asan.log 2>&1 || true
           touch -d @1541504307 "$GITHUB_WORKSPACE/ci/t/suite/test" "$GITHUB_WORKSPACE/ci/t/suite/test.zst"
-          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static-${{ github.run_id }}-${{ github.job }}"
+          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static-${RUN_ID}-${JOB_NAME}"
           mkdir -p "$TEST_NGINX_SERVROOT"
           perl ci/t/01-static.t > ci/t/static-asan.log 2>&1 || true
           # Gate strictly on sanitizer reports attributable to this module.
@@ -1564,6 +1612,17 @@ jobs:
           # frame header is hand-assembled — both lifetime/OOB classes.
           python3 ci/tools/test_dcz.py --nginx-binary "$TEST_NGINX_BINARY" \
             --port 18089
+          # Baseline loaded-and-blocking control (PR2 step 22): the ASAN
+          # binary is a static --add-module build, the shape this check
+          # needs to prove the compiled-in `zstd on;` default is OFF.
+          # Every other case in this job asserts response CORRECTNESS,
+          # none of them individually depend on compression having
+          # happened at all -- this is the control that would catch a
+          # module that failed to load or a decision-flip in the enable
+          # default, which every other green case here would miss.
+          python3 ci/tools/test_baseline_loaded.py \
+            --nginx-binary "$TEST_NGINX_BINARY" \
+            --port 18107 --backend-port 18108 --off-port 18112
 
           # Leak verdict. Everything in lsan.suppress is gone by now, so any
           # surviving "ERROR: LeakSanitizer" is an unsuppressed leak and fails
@@ -1619,14 +1678,22 @@ jobs:
     needs: resolve
     env:
       NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
-      # Own Test::Nginx listen port — see the tests job for why.
-      TEST_NGINX_SERVER_PORT: "2034"
+      # This job's own Test::Nginx port band -- see ci/tools/max-port.sh.
+      # Distinct from every other TEST_BASE_PORT in this repo so a collision
+      # with another runtime job on the same self-hosted runner reads as the
+      # bind error it is, not as an unrelated flake in a rerun.
+      TEST_BASE_PORT: 19200
+      # Test::Nginx reads TEST_NGINX_PORT, not TEST_BASE_PORT -- every `prove`
+      # call below shares this job's band.
+      TEST_NGINX_PORT: 19200
       # See ci-deep.yml:117 for why this must be 20, not the ~2s Test::Nginx::Socket default.
       TEST_NGINX_TIMEOUT: "20"
 
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -1701,36 +1768,52 @@ jobs:
           cpanm -l ~/perl5 --notest Test::Nginx::Socket
           echo "PERL5LIB=$HOME/perl5/lib/perl5:$PERL5LIB" >> "$GITHUB_ENV"
 
+      - name: Verify test port band
+        # Before the first `prove` -- see ci/tools/max-port.sh.
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
+
       - name: Run filter module tests
+        env:
+          RUN_ID: ${{ github.run_id }}
+          JOB_NAME: ${{ github.job }}
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-filter-${{ github.run_id }}-${{ github.job }}"
+          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-filter-${RUN_ID}-${JOB_NAME}"
           mkdir -p "$TEST_NGINX_SERVROOT"
           cd "$GITHUB_WORKSPACE"
           prove ci/t/00-filter.t
 
       - name: Run config-load warning tests
+        env:
+          RUN_ID: ${{ github.run_id }}
+          JOB_NAME: ${{ github.job }}
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-confwarn-${{ github.run_id }}-${{ github.job }}"
+          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-confwarn-${RUN_ID}-${JOB_NAME}"
           rm -rf "$TEST_NGINX_SERVROOT"
           mkdir -p "$TEST_NGINX_SERVROOT"
           cd "$GITHUB_WORKSPACE"
           prove ci/t/02-conf-warn.t
 
       - name: Run static module tests
+        env:
+          RUN_ID: ${{ github.run_id }}
+          JOB_NAME: ${{ github.job }}
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static-${{ github.run_id }}-${{ github.job }}"
+          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static-${RUN_ID}-${JOB_NAME}"
           mkdir -p "$TEST_NGINX_SERVROOT"
           touch -d @1541504307 "$GITHUB_WORKSPACE/ci/t/suite/test" "$GITHUB_WORKSPACE/ci/t/suite/test.zst"
           cd "$GITHUB_WORKSPACE"
           prove ci/t/01-static.t
 
       - name: Run dcz negotiation tests
+        env:
+          RUN_ID: ${{ github.run_id }}
+          JOB_NAME: ${{ github.job }}
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-dcz-${{ github.run_id }}-${{ github.job }}"
+          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-dcz-${RUN_ID}-${JOB_NAME}"
           rm -rf "$TEST_NGINX_SERVROOT"
           mkdir -p "$TEST_NGINX_SERVROOT"
           cd "$GITHUB_WORKSPACE"

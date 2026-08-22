@@ -1,16 +1,23 @@
 #!/bin/bash
 # Build and test zstd-nginx-module against nginx or angie.
 #
-#   ci/tools/ci-build.sh [flavor] [version]
+#   ci/tools/ci-build.sh [flavor] [version] [mode]
 #     flavor : nginx (default) | angie
 #     version: source version, e.g. 1.31.2. Omit (or pass "" with flavor=nginx)
 #              to resolve the current mainline release from nginx.org.
+#     mode   : release (default) | coverage
+#              coverage adds --coverage to cc-opt/ld-opt and builds into a
+#              SEPARATE tree (.build/<flavor>-<version>-coverage/) so a
+#              coverage-instrumented .so is never the one a non-coverage job
+#              picks up by cache hit. It is never bolted onto release as a
+#              flag: gcda/gcno files left in a shared tree would poison the
+#              next plain build's cache key without changing the key itself.
 #
-# Built tree persists at .build/<flavor>-<version>/objs/{<flavor>,ngx_http_zstd_*.so}
+# Built tree persists at .build/<flavor>-<version>[-<mode>]/objs/{<flavor>,ngx_http_zstd_*.so}
 # so a caller (a CI job) can find the binary and both dynamic modules after
 # the script exits — unlike the old single-nginx version of this script, which
 # built under /tmp and deleted it on exit. NO_CACHE=1 forces a from-scratch
-# rebuild of a given flavor/version pair.
+# rebuild of a given flavor/version/mode triple.
 #
 # nginx tarballs are verified via PGP against the signer keys VENDORED in
 # ci/tools/keys/ (committed to this repo) — never fetched from nginx.org at CI
@@ -41,11 +48,20 @@ MODULE_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 FLAVOR="${1:-nginx}"
 VERSION="${2:-}"
+MODE="${3:-release}"
 
 case "$FLAVOR" in
     nginx | angie) ;;
     *)
         echo "ERROR: unsupported flavor: $FLAVOR (want: nginx|angie)" >&2
+        exit 2
+        ;;
+esac
+
+case "$MODE" in
+    release | coverage) ;;
+    *)
+        echo "ERROR: unsupported mode: $MODE (want: release|coverage)" >&2
         exit 2
         ;;
 esac
@@ -97,7 +113,13 @@ case "$FLAVOR" in
         ;;
 esac
 
-SRCDIR="$ROOT/${FLAVOR}-${VERSION}"
+# Coverage gets its own build tree so an instrumented .so is never served by
+# a plain release cache hit -- see the mode note in the file header.
+if [ "$MODE" = "coverage" ]; then
+    SRCDIR="$ROOT/${FLAVOR}-${VERSION}-coverage"
+else
+    SRCDIR="$ROOT/${FLAVOR}-${VERSION}"
+fi
 TARBALL="$ROOT/${DIR}.tar.gz"
 
 echo "=========================================================================="
@@ -105,7 +127,7 @@ echo "  zstd-nginx-module CI Build"
 echo "=========================================================================="
 echo ""
 echo "Module: $ZSTD_MODULE_DIR"
-echo "Flavor: $FLAVOR  Version: $VERSION"
+echo "Flavor: $FLAVOR  Version: $VERSION  Mode: $MODE"
 echo "Build tree: $SRCDIR"
 echo ""
 
@@ -113,6 +135,34 @@ mkdir -p "$ROOT"
 
 if [ "$NO_CACHE" = "1" ]; then
     rm -rf "$SRCDIR" "$TARBALL"
+fi
+
+# Input stamp. A build tree is keyed by flavor/version/mode only, but its OBJECTS
+# also depend on the module sources, the config file and this script. On a
+# persistent self-hosted runner the directory outlives all three, so without a
+# stamp a changed src/ silently reuses the old objects and CI reports on a binary
+# that no longer matches the tree. The Actions cache does not save us: a cache
+# MISS still finds the retained local directory.
+# Every command here must succeed even when its input is absent. A bare
+# `[ -f x ] && cat x` as the LAST command of the group makes the whole
+# substitution exit non-zero when x is missing, and `set -e` then kills the
+# build before it has downloaded anything -- which reads as "rejected" to any
+# caller checking only the exit status.
+STAMP_INPUTS="$(
+    {
+        cat "${BASH_SOURCE[0]}"
+        if [ -f "$ZSTD_MODULE_DIR/config" ]; then
+            cat "$ZSTD_MODULE_DIR/config"
+        fi
+        find "$ZSTD_MODULE_DIR/src" -type f \( -name '*.c' -o -name '*.h' \) \
+            -print0 2>/dev/null | sort -z | xargs -0 -r cat
+        :
+    } | sha256sum | cut -d" " -f1
+)"
+STAMP_FILE="$SRCDIR/.myguard-build-inputs"
+if [ -d "$SRCDIR" ] && [ "$(cat "$STAMP_FILE" 2>/dev/null || true)" != "$STAMP_INPUTS" ]; then
+    echo "Build inputs changed since this tree was built -- rebuilding from scratch."
+    rm -rf "$SRCDIR"
 fi
 
 echo "=========================================================================="
@@ -209,6 +259,8 @@ if [ ! -d "$SRCDIR" ]; then
     fi
 fi
 
+printf '%s\n' "$STAMP_INPUTS" > "$STAMP_FILE"
+
 cd "$SRCDIR"
 
 echo ""
@@ -229,6 +281,38 @@ echo ""
 #     zstd_max_cctx_memory is built on; auto/zstd only defines it on the
 #     explicit ZSTD_INC path, not on the pkg-config auto-discovery path this
 #     script takes.
+# Coverage adds --coverage to BOTH cc-opt and ld-opt via the configure
+# argument, not env CC/CFLAGS -- nginx's configure probes the compiler with
+# its own invocations (`` `$CC -v ...` ``, unquoted so it also splits on a
+# ccache prefix) and ignores a bare CC=/CFLAGS= override entirely: nothing in
+# configure or the generated Makefile ever reads it.
+CC_OPT="-DZSTD_STATIC_LINKING_ONLY"
+LD_OPT=""
+if [ "$MODE" = "coverage" ]; then
+    CC_OPT="$CC_OPT --coverage -O0"
+    LD_OPT="--coverage"
+fi
+
+# ccache goes through --with-cc, the one flag configure actually reads for the
+# compiler pathname, not env CC= (same reason as above). CCACHE_COMPILERCHECK
+# content -- not the mtime-based default -- so a compiler reinstalled at the
+# same path with the same version string still hits cache; skipped under
+# coverage, where --coverage recompiles from a clean tree every run anyway and
+# a cache lookup only adds an unproductive stat.
+CC_BIN="gcc"
+if [ "$MODE" != "coverage" ] && command -v ccache >/dev/null 2>&1; then
+    export CCACHE_COMPILERCHECK=content
+    CC_BIN="ccache gcc"
+fi
+
+# mold as the linker, cheapest cache layer of all (no key, no invalidation
+# logic -- just a faster ld). Skipped under coverage: --coverage's own gcov
+# runtime linking has known mold interop gaps, and this script has no ASan
+# mode to skip it for yet (asan.yml builds outside ci-build.sh entirely).
+if [ "$MODE" != "coverage" ] && command -v mold >/dev/null 2>&1; then
+    LD_OPT="$LD_OPT -fuse-ld=mold"
+fi
+
 ./configure \
     --prefix=/etc/nginx \
     --sbin-path=/usr/sbin/"$FLAVOR" \
@@ -239,7 +323,9 @@ echo ""
     --with-http_v2_module \
     --with-http_sub_module \
     --with-http_auth_request_module \
-    --with-cc-opt="-DZSTD_STATIC_LINKING_ONLY" \
+    --with-cc="$CC_BIN" \
+    --with-cc-opt="$CC_OPT" \
+    --with-ld-opt="$LD_OPT" \
     --add-dynamic-module="$ZSTD_MODULE_DIR" \
     2>&1 | tail -5
 
