@@ -12,9 +12,9 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 on:
-  pull_request:
-    branches: [master, main]
   workflow_dispatch: {}
+  # Called by ci.yml, the single PR entry point (step 15).
+  workflow_call: {}
 
 concurrency:
   group: security-scanners-${{ github.workflow }}-${{ github.ref }}
@@ -26,7 +26,7 @@ permissions:
 jobs:
   scanners:
     name: Security scanners
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module
@@ -63,7 +63,7 @@ jobs:
           gnupghome="$(mktemp -d)"
           export GNUPGHOME="$gnupghome"
           chmod 700 "$gnupghome"
-          for keyfile in "$GITHUB_WORKSPACE"/tools/keys/*.key; do
+          for keyfile in "$GITHUB_WORKSPACE"/ci/tools/keys/*.key; do
             gpg --quiet --import "$keyfile" 2>/dev/null
           done
           gpg --quiet --verify "nginx-${ver}.tar.gz.asc" "nginx-${ver}.tar.gz"
@@ -74,8 +74,8 @@ jobs:
       - name: flawfinder
         run: |
           flawfinder --minlevel=1 \
-            "$GITHUB_WORKSPACE/filter/ngx_http_zstd_filter_module.c" \
-            "$GITHUB_WORKSPACE/static/ngx_http_zstd_static_module.c" 2>&1 | tee flawfinder.log
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_filter_module.c" \
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_static_module.c" 2>&1 | tee flawfinder.log
       - name: clang-tidy (cert-*, security.*)
         run: |
           set -euo pipefail
@@ -84,8 +84,8 @@ jobs:
             -I$N/src/os/unix -I$N/objs -I$N/src/http -I$N/src/http/modules -I$N/src/http/v2 -I/usr/include"
           status=0
           for f in \
-            "$GITHUB_WORKSPACE/filter/ngx_http_zstd_filter_module.c" \
-            "$GITHUB_WORKSPACE/static/ngx_http_zstd_static_module.c"; do
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_filter_module.c" \
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_static_module.c"; do
             # shellcheck disable=SC2086,SC2046
             clang-tidy "$f" \
               --checks='-*,cert-*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \

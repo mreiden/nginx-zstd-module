@@ -1,0 +1,955 @@
+use Test::Nginx::Socket;
+use File::Basename;
+use lib 'lib';
+
+my @dynamic_modules;
+if (defined $ENV{'TEST_NGINX_BINARY'}) {
+    my $nginx_dir = dirname($ENV{'TEST_NGINX_BINARY'});
+    for my $module_name (qw(ngx_http_zstd_filter_module.so ngx_http_zstd_static_module.so)) {
+        my $module_path = "$nginx_dir/$module_name";
+        push @dynamic_modules, $module_path if -f $module_path;
+    }
+}
+
+add_block_preprocessor(sub {
+    my $block = shift;
+    return if !@dynamic_modules;
+
+    my $main_config = join "\n", map { "load_module $_;" } @dynamic_modules;
+    $block->set_value("main_config", $main_config);
+});
+
+no_long_string();
+log_level 'debug';
+repeat_each(3);
+plan 'no_plan';
+run_tests();
+
+# COVERAGE NOTES on gaps found by the git-history CI audit
+# (kept above __DATA__ so they are not parsed into any test block):
+#
+# Gap 2 — f7e2ef3 ("clear Accept-Ranges in static module"), since
+# REVERSED: the handler now opts IN via r->allow_ranges = 1, covered
+# fail-first by TESTS 36–37. The history, for the record: f7e2ef3's
+# clear was a no-op (the handler never set r->allow_ranges, and
+# ngx_http_range_filter_module.c bails without it — empirically
+# verified at the time: identical responses on pre-fix and fixed
+# builds), and its rationale misread the RFC it cited. RFC 9110 §14.2
+# has ranges address the SELECTED REPRESENTATION — under
+# Content-Encoding: zstd, the .zst bytes — which is not an
+# "undecipherable fragment" hazard but exactly the coherent,
+# resumable-download semantics gzip_static has always provided by
+# setting r->allow_ranges = 1 (strong validator, byte-identical
+# representation on disk). The filter module's clear remains correct
+# for the opposite reason: a stream generated on the fly has nothing
+# stable to seek into.
+#
+# Gap 3 — HTTP/2 transport axis (8281baa bug-B class):
+# the build enables --with-http_v2_module but nothing tests the h2
+# path. HTTP/2 in nginx requires TLS + ALPN/Upgrade negotiation; h2c
+# (cleartext) does not work without Upgrade in nginx config. A Python
+# test without TLS cannot easily drive the h2 path. The bug-B defect
+# (empty-buffer, flush-state-machine, c->buffered accounting) is
+# already well-covered by test_proxy_unbuffered_truncation.py
+# (HTTP/1.1) and the matrix under ASAN; the h2-specific framing path
+# would be redundant effort without adding coverage for a new code
+# path. Left for future work when/if CI adds TLS test infrastructure.
+
+
+__DATA__
+
+
+=== TEST 1: zstd_static off
+--- config
+    location /test {
+        zstd_static off;
+        root ../suite;
+    }
+--- request
+GET /test
+--- response_headers
+Content-Length: 59738
+ETag: "5be17d33-e95a"
+!Content-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 2: zstd_static off (with accept-encoding header)
+--- config
+    location /test {
+        zstd_static off;
+        root ../suite;
+    }
+--- request
+GET /test
+Accept-Encoding: gzip,zstd
+--- response_headers
+Content-Length: 59738
+ETag: "5be17d33-e95a"
+!Content-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 3: zstd_static on
+--- config
+    location /test {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+Content-Length: 3717
+ETag: "5be17d33-e85"
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 4: zstd_static on (without accept-encoding header)
+--- config
+    location /test {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+GET /test
+--- response_headers
+Content-Length: 59738
+ETag: "5be17d33-e95a"
+!Content-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 5: zstd_static on (without zstd component in accept-encoding header)
+--- config
+    location /test {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip, br
+--- response_headers
+Content-Length: 59738
+ETag: "5be17d33-e95a"
+!Content-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 6: zstd_static always
+--- config
+    location /test {
+        zstd_static always;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip, br
+--- response_headers
+Content-Length: 3717
+ETag: "5be17d33-e85"
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 7: zstd_static always (without accept-encoding header)
+--- config
+    location /test {
+        zstd_static always;
+        root ../suite;
+    }
+--- request
+GET /test
+--- response_headers
+Content-Length: 3717
+ETag: "5be17d33-e85"
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 8: zstd_static always (without zstd component in accept-encoding header)
+--- config
+    location /test {
+        zstd_static always;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip, br
+--- response_headers
+Content-Length: 3717
+ETag: "5be17d33-e85"
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 9: zstd_static always (file does not exist)
+--- config
+    location /test2 {
+        zstd_static always;
+        root ../suite;
+    }
+--- request
+GET /test2
+--- more_headers
+Accept-Encoding: gzip, br
+--- error_code: 404
+
+
+
+=== TEST 10: zstd_static on (file does not exist)
+--- config
+    location /test2 {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+GET /test2
+--- more_headers
+Accept-Encoding: gzip, br
+--- error_code: 404
+
+
+
+=== TEST 11: zstd_static off (file does not exist)
+--- config
+    location /test2 {
+        zstd_static off;
+        root ../suite;
+    }
+--- request
+GET /test2
+--- more_headers
+Accept-Encoding: gzip, br
+--- error_code: 404
+
+
+
+=== TEST 12: zstd_static on with quality value q=0 (reject)
+--- config
+    location /test {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: zstd;q=0, gzip;q=1
+--- response_headers
+Content-Length: 59738
+ETag: "5be17d33-e95a"
+!Content-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 13: zstd_static on with quality value q=0.5 (accept lower)
+--- config
+    location /test {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: zstd;q=0.5
+--- response_headers
+Content-Length: 3717
+ETag: "5be17d33-e85"
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 14: zstd_static always with q=0 (still serve zst)
+--- config
+    location /test {
+        zstd_static always;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: zstd;q=0
+--- response_headers
+Content-Length: 3717
+ETag: "5be17d33-e85"
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 15: zstd_static on with gzip_vary and gzip support
+--- config
+    location /test {
+        zstd_static on;
+        gzip_vary on;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+Content-Length: 3717
+ETag: "5be17d33-e85"
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 16: zstd_static on with gzip_vary but no zstd support
+--- config
+    location /test {
+        zstd_static on;
+        gzip_vary on;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip
+--- response_headers
+Content-Length: 59738
+ETag: "5be17d33-e95a"
+!Content-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 17: zstd_static on - HEAD request
+--- config
+    location /test {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+HEAD /test
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Length: 3717
+ETag: "5be17d33-e85"
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 18: zstd_static on - POST request (not GET/HEAD)
+--- config
+    location /test {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+POST /test
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 405
+--- response_headers
+!Content-Encoding
+
+
+
+=== TEST 19: zstd_dict_file loads and serves correctly (filter path)
+# Regression for the untested zstd_dict_file feature, which had three
+# distinct historical bug fixes with NO test: 0fb40d9 (CDict leak on
+# cleanup), 50f27a8 (version-specific init error handling), f735a5d
+# (cleanup handler size). This is the first test that exercises a
+# dictionary at all: nginx must start with zstd_dict_file set and still
+# produce a valid compressed response.
+# zstd_dict_file is an http{}-context directive (NGX_HTTP_MAIN_CONF), so
+# it goes in --- http_config, not --- main_config (global, before http{}).
+# Relative paths resolve against the *configuration* prefix (conf/), while
+# --- user_files land in <servroot>/html, so use the absolute servroot
+# token Test::Nginx exports for this exact purpose.
+--- http_config
+    zstd_dict_file_unsafe on;
+    zstd_dict_file $TEST_NGINX_SERVER_ROOT/html/zstd.dict;
+--- config
+    location /filter {
+        zstd on;
+        zstd_min_length 1;
+        zstd_types text/plain;
+        proxy_pass http://127.0.0.1:$TEST_NGINX_SERVER_PORT/src;
+    }
+    location /src {
+        default_type text/plain;
+        return 200 "dictionary compressed body, long enough to compress\n";
+    }
+--- user_files
+>>> zstd.dict
+the quick brown fox jumps over the lazy dog 0123456789 dictionary sample payload for zstd training corpus padding padding padding
+--- request
+GET /filter
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 20: zstd_static handles a long URI without buffer overflow
+# Regression for 9789448 "buffer overflow when appending .zst extension".
+# A long request path stresses the .zst path-build reservation made via
+# ngx_http_map_uri_to_path(sizeof(".zst")). Missing file -> clean 404,
+# no crash, no ASAN abort (the ASAN test job runs this binary too).
+--- config
+    location /s/ {
+        zstd_static on;
+        root ../suite;
+    }
+--- request eval
+"GET /s/" . ("a" x 2000) . "/nonexistent-resource-name"
+--- error_code: 404
+--- response_headers
+!Content-Encoding
+--- no_error_log
+[alert]
+
+
+
+=== TEST 21: zstd_static rejects a file whose contents are not a zstd frame
+# Defence-in-depth: a .zst whose first 4 bytes are not the zstd magic
+# (truncated download, mistakenly renamed text, `cp foo.txt foo.zst`)
+# must NOT be served with Content-Encoding: zstd — the client would
+# receive an undecodable body. The handler pread()s the leading 4
+# bytes, checks them against ZSTD_MAGICNUMBER / ZSTD_MAGIC_SKIPPABLE_*,
+# and declines on mismatch. The fixture below contains plain ASCII
+# ("HELO ...") with no zstd magic; no uncompressed fallback file is
+# placed alongside it, so the request falls through to a clean 404.
+--- config
+    location /bogus {
+        zstd_static on;
+        root html;
+    }
+--- user_files
+>>> bogus.zst
+HELO this is not a zstd frame
+--- request
+GET /bogus
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 404
+--- response_headers
+!Content-Encoding
+--- error_log
+is not a zstd frame
+
+
+
+=== TEST 22: zstd_static always does NOT set Vary even with gzip_vary on
+# Locks intentional behaviour: in "always" mode the handler unconditionally
+# serves the precompressed .zst and never sets r->gzip_vary. Vary:
+# Accept-Encoding would mis-key shared caches for a response that does
+# not actually vary on Accept-Encoding (the same .zst comes back no
+# matter what the client sends), so the absence of Vary here is the
+# correct contract. TEST 6-8 cover "always" without gzip_vary; this
+# locks that adding gzip_vary on at the location does not flip the
+# behaviour by accident.
+--- config
+    gzip_vary on;
+    location /test {
+        zstd_static always;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip, br
+--- response_headers
+Content-Length: 3717
+ETag: "5be17d33-e85"
+Content-Encoding: zstd
+!Vary
+--- no_error_log
+[error]
+
+
+
+=== TEST 23: zstd_static rejects an empty .zst file
+# A zero-byte .zst cannot satisfy the 4-byte pread() magic check;
+# the handler must decline rather than serve an empty body with
+# Content-Encoding: zstd. TEST 21 covers the wrong-magic case;
+# this locks the truncated-to-zero edge specifically. Like TEST 21,
+# no uncompressed fallback is placed alongside empty.zst, so a
+# benign ENOENT on the fallback path is expected and not asserted
+# against.
+--- config
+    location /empty {
+        zstd_static on;
+        root html;
+    }
+--- user_files
+>>> empty.zst
+--- request
+GET /empty
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 404
+--- response_headers
+!Content-Encoding
+
+
+
+=== TEST 24: zstd_static declines a directory-style request
+# A request whose URI ends in "/" maps to a path with a trailing
+# slash; appending ".zst" would produce ".../.zst". The handler
+# short-circuits at the URI-suffix check (uri.data[uri.len - 1]
+# == '/') and declines without touching the filesystem, so the
+# request falls through to the normal directory-index machinery
+# rather than being answered with Content-Encoding: zstd. The
+# fallback then 403s the directory and logs the missing index file
+# — that log line is from the regular static handler, not from
+# zstd_static, and is expected here. The contract being locked is
+# only !Content-Encoding (i.e. zstd_static did not falsely claim
+# the response was zstd-encoded).
+--- config
+    location /dir/ {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+GET /dir/
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 404
+--- response_headers
+!Content-Encoding
+
+
+
+=== TEST 25: zstd_static on sets Vary even when declining for a non-accepting client
+# Subtle behaviour at static.c:204 — when zstd_static is "on" and
+# the .zst exists, the handler sets r->gzip_vary = 1 *before*
+# declining for a client that does not accept zstd. That keeps the
+# response cacheable by intermediaries that key on Vary, so a later
+# request from a zstd-capable client through the same shared cache
+# gets the encoded variant rather than the identity one. Without
+# this, a CDN that saw the identity response first would pin all
+# subsequent clients to it.
+--- config
+    gzip_vary on;
+    location /test {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip
+--- response_headers
+!Content-Encoding
+Vary: Accept-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 26: zstd_static serves a .zst under directio without a failed pread
+# Regression for the O_DIRECT magic-probe bug. With "directio" active the
+# open_file_cache opens the .zst with O_DIRECT; the 4-byte, unaligned
+# magic pread() then fails EINVAL, wrongly declining every .zst above the
+# threshold and spamming NGX_LOG_CRIT. The fix skips the probe when
+# of.is_directio. Assert the precompressed frame is still served (200 +
+# Content-Encoding: zstd) and no CRIT/[error] appears.
+#
+# NOTE: O_DIRECT support is filesystem-dependent (tmpfs may not honour it),
+# so this deterministically catches the "declined + CRIT" regression only
+# where O_DIRECT actually engages; everywhere else it still asserts correct
+# serving. directio 1 = every file >= 1 byte is eligible (test.zst is 3717B).
+--- config
+    location /test {
+        zstd_static on;
+        directio 1;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- error_code: 200
+--- no_error_log
+[error]
+
+
+
+=== TEST 27: zstd_static "on" declining does not suppress the gzip fallback
+# Regression for the gzip-fallback latch. ngx_http_zstd_ok() latches
+# r->gzip_tested=1 / r->gzip_ok=0 as a side effect; the static handler
+# used to call it (before the .zst existence check), so when the .zst was
+# absent it declined but left gzip permanently marked "not ok" for the
+# request. A later gzip filter/handler then short-circuited on the cached
+# decision and served identity instead of gzip. The fix routes the static
+# decision through the side-effect-free ngx_http_zstd_accepts().
+#
+# Reproduces with the always-present gzip *filter* (no gzip_static needed):
+# request a plain file that has NO sibling .zst. zstd_static declines; the
+# core static handler serves it; the gzip filter must still compress it.
+# Pre-fix: Content-Encoding is absent (gzip suppressed). Post-fix: gzip.
+--- config
+    location /gz/ {
+        zstd_static on;
+        gzip on;
+        gzip_min_length 1;
+        gzip_types text/plain;
+        root html;
+    }
+--- user_files
+>>> gz/plain.txt
+gzip fallback body long enough to exceed gzip_min_length and actually compress padding padding padding padding
+--- request
+GET /gz/plain.txt
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+Content-Encoding: gzip
+--- error_code: 200
+--- no_error_log
+[error]
+
+
+
+=== TEST 28: zstd_static coexists with gzip_static; .gz still served
+# Interop guard, sibling of TEST 27 but for the gzip_static *module*.
+# NOTE: unlike the gzip *filter* (TEST 27), gzip_static is a CONTENT_PHASE
+# handler. It is a built-in module, so its handler is pushed onto the
+# content-phase array before the dynamically-loaded zstd_static handler and
+# runs FIRST -- it serves the .gz before zstd_static ever runs, so the
+# ngx_http_zstd_ok() latch could not suppress it even on the pre-fix code.
+# (Verified: this test passes on both pre-fix and the fixed tree; the real
+# latch regression is covered by TEST 27 via the post-content gzip filter.)
+# Kept as a coexistence contract: with both directives on and a .gz but no
+# .zst present, zstd_static declines and gzip_static serves the .gz -- the
+# two static handlers must not fight over the request.
+#
+# The request has NO sibling .zst (so zstd_static declines) but DOES have a
+# real gzip-compressed plain.txt.gz (so gzip_static must serve it).
+--- config
+    location /gzs/ {
+        zstd_static on;
+        gzip_static on;
+        root html;
+    }
+--- user_files eval
+my $body = "gzip_static fallback body long enough to matter " x 4;
+my $gz;
+require IO::Compress::Gzip;
+IO::Compress::Gzip::gzip(\$body => \$gz)
+    or die "gzip failed: $IO::Compress::Gzip::GzipError";
+">>> gzs/plain.txt\n$body>>> gzs/plain.txt.gz\n$gz";
+--- request
+GET /gzs/plain.txt
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+Content-Encoding: gzip
+--- error_code: 200
+--- no_error_log
+[error]
+
+
+=== TEST 29: Content-Encoding entry leaves the headers_out chain terminated
+# Sibling of filter TEST 85 for the static module: the .zst sidecar path
+# pushes its own Content-Encoding entry and must terminate the header
+# chain the same way (see core ngx_http_gzip_static_module.c).
+--- config
+    location /test {
+        zstd_static on;
+        add_header X-Sent-Content-Encoding $sent_http_content_encoding;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+Content-Encoding: zstd
+X-Sent-Content-Encoding: zstd
+--- error_code: 200
+--- no_error_log
+[error]
+
+
+
+=== TEST 30: a .zst that is a DIRECTORY is declined, origin served instead
+# of.is_dir branch in the static handler. ngx_open_cached_file() succeeds on a
+# directory, so without the is_dir check the handler would proceed to serve a
+# directory fd as a response body. Creating "dir.txt.zst/" as a real directory
+# (via a file nested inside it) makes the sibling lookup hit a directory; the
+# handler must decline and let the plain origin be served.
+--- config
+    location /isdir/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files
+>>> isdir/dir.txt
+plain origin body served because the .zst sibling is a directory
+>>> isdir/dir.txt.zst/keep.txt
+this file only exists to make dir.txt.zst a directory
+--- request
+GET /isdir/dir.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+plain origin body served because the .zst sibling is a directory
+--- error_code: 200
+--- no_error_log
+[error]
+
+
+
+=== TEST 31: a .zst declaring a >8MB window is declined (streaming frame)
+# The frame header (built byte-by-byte from RFC 8878 §3.1.1.1) declares
+# a 128 MB decompression window: magic, descriptor 0x00 (no
+# Single_Segment), Window_Descriptor 0x88 = exponent 17 -> 1 << 27.
+# That is what a Node streaming encoder stamps at high levels when not
+# told the input size — the file decodes fine with the zstd CLI but
+# every browser rejects it before decoding, so the handler must decline
+# from the header alone (trailing zeros stand in for the never-read
+# block data) and let the identity origin be served.
+--- config
+    location /bw/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> bw/big.js\nbig-window stream body\n>>> bw/big.js.zst\n"
+. pack("C*", 0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x88, 0x00, 0x00, 0x00)
+--- request
+GET /bw/big.js
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+big-window stream body
+--- error_code: 200
+--- error_log
+big.js.zst
+declares a 134217728-byte decompression window
+above the 8 MB limit browsers enforce for Content-Encoding: zstd
+recompress with a window log <= 23
+
+
+
+=== TEST 32: a single-segment .zst with >8MB content size is declined
+# Single-segment frames carry no Window_Descriptor — the window IS the
+# frame content size, read from behind the optional dictionary id.
+# Descriptor 0xA0 = Single_Segment with a 4-byte content size; the
+# little-endian field declares 20 MB, over the browser cap, so the
+# handler must decline this layout too.
+--- config
+    location /bw/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> bw/single.js\nbig-window single-segment body\n>>> bw/single.js.zst\n"
+. pack("C*", 0x28, 0xB5, 0x2F, 0xFD, 0xA0, 0x00, 0x00, 0x40, 0x01,
+       0x00, 0x00, 0x00)
+--- request
+GET /bw/single.js
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+big-window single-segment body
+--- error_code: 200
+--- error_log
+single.js.zst
+declares a 20971520-byte decompression window
+above the 8 MB limit browsers enforce for Content-Encoding: zstd
+recompress with a window log <= 23
+
+
+
+=== TEST 33: the window check runs under directio too
+# The probe historically skipped O_DIRECT files (unaligned preads fail
+# EINVAL — see #75); it now uses an aligned read so validation still
+# runs. The .zst is padded past the "directio 512" threshold so the
+# open really is O_DIRECT, and the oversized declared window must be
+# declined the same as TEST 31. Verified fail-first: on the
+# directio-skip build this file is served as Content-Encoding: zstd and
+# every assertion here fails. The "aligned probe" debug line is the
+# positive witness that is_directio was really set for this request —
+# without it the block would also pass vacuously through the stack-read
+# path on filesystems where O_DIRECT does not take.
+--- config
+    location /bw/ {
+        zstd_static on;
+        directio 512;
+        root html;
+    }
+--- user_files eval
+">>> bw/dio.js\nbig-window directio body\n>>> bw/dio.js.zst\n"
+. pack("C*", 0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x88)
+. ("\0" x 1018)
+--- request
+GET /bw/dio.js
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+big-window directio body
+--- error_code: 200
+--- error_log
+dio.js.zst
+declares a 134217728-byte decompression window
+aligned probe on directio file
+
+
+
+=== TEST 34: the directio probe honors directio_alignment above the 4 KB floor
+# Review: the probe geometry must follow the operator's declared
+# alignment (the core copy filter honours clcf->directio_alignment the
+# same way) — a hardcoded 4 KB read fails EINVAL on storage configured
+# above that, and a failed validation read now DECLINES rather than
+# serving unvalidated. With 16 KB declared, the witness line must show
+# a 16384-byte probe and the oversized window must still be declined.
+--- config
+    location /bw/ {
+        zstd_static on;
+        directio 512;
+        directio_alignment 16k;
+        root html;
+    }
+--- user_files eval
+">>> bw/dioal.js\nbig-window directio alignment body\n>>> bw/dioal.js.zst\n"
+. pack("C*", 0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x88)
+. ("\0" x 1018)
+--- request
+GET /bw/dioal.js
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+big-window directio alignment body
+--- error_code: 200
+--- error_log
+dioal.js.zst
+declares a 134217728-byte decompression window
+16384-byte aligned probe on directio file
+
+
+
+=== TEST 35: concatenated frames are validated on the leading frame only
+# Contract pin for the documented scope (review): a valid small first
+# frame followed by an oversized second frame is SERVED — a regular
+# frame's header does not declare its compressed length, so the probe
+# cannot walk the sequence without decoding block chains. The README
+# scopes the guarantee to the leading frame and points at
+# `zstd -t --memory=8MB` as the complete pre-deploy check; this block
+# exists so any future change to that scope is a deliberate one.
+# First frame: 1 KB window, one raw last-block containing "hi\n".
+# Second frame: the 128 MB-window header from TEST 31.
+--- config
+    location /bw/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> bw/concat.js\nconcat origin body\n>>> bw/concat.js.zst\n"
+. pack("C*", 0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x19, 0x00, 0x00)
+. "hi\n"
+. pack("C*", 0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x88, 0x00, 0x00, 0x00)
+--- request
+GET /bw/concat.js
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+Content-Encoding: zstd
+--- error_code: 200
+--- no_error_log
+decompression window
+
+
+
+=== TEST 36: a served sidecar advertises Accept-Ranges: bytes
+# gzip_static parity (see gzip_static's r->allow_ranges = 1): the
+# representation is the .zst bytes and the validator is strong, so
+# static-side ranges are coherent — resumable downloads included.
+# Fails on builds without the opt-in: no allow_ranges, no header.
+--- config
+    location /test {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip, zstd
+--- response_headers
+Content-Encoding: zstd
+Accept-Ranges: bytes
+--- no_error_log
+[error]
+
+
+
+=== TEST 37: byte ranges slice the sidecar's bytes (206 + Content-Range)
+# RFC 9110 §14.2: ranges address the SELECTED REPRESENTATION — under
+# Content-Encoding: zstd that is the .zst bytes themselves, which a
+# client can fetch, resume and concatenate before decompressing. The
+# fixture is TEST 35's crafted 12-byte frame (magic + 1 KB window +
+# raw "hi\n" block), so the slice is byte-pinned: the first four bytes
+# are the frame magic. Unfixed code ignores Range and answers 200.
+--- config
+    location /rg/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> rg/tiny.js\ntiny origin body\n>>> rg/tiny.js.zst\n"
+. pack("C*", 0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x19, 0x00, 0x00)
+. "hi\n"
+--- request
+GET /rg/tiny.js
+--- more_headers
+Accept-Encoding: zstd
+Range: bytes=0-3
+--- error_code: 206
+--- response_headers
+Content-Encoding: zstd
+Content-Range: bytes 0-3/12
+--- response_body eval
+pack("C*", 0x28, 0xB5, 0x2F, 0xFD)
+--- no_error_log
+[error]

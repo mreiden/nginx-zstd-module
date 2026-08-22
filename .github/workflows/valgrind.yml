@@ -12,9 +12,9 @@ env:
   NGINX_VERSION: ""
 
 on:
-  pull_request:
-    branches: [master, main]
   workflow_dispatch: {}
+  # Called by ci.yml, the single PR entry point (step 15).
+  workflow_call: {}
 
 concurrency:
   group: valgrind-${{ github.workflow }}-${{ github.ref }}
@@ -26,7 +26,7 @@ permissions:
 jobs:
   memcheck-lite:
     name: Memcheck lite (60s soak)
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 45
     steps:
       - name: Checkout module
@@ -67,7 +67,7 @@ jobs:
           gnupghome="$(mktemp -d)"
           export GNUPGHOME="$gnupghome"
           chmod 700 "$gnupghome"
-          for keyfile in tools/keys/*.key; do
+          for keyfile in ci/tools/keys/*.key; do
             gpg --quiet --import "$keyfile" 2>/dev/null
           done
           gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
@@ -87,6 +87,6 @@ jobs:
         env:
           USE_VALGRIND: "1"
         run: |
-          bash tools/soak.sh \
+          bash ci/tools/soak.sh \
             "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx" \
             60 4

@@ -10,16 +10,16 @@ name: CI Deep
 #
 # Jobs: build-flavors (nginx mainline/stable + angie) · fuzz (14400s/target) ·
 #   memcheck soak · helgrind soak · scanners.
-#   * memcheck AND helgrind run under tools/soak.sh, which already passes
+#   * memcheck AND helgrind run under ci/tools/soak.sh, which already passes
 #     --suppressions=valgrind.suppress and --error-exitcode=99 for BOTH tools
-#     (see tools/soak.sh) — the drift-fix baseline for every module.
+#     (see ci/tools/soak.sh) — the drift-fix baseline for every module.
 #
 # build-flavors exists because build-test.yml (the fast PR gate) only builds
 # ONE pinned nginx version (mainline) — the module's README documents Angie
 # support and tracks nginx stable too, but nothing in CI actually built angie
 # or nginx stable until this job. It is here (monthly), not in the PR gate,
 # because each leg is a from-scratch configure+compile+Test::Nginx run and
-# three of them would blow the PR gate's budget. Uses tools/ci-build.sh, which
+# three of them would blow the PR gate's budget. Uses ci/tools/ci-build.sh, which
 # supports flavor+version args and sha256-verifies the tarball it downloads.
 #
 # Action pins (keep in sync with build-test.yml header):
@@ -52,7 +52,7 @@ permissions:
 jobs:
   build-flavors:
     name: Build & Test::Nginx (${{ matrix.flavor }} ${{ matrix.version }})
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -97,7 +97,7 @@ jobs:
             wget zstd libperl-dev cpanminus
 
       - name: Build server and dynamic modules
-        run: bash tools/ci-build.sh "${{ matrix.flavor }}" "${{ matrix.version }}"
+        run: bash ci/tools/ci-build.sh "${{ matrix.flavor }}" "${{ matrix.version }}"
 
       - name: Verify built modules
         run: |
@@ -118,7 +118,7 @@ jobs:
           cpanm -l ~/perl5 --notest Test::Nginx::Socket
           echo "PERL5LIB=$HOME/perl5/lib/perl5:$PERL5LIB" >> "$GITHUB_ENV"
 
-      - name: Run t/ (filter + static + conf-warn)
+      - name: Run ci/t/ (filter + static + conf-warn)
         env:
           # See build-test.yml's identical setting for why this must be 20,
           # not the ~2s Test::Nginx::Socket default.
@@ -128,23 +128,23 @@ jobs:
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
           cd "$GITHUB_WORKSPACE"
-          # t/01-static.t asserts on fixture mtimes (Last-Modified/If-Modified-Since);
+          # ci/t/01-static.t asserts on fixture mtimes (Last-Modified/If-Modified-Since);
           # pin them to a fixed timestamp, same as build-test.yml's tests job.
-          touch -d @1541504307 t/suite/test t/suite/test.zst
+          touch -d @1541504307 ci/t/suite/test ci/t/suite/test.zst
           export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-${{ matrix.flavor }}-${{ matrix.version }}"
           mkdir -p "$TEST_NGINX_SERVROOT"
-          prove -v t/00-filter.t t/02-conf-warn.t
-          # 01-static.t serves fixtures via "root ../../t/suite", which only
-          # resolves when the servroot sits two levels under the checkout —
-          # a /tmp servroot makes every static case 404. Same split as
-          # build-test.yml's tests job.
-          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/t/servroot-static"
+          prove -v ci/t/00-filter.t ci/t/02-conf-warn.t
+          # 01-static.t serves fixtures via "root ../suite", resolved against
+          # the servroot's PARENT, so the servroot must be a sibling of
+          # ci/t/suite — i.e. inside ci/t/. A /tmp servroot makes every static
+          # case 404. Same split as build-test.yml's tests job.
+          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static"
           mkdir -p "$TEST_NGINX_SERVROOT"
-          prove -v t/01-static.t
+          prove -v ci/t/01-static.t
 
   fuzz:
     name: Fuzz (Accept-Encoding, long)
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 600
     steps:
       - name: Checkout module
@@ -184,12 +184,12 @@ jobs:
           fi
 
       - name: Build fuzz target
-        run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz/fuzz_accept_encoding"
+        run: bash ci/fuzz/build.sh "$GITHUB_WORKSPACE/ci/fuzz/fuzz_accept_encoding"
 
       - name: Fuzz
         run: |
           set -euo pipefail
-          cd fuzz
+          cd ci/fuzz
           set +e
           ./fuzz_accept_encoding \
             -max_total_time="$FUZZ_SECS" \
@@ -205,7 +205,7 @@ jobs:
       - name: Minimize + persist corpus
         if: success()
         run: |
-          cd fuzz
+          cd ci/fuzz
           mkdir -p corpus-min
           ./fuzz_accept_encoding -merge=1 corpus-min/ corpus/
           echo "merged: $(find corpus-min -type f | wc -l) units"
@@ -215,7 +215,7 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-deep-crashes
-          path: ${{ github.workspace }}/fuzz/crash-*
+          path: ${{ github.workspace }}/ci/fuzz/crash-*
           retention-days: 30
 
       - name: Upload minimized corpus
@@ -223,7 +223,7 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-corpus
-          path: ${{ github.workspace }}/fuzz/corpus-min
+          path: ${{ github.workspace }}/ci/fuzz/corpus-min
           retention-days: 30
 
       - name: Notify Discord on failure
@@ -240,7 +240,7 @@ jobs:
 
   memcheck:
     name: Valgrind Memcheck soak
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -284,7 +284,7 @@ jobs:
         env:
           USE_VALGRIND: "1"
         run: |
-          bash tools/soak.sh \
+          bash ci/tools/soak.sh \
             "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx" 300 4
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
@@ -300,7 +300,7 @@ jobs:
 
   helgrind:
     name: Valgrind Helgrind soak
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
@@ -344,7 +344,7 @@ jobs:
         env:
           USE_HELGRIND: "1"
         run: |
-          bash tools/soak.sh \
+          bash ci/tools/soak.sh \
             "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx" 300 4
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
@@ -360,7 +360,7 @@ jobs:
 
   scanners:
     name: Security scanners
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module
@@ -399,8 +399,8 @@ jobs:
       - name: flawfinder
         run: |
           flawfinder --minlevel=1 \
-            "$GITHUB_WORKSPACE/filter/ngx_http_zstd_filter_module.c" \
-            "$GITHUB_WORKSPACE/static/ngx_http_zstd_static_module.c" 2>&1 | tee flawfinder.log
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_filter_module.c" \
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_static_module.c" 2>&1 | tee flawfinder.log
       - name: clang-tidy (cert-*, security.*)
         run: |
           set -euo pipefail
@@ -409,8 +409,8 @@ jobs:
             -I$N/src/os/unix -I$N/objs -I$N/src/http -I$N/src/http/modules -I$N/src/http/v2 -I/usr/include"
           status=0
           for f in \
-            "$GITHUB_WORKSPACE/filter/ngx_http_zstd_filter_module.c" \
-            "$GITHUB_WORKSPACE/static/ngx_http_zstd_static_module.c"; do
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_filter_module.c" \
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_static_module.c"; do
             # shellcheck disable=SC2086,SC2046
             clang-tidy "$f" \
               --checks='-*,cert-*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \
