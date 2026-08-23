@@ -12,9 +12,9 @@ env:
   NGINX_VERSION: ""
 
 on:
-  pull_request:
-    branches: [master, main]
   workflow_dispatch: {}
+  # Called by ci.yml, the single PR entry point (step 15).
+  workflow_call: {}
 
 concurrency:
   group: valgrind-${{ github.workflow }}-${{ github.ref }}
@@ -26,11 +26,13 @@ permissions:
 jobs:
   memcheck-lite:
     name: Memcheck lite (60s soak)
-    runs-on: [self-hosted, builder02, lxc]
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 45
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Resolve latest mainline nginx
         run: |
@@ -43,6 +45,14 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # builder02 apt profile: loose timeouts — the box runs jobs
+          # concurrently and never talks to the Azure mirror (PR #121)
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
           sudo apt-get update
           sudo apt-get install -y \
             build-essential curl libpcre2-dev libzstd-dev pkg-config \
@@ -59,7 +69,7 @@ jobs:
           gnupghome="$(mktemp -d)"
           export GNUPGHOME="$gnupghome"
           chmod 700 "$gnupghome"
-          for keyfile in tools/keys/*.key; do
+          for keyfile in ci/tools/keys/*.key; do
             gpg --quiet --import "$keyfile" 2>/dev/null
           done
           gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
@@ -79,6 +89,6 @@ jobs:
         env:
           USE_VALGRIND: "1"
         run: |
-          bash tools/soak.sh \
+          bash ci/tools/soak.sh \
             "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx" \
             60 4

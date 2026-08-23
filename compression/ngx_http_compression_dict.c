@@ -21,7 +21,7 @@
  * hashes included, the mandated compute doubling as the free audit —
  * so there is no verbatim fast path to hide slow hashing behind.
  */
-#include "../ngx_http_zstd_sha256.h"
+#include "../src/ngx_http_zstd_sha256.h"
 
 
 extern ngx_module_t  ngx_http_compression_filter_module;
