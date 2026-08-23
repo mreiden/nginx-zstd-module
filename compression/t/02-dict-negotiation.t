@@ -636,3 +636,81 @@ qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
 Content-Encoding: dcz
 --- error_log
 the file's computed hash wins
+
+
+=== TEST 19: duplicate Sec-Fetch-Site fails closed (agreeable value LAST)
+# Parent's #140, ported — with the hazard order inverted for this walk.
+# Neither header is in nginx's headers_in table, so duplicates chain
+# through to the module instead of being rejected. This walk keeps the
+# LAST occurrence, so the dangerous shape here is a smuggled/merged
+# duplicate APPENDING same-origin after a truthful cross-site: pre-fix
+# the appended value won and the §8.3 gate switched off (this test
+# answered dcz). More than one occurrence now refuses the dictionary
+# coding outright; a browser never sends two, so nothing real degrades.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "dup sec-fetch fixture body, long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: cross-site\nSec-Fetch-Site: same-origin}
+--- response_headers
+Content-Encoding: zstd
+
+
+=== TEST 19b: duplicate Sec-Fetch-Site fails closed regardless of order
+# The agreeable value first: last-match already refused this shape (the
+# cross-site line won), so this passes pre-fix too — kept because it
+# pins the refusal as order-independent rather than an accident of
+# which duplicate the walk happens to keep.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "dup sec-fetch fixture body, long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: same-origin\nSec-Fetch-Site: cross-site}
+--- response_headers
+Content-Encoding: zstd
+
+
+=== TEST 19c: duplicate Available-Dictionary fails closed
+# Same rule for the other un-tabled header: two AD lines — even
+# identical, valid ones — refuse the dictionary coding. Pre-fix the
+# last line silently decided the negotiation.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "dup available-dictionary fixture body to compress\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nAvailable-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: zstd

@@ -302,7 +302,7 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
     u_char                         raw[36];
     u_char                        *p, *last;
     ngx_str_t                      b64, dst;
-    ngx_uint_t                     i;
+    ngx_uint_t                     i, ad_n, sfs_n;
     ngx_list_part_t               *part;
     ngx_table_elt_t               *h, *ad, *sfs;
     ngx_http_compression_dict_t  **list;
@@ -315,6 +315,8 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
      * one generic list walk collects both */
     ad = NULL;
     sfs = NULL;
+    ad_n = 0;
+    sfs_n = 0;
     part = &r->headers_in.headers.part;
     h = part->elts;
 
@@ -335,6 +337,7 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
                                sizeof("Available-Dictionary") - 1) == 0)
         {
             ad = &h[i];
+            ad_n++;
 
         } else if (h[i].key.len == sizeof("Sec-Fetch-Site") - 1
                    && ngx_strncasecmp(h[i].key.data,
@@ -342,7 +345,30 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
                                       sizeof("Sec-Fetch-Site") - 1) == 0)
         {
             sfs = &h[i];
+            sfs_n++;
         }
+    }
+
+    /*
+     * Fail closed on duplicates (parent's #140, ported): neither header
+     * is in nginx's ngx_http_headers_in table, so neither gets
+     * ngx_http_process_unique_header_line's duplicate rejection — a
+     * request can reach this walk carrying two of either, and the walk
+     * above keeps the LAST occurrence. For Sec-Fetch-Site that is the
+     * RFC 9842 §8.3 cross-origin partitioning gate: a proxy that merges
+     * a client-supplied duplicate, or a request-smuggling desync, must
+     * not be able to switch the gate off by APPENDING an agreeable
+     * value (the mirror image of the parent's first-match hazard).
+     * Both headers are single-valued by their specifications and a
+     * browser never sends either twice, so refusing the dictionary
+     * coding costs nothing — the response degrades to the base coding.
+     */
+    if (ad_n > 1 || sfs_n > 1) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "compression: duplicate negotiation header "
+                       "(Available-Dictionary x%ui, Sec-Fetch-Site x%ui), "
+                       "dictionary coding refused", ad_n, sfs_n);
+        return NULL;
     }
 
     if (ad == NULL || ad->value.len == 0) {

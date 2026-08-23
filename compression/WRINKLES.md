@@ -697,6 +697,34 @@ directions. Ported back here:
   paths still forced, roundtrips still gate, witness assertions
   skipped. Retire the flag when the upstream fix lands.
 
+### 32. Duplicate negotiation headers fail closed (parent's #140, ported)
+
+A security parity port surfaced by the 2026-08-23 master sync. Neither
+Available-Dictionary nor Sec-Fetch-Site is in nginx's
+ngx_http_headers_in table, so neither gets
+ngx_http_process_unique_header_line's duplicate rejection — a request
+can reach match_dict carrying two of either, chained on the headers
+list. The parent's lookup kept the FIRST occurrence; ours kept the
+LAST (`sfs = &h[i]` overwrote per hit). Same vulnerability class,
+mirror-image hazard order: where the parent's gate fell to a
+PREPENDED agreeable value, ours fell to an APPENDED one — a proxy
+that merges a client-supplied duplicate, or a request-smuggling
+desync, could switch the RFC 9842 §8.3 cross-origin partition gate
+off. The walk now counts occurrences and refuses the dictionary
+coding on more than one of either header; both are single-valued by
+specification and browsers never send two, so nothing real degrades
+(the response falls back to the base coding).
+
+Pinned by t/02 TESTs 19/19b/19c, with the fail-first order matched to
+THIS walk's hazard: pre-fix, cross-site-then-same-origin answered dcz
+(TEST 19 red) and duplicate Available-Dictionary let the last line
+decide (19c red); 19b (agreeable-first) passes either way and is kept
+to pin order-independence. The port lesson generalizes: when porting
+a security fix across a design difference (first-match vs
+last-match), re-derive the attack order for the local code — copying
+the parent's test vectors verbatim would have produced tests that
+pass against the unfixed module.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep
