@@ -51,6 +51,15 @@ ngx_http_zstd_dcz_dict_hash(const u_char *data, size_t len,
 #define NGX_HTTP_ZSTD_DCZ_HEADER_LEN  (8 + NGX_HTTP_ZSTD_SHA256_DIGEST_LEN)
 
 /*
+ * ngx_http_zstd_dcz_decode_digest()'s scratch/output buffer size. Must
+ * stay >= 48: an Available-Dictionary byte-sequence up to the 44-char
+ * length ceiling can carry unpadded base64 that decodes to 33 bytes
+ * (one past NGX_HTTP_ZSTD_SHA256_DIGEST_LEN) before the post-decode
+ * length check runs, so the destination buffer must have that headroom.
+ */
+#define NGX_HTTP_ZSTD_DCZ_DECODE_BUF_LEN  48
+
+/*
  * RFC 9842 §2.2.2: a dcz client guarantees a decode window of at least
  * max(8 MB, 1.25 x dictionary size). Never exceeding 2^23 (8 MB) keeps
  * every emitted frame inside the guarantee for any dictionary size, so
@@ -207,9 +216,19 @@ typedef struct {
 } ngx_http_zstd_ctx_t;
 
 
-typedef struct {
-    ngx_conf_post_handler_pt  post_handler;
-} ngx_http_zstd_comp_level_bounds_t;
+/*
+ * zstd_comp_level cannot use NGX_CONF_UNSET as its "not configured"
+ * marker: NGX_CONF_UNSET is -1, and -1 is itself a valid, documented
+ * compression level (ZSTD_minCLevel()..-1, see README). With the shared
+ * sentinel, "zstd_comp_level -1;" was indistinguishable from an absent
+ * directive, so the merge below silently replaced it with the inherited
+ * value or the default 3 -- and the duplicate-directive guard in
+ * ngx_conf_zstd_set_num_slot_with_negatives() could never fire for it.
+ * The value is out of band for every libzstd: ZSTD_minCLevel() is
+ * -131072 at its most extreme, far above the type minimum. nginx defines
+ * NGX_MAX_INT_T_VALUE but no signed minimum, so derive it.
+ */
+#define NGX_HTTP_ZSTD_LEVEL_UNSET  (-NGX_MAX_INT_T_VALUE - 1)
 
 
 static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
@@ -270,7 +289,8 @@ static ngx_int_t ngx_http_zstd_body_filter(ngx_http_request_t *r,
 static ngx_int_t ngx_http_zstd_filter_add_data(ngx_http_request_t *r,
     ngx_http_zstd_ctx_t *ctx);
 static ngx_int_t ngx_http_zstd_filter_get_buf(ngx_http_request_t *r,
-    ngx_http_zstd_ctx_t *ctx);
+    ngx_http_zstd_ctx_t *ctx,
+    ngx_http_zstd_loc_conf_t *zlcf);
 static ngx_int_t ngx_http_zstd_set_param(ngx_http_request_t *r,
     ZSTD_CCtx *cctx, ZSTD_cParameter param, int value, const char *name);
 static ngx_int_t ngx_http_zstd_filter_init_cctx(ngx_http_request_t *r,
@@ -299,6 +319,10 @@ static char *ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static void ngx_http_zstd_cleanup_dict(void *data);
 static void ngx_http_zstd_cleanup_cctx(void *data);
+static void ngx_http_zstd_release_cctx(void *data);
+static ngx_int_t ngx_http_zstd_acquire_cctx(ngx_http_request_t *r,
+    ngx_http_zstd_ctx_t *ctx, ngx_http_zstd_loc_conf_t *zlcf);
+static void ngx_http_zstd_exit_process(ngx_cycle_t *cycle);
 static char *ngx_http_zstd_dcz_dict_file(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_table_elt_t *ngx_http_zstd_find_request_header(
@@ -309,7 +333,69 @@ static ngx_int_t ngx_http_zstd_filter_emit_dcz_header(ngx_http_request_t *r,
     ngx_http_zstd_ctx_t *ctx);
 
 
-static ngx_http_zstd_comp_level_bounds_t  ngx_http_zstd_comp_level_bounds = {
+/*
+ * Worker-lifetime CCtx cache.
+ *
+ * ZSTD_createCCtx() plus the first-use workspace allocation is 34-75% of the
+ * per-response libzstd CPU on typical body sizes (measured, libzstd 1.5.7:
+ * ~1.6us of 3.1us at level 6 / 8 KB; ~10.8us of 15.0us at level 6 / 64 KB).
+ * Since ngx_http_zstd_filter_init_cctx() already does a full
+ * ZSTD_reset_session_and_parameters() and re-applies every parameter on each
+ * request, a context carried across requests is byte-for-byte equivalent on
+ * the wire to a freshly created one -- the creation is pure overhead.
+ *
+ * Why this does NOT reintroduce the shared-context bug 774b4a5 fixed: that
+ * commit's defect was a context shared between CONCURRENT requests (interleaved
+ * compression state). Here the cache lends the context to exactly one
+ * request at a time -- `busy` is set on loan and cleared by the request
+ * pool's cleanup handler -- so any second concurrent claimant (a subrequest
+ * compressing while the main request is mid-stream) transparently gets its
+ * own per-request context instead. The per-request ownership model is
+ * preserved; only the allocation is amortised.
+ *
+ * Why there is no runtime memory cap: ZSTD_sizeof_CCtx() does not shrink on
+ * reset, so an unbounded cache would pin each worker's RSS at its
+ * largest-ever footprint. The cache is therefore keyed on the COMPLETE set
+ * of parameters that drive that workspace, and every one of them is fixed at
+ * config load: zstd_comp_level, zstd_long and zstd_window_log.
+ *
+ * An earlier revision keyed on the level alone, on a measurement that said
+ * windowLog did not move ZSTD_sizeof_CCtx() at a fixed level. That
+ * measurement was taken with a known pledged source size, which clamps the
+ * window to the input; it does not hold on this module's path, where the
+ * body length is generally unknown to libzstd. Re-measured on libzstd 1.5.7
+ * with a streaming, unknown-size compression at level 6:
+ *
+ *     zstd_long  zstd_window_log   ZSTD_sizeof_CCtx()
+ *     off        (unset)                    5 498 401
+ *     off        20                         4 449 825
+ *     off        27                       137 618 977
+ *     on         (unset)                  154 551 841
+ *     on         20                         4 606 497
+ *     on         27                       154 551 841
+ *
+ * So both zstd_long and zstd_window_log move the retained workspace by more
+ * than thirty times at one level, and the growth is permanent: walking a
+ * context through the 154 MB profile and back to the 4 MB one leaves
+ * ZSTD_sizeof_CCtx() at 154 MB. Lending one worker context across locations
+ * with differing profiles would raise the worker's floor to the largest
+ * profile ever served and silently defeat a lower location's
+ * zstd_max_cctx_memory budget, which is computed from exactly these three
+ * values at config load.
+ *
+ * Keying on all three keeps the cached context's high-water mark equal to
+ * the figure config load already vetted for that profile. A location whose
+ * profile differs in any of the three does not reuse the cache; it takes the
+ * per-request path, which is the pre-existing safe behaviour.
+ */
+static ZSTD_CCtx  *ngx_http_zstd_worker_cctx;
+static ngx_int_t   ngx_http_zstd_worker_cctx_level;
+static ngx_flag_t  ngx_http_zstd_worker_cctx_long_mode;
+static ngx_int_t   ngx_http_zstd_worker_cctx_window_log;
+static ngx_uint_t  ngx_http_zstd_worker_cctx_busy;
+
+
+static ngx_conf_post_t  ngx_http_zstd_comp_level_bounds = {
     ngx_http_zstd_comp_level
 };
 
@@ -471,7 +557,7 @@ ngx_module_t  ngx_http_zstd_filter_module = {
     NULL,                                   /* init process */
     NULL,                                   /* init thread */
     NULL,                                   /* exit thread */
-    NULL,                                   /* exit process */
+    ngx_http_zstd_exit_process,             /* exit process */
     NULL,                                   /* exit master */
     NGX_MODULE_V1_PADDING
 };
@@ -748,9 +834,9 @@ static ngx_table_elt_t *
 ngx_http_zstd_find_request_header(ngx_http_request_t *r, const char *name,
     size_t len, ngx_uint_t *count)
 {
-    ngx_uint_t        i;
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h, *found;
+    ngx_uint_t              i;
+    const ngx_list_part_t  *part;
+    ngx_table_elt_t        *h, *found;
 
     part = &r->headers_in.headers.part;
     h = part->elts;
@@ -806,14 +892,78 @@ ngx_http_zstd_find_request_header(ngx_http_request_t *r, const char *name,
  *
  * Dictionary-ID is intentionally not parsed: it only matters when the
  * operator sets id= in Use-As-Dictionary, and the hash alone is a
- * complete, collision-free key for the lookup below.
+ * complete, collision-resistant key for the lookup below. (SHA-256 is
+ * collision-RESISTANT, not collision-free -- the distinction does not
+ * weaken the lookup, which indexes public dictionary identities, but the
+ * stronger claim is not one SHA-256 makes.)
  */
+/*
+ * Decode an RFC 8941 byte-sequence Available-Dictionary header value
+ * (":base64:") into a fixed-size digest buffer.
+ *
+ * Pulled out of ngx_http_zstd_dcz_negotiate() below as a pure function of
+ * its inputs: no ngx_http_request_t, no connection log, no config
+ * structures. That is deliberate -- it is the exact slice of the
+ * negotiation logic that parses attacker-controlled bytes (the base64
+ * length/prefix gate plus ngx_decode_base64() itself), and the
+ * request/config entanglement in the caller is what previously made it
+ * impossible to fuzz in isolation.
+ *
+ * `raw` is the full header value including the wrapping colons, exactly
+ * as ngx_http_zstd_dcz_negotiate() receives it in h->value. `out` must
+ * point at a buffer of at least NGX_HTTP_ZSTD_DCZ_DECODE_BUF_LEN (48)
+ * bytes -- NOT just NGX_HTTP_ZSTD_SHA256_DIGEST_LEN (32) -- and receives
+ * the decoded digest on success. The larger size is load-bearing: the
+ * length gate below only bounds the base64 *text* to 44 characters, and
+ * an unpadded 44-character input (no trailing "=") decodes to 33 bytes,
+ * one past a tight 32-byte buffer, before the post-decode length check
+ * ever runs. A caller-supplied buffer smaller than
+ * NGX_HTTP_ZSTD_DCZ_DECODE_BUF_LEN reintroduces that overflow.
+ *
+ * Returns NGX_OK when raw is a well-formed byte-sequence decoding to
+ * exactly NGX_HTTP_ZSTD_SHA256_DIGEST_LEN bytes (written to *out*),
+ * NGX_DECLINED otherwise (malformed byte-sequence framing, or a decoded
+ * length other than 32 bytes) -- *out* is left untouched on NGX_DECLINED.
+ */
+static ngx_int_t
+ngx_http_zstd_dcz_decode_digest(ngx_str_t raw,
+    u_char out[NGX_HTTP_ZSTD_DCZ_DECODE_BUF_LEN])
+{
+    ngx_str_t   b64, decoded;
+
+    /*
+     * RFC 8941 byte sequence: colon-delimited standard base64. 32 bytes
+     * encode to 44 characters with padding (43 without); anything longer
+     * cannot be a SHA-256 and is rejected before decoding.
+     */
+    if (raw.len < 2
+        || raw.data[0] != ':'
+        || raw.data[raw.len - 1] != ':'
+        || raw.len - 2 > 44)
+    {
+        return NGX_DECLINED;
+    }
+
+    b64.data = raw.data + 1;
+    b64.len = raw.len - 2;
+
+    decoded.data = out;
+
+    if (ngx_decode_base64(&decoded, &b64) != NGX_OK
+        || decoded.len != NGX_HTTP_ZSTD_SHA256_DIGEST_LEN)
+    {
+        return NGX_DECLINED;
+    }
+
+    return NGX_OK;
+}
+
+
 static ngx_http_zstd_dcz_dict_t *
 ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
     ngx_http_zstd_loc_conf_t *zlcf)
 {
-    u_char                     buf[48];
-    ngx_str_t                  b64, decoded;
+    u_char                     buf[NGX_HTTP_ZSTD_DCZ_DECODE_BUF_LEN];
     ngx_uint_t                 i, nheaders;
     ngx_table_elt_t           *h, *ae;
     ngx_http_zstd_dcz_dict_t  *dicts;
@@ -856,7 +1006,10 @@ ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
     /*
      * RFC 8941 byte sequence: colon-delimited standard base64. 32 bytes
      * encode to 44 characters with padding (43 without); anything longer
-     * cannot be a SHA-256 and is rejected before decoding.
+     * cannot be a SHA-256 and is rejected before decoding. The framing
+     * check and ngx_decode_base64() call live in
+     * ngx_http_zstd_dcz_decode_digest() so that attacker-controlled-byte
+     * slice can be fuzzed independently of ngx_http_request_t.
      */
     if (h->value.len < 2
         || h->value.data[0] != ':'
@@ -869,14 +1022,7 @@ ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
         return NULL;
     }
 
-    b64.data = h->value.data + 1;
-    b64.len = h->value.len - 2;
-
-    decoded.data = buf;
-
-    if (ngx_decode_base64(&decoded, &b64) != NGX_OK
-        || decoded.len != NGX_HTTP_ZSTD_SHA256_DIGEST_LEN)
-    {
+    if (ngx_http_zstd_dcz_decode_digest(h->value, buf) != NGX_OK) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "zstd dcz: Available-Dictionary \"%V\" is not a "
                        "base64 SHA-256", &h->value);
@@ -922,7 +1068,7 @@ ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
     dicts = zlcf->dcz_dicts->elts;
 
     for (i = 0; i < zlcf->dcz_dicts->nelts; i++) {
-        if (ngx_memcmp(dicts[i].hash, decoded.data,
+        if (ngx_memcmp(dicts[i].hash, buf,
                        NGX_HTTP_ZSTD_SHA256_DIGEST_LEN) == 0)
         {
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1071,7 +1217,7 @@ ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 goto failed;
             }
 
-            rc = ngx_http_zstd_filter_get_buf(r, ctx);
+            rc = ngx_http_zstd_filter_get_buf(r, ctx, zlcf);
 
             if (rc == NGX_ERROR) {
                 goto failed;
@@ -1452,10 +1598,10 @@ ngx_http_zstd_filter_add_data(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
 
 
 static ngx_int_t
-ngx_http_zstd_filter_get_buf(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
+ngx_http_zstd_filter_get_buf(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx,
+    ngx_http_zstd_loc_conf_t *zlcf)
 {
-    ngx_chain_t               *cl;
-    ngx_http_zstd_loc_conf_t  *zlcf;
+    ngx_chain_t  *cl;
 
     /*
      * Keep using the current output buffer only if it still exists AND has
@@ -1474,8 +1620,6 @@ ngx_http_zstd_filter_get_buf(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     if (ctx->out_buf != NULL && ctx->buffer_out.pos < ctx->buffer_out.size) {
         return NGX_OK;
     }
-
-    zlcf = ngx_http_get_module_loc_conf(r, ngx_http_zstd_filter_module);
 
     if (ctx->free) {
         cl = ctx->free;
@@ -1622,10 +1766,106 @@ ngx_http_zstd_set_param(ngx_http_request_t *r, ZSTD_CCtx *cctx,
 
 
 /*
- * Configure a per-request CCtx on first body data.
- * The CCtx is allocated outside the request pool but attached to the request
- * cleanup chain, so overlapping requests in one worker never share libzstd
- * streaming state.
+ * Give this request a CCtx: either the worker's cached one on loan, or a
+ * fresh per-request context.
+ *
+ * Extracted from ngx_http_zstd_filter_init_cctx() so the loan bookkeeping --
+ * which cleanup handler owns the context, and when `busy` may be set -- reads
+ * as one unit instead of as five branches inside the parameter-setting code.
+ *
+ * On success ctx->cctx is non-NULL and a pool cleanup owns it: either
+ * ngx_http_zstd_release_cctx (returns the loan) or ngx_http_zstd_cleanup_cctx
+ * (frees an unshared context).
+ */
+static ngx_int_t
+ngx_http_zstd_acquire_cctx(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx,
+    ngx_http_zstd_loc_conf_t *zlcf)
+{
+    ngx_uint_t           borrowed;
+    ngx_pool_cleanup_t  *cln;
+
+    /*
+     * The cleanup slot is registered BEFORE the context is claimed, so a
+     * borrowed context can never be stranded with busy set: an allocation
+     * failure here happens while the cache is still untouched.
+     */
+    cln = ngx_pool_cleanup_add(r->pool, 0);
+    if (cln == NULL) {
+        return NGX_ERROR;
+    }
+
+    borrowed = 0;
+
+    /*
+     * Borrow the worker context when it is free and was built for this
+     * location's complete memory-affecting profile: compression level, long
+     * mode and window log. A mismatch in any of the three takes the
+     * per-request path rather than re-parameterising the cache: the retained
+     * workspace is driven by all three and never shrinks, so honouring a
+     * higher-memory location here would raise the worker's floor for every
+     * subsequent request of every other location.
+     */
+    if (!ngx_http_zstd_worker_cctx_busy
+        && ngx_http_zstd_worker_cctx != NULL
+        && ngx_http_zstd_worker_cctx_level == zlcf->level
+        && ngx_http_zstd_worker_cctx_long_mode == zlcf->long_mode
+        && ngx_http_zstd_worker_cctx_window_log == zlcf->window_log)
+    {
+        ctx->cctx = ngx_http_zstd_worker_cctx;
+        borrowed = 1;
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "zstd: reusing worker cctx %p", ctx->cctx);
+
+    } else {
+        ctx->cctx = ZSTD_createCCtx();
+        if (ctx->cctx == NULL) {
+            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                          "zstd: ZSTD_createCCtx() failed");
+            return NGX_ERROR;
+        }
+
+        /*
+         * Seed an empty cache so subsequent requests amortise. Only an empty
+         * cache is populated -- a live cached context is never evicted
+         * mid-flight, and one already on loan is left alone.
+         */
+        if (ngx_http_zstd_worker_cctx == NULL) {
+            ngx_http_zstd_worker_cctx = ctx->cctx;
+            ngx_http_zstd_worker_cctx_level = zlcf->level;
+            ngx_http_zstd_worker_cctx_long_mode = zlcf->long_mode;
+            ngx_http_zstd_worker_cctx_window_log = zlcf->window_log;
+            borrowed = 1;
+        }
+
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "zstd: created cctx %p (cached:%ui)",
+                       ctx->cctx, borrowed);
+    }
+
+    if (borrowed) {
+        ngx_http_zstd_worker_cctx_busy = 1;
+        cln->handler = ngx_http_zstd_release_cctx;
+
+    } else {
+        cln->handler = ngx_http_zstd_cleanup_cctx;
+    }
+
+    cln->data = ctx->cctx;
+
+    return NGX_OK;
+}
+
+
+/*
+ * Configure this request's CCtx on first body data.
+ *
+ * The context comes from ngx_http_zstd_acquire_cctx() -- either the worker's
+ * cached one on loan or a fresh per-request one -- and is attached to the
+ * request cleanup chain either way, so overlapping requests in one worker
+ * never share libzstd streaming state. Every parameter is (re-)applied here
+ * after a full reset, which is what makes a carried-over context equivalent
+ * to a freshly created one.
  */
 static ngx_int_t
 ngx_http_zstd_filter_init_cctx(ngx_http_request_t *r,
@@ -1637,25 +1877,10 @@ ngx_http_zstd_filter_init_cctx(ngx_http_request_t *r,
 
     zlcf = ngx_http_get_module_loc_conf(r, ngx_http_zstd_filter_module);
 
-    if (ctx->cctx == NULL) {
-        ngx_pool_cleanup_t  *cln;
-
-        ctx->cctx = ZSTD_createCCtx();
-        if (ctx->cctx == NULL) {
-            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                          "zstd: ZSTD_createCCtx() failed");
-            return NGX_ERROR;
-        }
-
-        cln = ngx_pool_cleanup_add(r->pool, 0);
-        if (cln == NULL) {
-            ZSTD_freeCCtx(ctx->cctx);
-            ctx->cctx = NULL;
-            return NGX_ERROR;
-        }
-
-        cln->handler = ngx_http_zstd_cleanup_cctx;
-        cln->data = ctx->cctx;
+    if (ctx->cctx == NULL
+        && ngx_http_zstd_acquire_cctx(r, ctx, zlcf) != NGX_OK)
+    {
+        return NGX_ERROR;
     }
 
     cctx = ctx->cctx;
@@ -1951,7 +2176,7 @@ ngx_http_zstd_create_loc_conf(ngx_conf_t *cf)
      */
 
     conf->enable = NGX_CONF_UNSET;
-    conf->level = NGX_CONF_UNSET;
+    conf->level = NGX_HTTP_ZSTD_LEVEL_UNSET;
     conf->min_length = NGX_CONF_UNSET;
     conf->max_length = NGX_CONF_UNSET;
     conf->target_cblock_size = NGX_CONF_UNSET;
@@ -1972,6 +2197,7 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_zstd_loc_conf_t *conf = child;
 
     ngx_fd_t                    fd;
+    off_t                       fsize;
     size_t                      size;
     ssize_t                     n;
     char                       *rc;
@@ -1984,7 +2210,17 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     fd = NGX_INVALID_FILE;
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
-    ngx_conf_merge_value(conf->level, prev->level, 3);
+
+    /*
+     * Hand-rolled rather than ngx_conf_merge_value(): that macro tests
+     * against NGX_CONF_UNSET, which is a legal level here. See
+     * NGX_HTTP_ZSTD_LEVEL_UNSET above.
+     */
+    if (conf->level == NGX_HTTP_ZSTD_LEVEL_UNSET) {
+        conf->level = (prev->level == NGX_HTTP_ZSTD_LEVEL_UNSET)
+                      ? 3 : prev->level;
+    }
+
     ngx_conf_merge_value(conf->min_length, prev->min_length, 1024);
     ngx_conf_merge_value(conf->max_length, prev->max_length, NGX_CONF_UNSET);
     ngx_conf_merge_value(conf->target_cblock_size, prev->target_cblock_size, 0);
@@ -2100,19 +2336,45 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                 goto close;
             }
 
-            size = ngx_file_size(&info);
+            /*
+             * Compare as off_t BEFORE narrowing to size_t: on an ILP32
+             * build with large-file support a >4 GiB dictionary wraps to
+             * a small size_t, slipping past the cap below and loading a
+             * truncated dictionary.
+             */
+            fsize = ngx_file_size(&info);
 
             /* Validate dictionary file size to prevent DoS
              * via memory exhaustion */
-            if (size > NGX_HTTP_ZSTD_MAX_DICT_SIZE) {
+            if (fsize > (off_t) NGX_HTTP_ZSTD_MAX_DICT_SIZE) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "dictionary file too large: %uz bytes "
+                                   "dictionary file too large: %O bytes "
                                    "(limit: %d bytes)",
-                                   size, NGX_HTTP_ZSTD_MAX_DICT_SIZE);
+                                   fsize, NGX_HTTP_ZSTD_MAX_DICT_SIZE);
 
                 rc = NGX_CONF_ERROR;
                 goto close;
             }
+
+            /*
+             * Reject an empty file rather than loading a do-nothing
+             * dictionary. ZSTD_createCDict(buf, 0, level) returns a
+             * VALID CDict, and ngx_read_fd(..., 0) returns 0 == size, so
+             * every completeness check downstream passes and the operator
+             * -- who had to set zstd_dict_file_unsafe on to get here --
+             * silently gets no dictionary at all. The dcz loader below
+             * has always rejected this; the two now agree.
+             */
+            if (fsize == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "dictionary file \"%V\" is empty",
+                                   &zmcf->dict_file);
+
+                rc = NGX_CONF_ERROR;
+                goto close;
+            }
+
+            size = (size_t) fsize;
 
             buf = ngx_palloc(cf->pool, size);
             if (buf == NULL) {
@@ -2350,7 +2612,7 @@ close:
     }
 
     if (rc == NGX_CONF_OK && conf->enable) {
-        ngx_http_core_loc_conf_t  *clcf;
+        const ngx_http_core_loc_conf_t  *clcf;
 
         /*
          * The advice below is wrong when the compression_vary filter
@@ -2485,6 +2747,17 @@ ngx_http_zstd_dcz_dicts_hashed_variable(ngx_http_request_t *r,
 
     zmcf = ngx_http_get_module_main_conf(r, ngx_http_zstd_filter_module);
 
+    /*
+     * Consistency with merge_loc_conf(), filter_init() and both static-module
+     * sites, which all guard this. The main conf is present whenever the
+     * module is loaded, so this cannot fire today -- but a reader should not
+     * have to prove that from four other call sites to know it is safe.
+     */
+    if (zmcf == NULL) {
+        vv->not_found = 1;
+        return NGX_OK;
+    }
+
     vv->data = ngx_pnalloc(r->pool, NGX_INT_T_LEN);
     if (vv->data == NULL) {
         return NGX_ERROR;
@@ -2505,8 +2778,8 @@ static ngx_int_t
 ngx_http_zstd_ratio_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *vv, uintptr_t data)
 {
-    ngx_uint_t            ratio_int, ratio_frac;
-    ngx_http_zstd_ctx_t  *ctx;
+    ngx_uint_t                  ratio_int, ratio_frac;
+    const ngx_http_zstd_ctx_t  *ctx;
 
     (void) data;
 
@@ -2592,6 +2865,67 @@ ngx_http_zstd_cleanup_cctx(void *data)
 }
 
 
+/*
+ * Return a borrowed worker context to the cache at request end.
+ *
+ * Runs from the request pool's cleanup list, so it fires on every exit path --
+ * normal completion, client abort, upstream error, worker shutdown of a live
+ * request -- which is what makes `busy` a reliable loan flag rather than a leak
+ * waiting for the one path that forgot to clear it.
+ *
+ * The session is reset HERE, not only on the next acquire: a request may be
+ * abandoned mid-stream (client reset on a partially compressed response), and
+ * leaving that half-finished frame state resident means the cached context
+ * holds the previous response's compression state until something else
+ * claims it.
+ * init_cctx does reset before reuse, so this is defence in depth against a
+ * future caller that forgets -- and it releases the session's internal buffers
+ * promptly rather than pinning them until the next request arrives.
+ */
+static void
+ngx_http_zstd_release_cctx(void *data)
+{
+    ZSTD_CCtx *cctx = data;
+
+    if (cctx == NULL) {
+        return;
+    }
+
+    if (cctx == ngx_http_zstd_worker_cctx) {
+        (void) ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only);
+        ngx_http_zstd_worker_cctx_busy = 0;
+        return;
+    }
+
+    /*
+     * Not the cached context: the cache was replaced while this request held
+     * its loan (only reachable if a future edit adds eviction). Own it.
+     */
+    ZSTD_freeCCtx(cctx);
+}
+
+
+/*
+ * Free the worker's cached context at process exit.
+ *
+ * Without this the cache is a live allocation at shutdown, which LeakSanitizer
+ * and Valgrind both report -- this tree gates on both, so a "harmless" one-off
+ * worker-lifetime leak would be a red CI job, not a footnote. Any request still
+ * holding a loan has already had its pool destroyed by the time module exit
+ * handlers run, so the context is unowned here.
+ */
+static void
+ngx_http_zstd_exit_process(ngx_cycle_t *cycle)
+{
+    if (ngx_http_zstd_worker_cctx != NULL) {
+        ZSTD_freeCCtx(ngx_http_zstd_worker_cctx);
+        ngx_http_zstd_worker_cctx = NULL;
+    }
+
+    ngx_http_zstd_worker_cctx_busy = 0;
+}
+
+
 static void
 ngx_http_zstd_cleanup_dict(void *data)
 {
@@ -2618,10 +2952,11 @@ ngx_http_zstd_dcz_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_zstd_loc_conf_t *zlcf = conf;
 
+    off_t                      fsize;
     size_t                     size;
     ssize_t                    n;
     ngx_fd_t                   fd;
-    ngx_str_t                 *value, path;
+    ngx_str_t                 *value, path, bytes;
     ngx_uint_t                 i, have_hash;
     u_char                     c, hi, lo;
     u_char                     hash[NGX_HTTP_ZSTD_SHA256_DIGEST_LEN];
@@ -2718,21 +3053,28 @@ ngx_http_zstd_dcz_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         goto failed;
     }
 
-    size = ngx_file_size(&info);
+    /*
+     * off_t comparison before the size_t narrowing: see the matching
+     * note in ngx_http_zstd_merge_loc_conf(). A >4 GiB file on ILP32
+     * would otherwise wrap under the cap.
+     */
+    fsize = ngx_file_size(&info);
 
-    if (size == 0) {
+    if (fsize == 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "dcz dictionary \"%V\" is empty", &path);
         goto failed;
     }
 
-    if (size > NGX_HTTP_ZSTD_MAX_DICT_SIZE) {
+    if (fsize > (off_t) NGX_HTTP_ZSTD_MAX_DICT_SIZE) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "dcz dictionary \"%V\" too large: %uz bytes "
+                           "dcz dictionary \"%V\" too large: %O bytes "
                            "(limit: %d bytes)",
-                           &path, size, NGX_HTTP_ZSTD_MAX_DICT_SIZE);
+                           &path, fsize, NGX_HTTP_ZSTD_MAX_DICT_SIZE);
         goto failed;
     }
+
+    size = (size_t) fsize;
 
     /*
      * Between the window cap (2^23) and the hard limit above the frame
@@ -2752,19 +3094,21 @@ ngx_http_zstd_dcz_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            &path, size);
     }
 
-    dict = ngx_array_push(zlcf->dcz_dicts);
-    if (dict == NULL) {
+    /*
+     * Build the entry in locals and push it only once the file has been
+     * read in full. Pushing first left a half-initialised element (NULL
+     * bytes.data, uninitialised hash) in zlcf->dcz_dicts on every error
+     * path below -- unreachable today because NGX_CONF_ERROR aborts the
+     * load before anything walks the array, but that is a non-local
+     * safety argument and the next reader should not have to rebuild it.
+     */
+    bytes.len = size;
+    bytes.data = ngx_palloc(cf->pool, size);
+    if (bytes.data == NULL) {
         goto failed;
     }
 
-    dict->file = path;
-    dict->bytes.len = size;
-    dict->bytes.data = ngx_palloc(cf->pool, size);
-    if (dict->bytes.data == NULL) {
-        goto failed;
-    }
-
-    n = ngx_read_fd(fd, (void *) dict->bytes.data, size);
+    n = ngx_read_fd(fd, (void *) bytes.data, size);
     if (n < 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
                            ngx_read_fd_n " \"%V\" failed", &path);
@@ -2782,13 +3126,10 @@ ngx_http_zstd_dcz_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    if (have_hash) {
-        ngx_memcpy(dict->hash, hash, NGX_HTTP_ZSTD_SHA256_DIGEST_LEN);
-
-    } else {
+    if (!have_hash) {
         zmcf = ngx_http_conf_get_module_main_conf(cf,
                                                   ngx_http_zstd_filter_module);
-        ngx_http_zstd_dcz_dict_hash(dict->bytes.data, size, dict->hash,
+        ngx_http_zstd_dcz_dict_hash(bytes.data, size, hash,
                                     &zmcf->dcz_dicts_hashed);
     }
 
@@ -2802,8 +3143,8 @@ ngx_http_zstd_dcz_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
      */
     dicts = zlcf->dcz_dicts->elts;
 
-    for (i = 0; i + 1 < zlcf->dcz_dicts->nelts; i++) {
-        if (ngx_memcmp(dicts[i].hash, dict->hash,
+    for (i = 0; i < zlcf->dcz_dicts->nelts; i++) {
+        if (ngx_memcmp(dicts[i].hash, hash,
                        NGX_HTTP_ZSTD_SHA256_DIGEST_LEN) == 0)
         {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -2812,6 +3153,15 @@ ngx_http_zstd_dcz_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
     }
+
+    dict = ngx_array_push(zlcf->dcz_dicts);
+    if (dict == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    dict->file = path;
+    dict->bytes = bytes;
+    ngx_memcpy(dict->hash, hash, NGX_HTTP_ZSTD_SHA256_DIGEST_LEN);
 
     return NGX_CONF_OK;
 
@@ -2829,7 +3179,7 @@ failed:
 static char *
 ngx_http_zstd_comp_level(ngx_conf_t *cf, void *post, void *data)
 {
-    ngx_int_t  *np = data;
+    const ngx_int_t  *np = data;
 
     (void)post;
 
@@ -3011,12 +3361,18 @@ ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf,
 
     ngx_int_t        *np;
     ngx_str_t        *value;
-    ngx_conf_post_t  *post;
 
 
     np = (ngx_int_t *) (p + cmd->offset);
 
-    if (*np != NGX_CONF_UNSET) {
+    /*
+     * NGX_HTTP_ZSTD_LEVEL_UNSET, not NGX_CONF_UNSET: this slot serves
+     * only zstd_comp_level, whose unset marker is out of band precisely
+     * because NGX_CONF_UNSET (-1) is a valid level. Testing the shared
+     * sentinel here let "zstd_comp_level -1; zstd_comp_level 5;" through
+     * as if the first line had never been parsed.
+     */
+    if (*np != NGX_HTTP_ZSTD_LEVEL_UNSET) {
         return (char *) "is duplicate";
     }
 
@@ -3042,7 +3398,8 @@ ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf,
     }
 
     if (cmd->post) {
-        post = cmd->post;
+        ngx_conf_post_t  *post = cmd->post;
+
         return post->post_handler(cf, post, np);
     }
 

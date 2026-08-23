@@ -49,7 +49,7 @@
  * fires, so the caller's surrounding loop cannot stall.
  */
 static u_char *
-ngx_http_zstd_skip_quoted(u_char *p, u_char *end)
+ngx_http_zstd_skip_quoted(u_char *p, const u_char *end)
 {
     if (p >= end || *p != '"') {
         return p;
@@ -73,6 +73,38 @@ ngx_http_zstd_skip_quoted(u_char *p, u_char *end)
 
 
 /*
+ * Walk the up-to-three fractional digits of a "q=0.NNN" qvalue, starting
+ * right after the '.'. Advances *p past each digit consumed and returns
+ * the accumulated milli-units contribution (0..900, in multiples of 100,
+ * 10 or 1 as digits are consumed) via the return value. Bounded on both
+ * sides: the loop stops at `end`, and after three digits `scale` has hit
+ * 0 so a fourth or later digit byte is left unconsumed for the caller's
+ * trailing-junk check to reject. Pure digit-walk, no other qvalue state:
+ * splitting it out of ngx_http_zstd_eval_qvalue() shrinks that function's
+ * branching without changing what either side does.
+ */
+static ngx_int_t
+ngx_http_zstd_parse_q_fraction(const u_char *end, u_char **p)
+{
+    /* ngx_int_t (not int) so the digit*scale product widens before the
+     * add — avoids a theoretical int overflow CodeQL flags (the operands
+     * are tiny in practice). */
+    ngx_int_t  scale = 100;
+    ngx_int_t  frac = 0;
+    u_char    *q = *p;
+
+    while (q < end && *q >= '0' && *q <= '9' && scale > 0) {
+        frac += (*q - '0') * scale;
+        scale /= 10;
+        q++;
+    }
+
+    *p = q;
+    return frac;
+}
+
+
+/*
  * Evaluate the optional parameters of a coding token whose name has just
  * been consumed. `p` points at the ';' that introduces the parameters.
  * Returns the weight in milli-units (0..1000) — 1000 when no "q" parameter
@@ -82,16 +114,16 @@ ngx_http_zstd_skip_quoted(u_char *p, u_char *end)
  * (the caller re-scans to the next ',').
  */
 static ngx_int_t
-ngx_http_zstd_eval_qvalue(ngx_str_t *ae, u_char *p)
+ngx_http_zstd_eval_qvalue(const ngx_str_t *ae, u_char *p)
 {
-    u_char     *end = ae->data + ae->len;
-    ngx_int_t   q = 1000;   /* no q parameter → q=1 */
-    ngx_int_t   q_seen = 0; /* reject a second "q" parameter (RFC 9110) */
+    const u_char  *end = ae->data + ae->len;
+    ngx_int_t      q = 1000;   /* no q parameter → q=1 */
+    ngx_int_t      q_seen = 0; /* reject a second "q" parameter (RFC 9110) */
 
     while (p < end && *p == ';') {
 
-        u_char     *nstart, *nend;
-        ngx_int_t   is_q;
+        const u_char  *nstart, *nend;
+        ngx_int_t      is_q;
 
         p++;    /* skip ';' */
 
@@ -108,6 +140,16 @@ ngx_http_zstd_eval_qvalue(ngx_str_t *ae, u_char *p)
             p++;
         }
         nend = p;
+
+        /*
+         * RFC 9110 has no empty-parameter production, so "zstd;;q=1" is
+         * malformed rather than "a skipped parameter followed by q=1".
+         * Reject it instead of silently resolving the element to q=1.
+         */
+        if (nend == nstart) {
+            return -1;
+        }
+
         is_q = (nend - nstart == 1
                 && (nstart[0] == 'q' || nstart[0] == 'Q'));
 
@@ -136,32 +178,21 @@ ngx_http_zstd_eval_qvalue(ngx_str_t *ae, u_char *p)
                 }
 
                 if (*p == '0') {
-                    /* ngx_int_t (not int) so the digit*scale product widens
-                     * before the add — avoids a theoretical int overflow
-                     * CodeQL flags (the operands are tiny in practice). */
-                    ngx_int_t  scale = 100;
-
                     p++;
                     q = 0;
 
                     if (p < end && *p == '.') {
                         p++;
-                        while (p < end && *p >= '0' && *p <= '9'
-                               && scale > 0)
-                        {
-                            q += (*p - '0') * scale;
-                            scale /= 10;
-                            p++;
-                        }
+                        q += ngx_http_zstd_parse_q_fraction(end, &p);
                     }
 
                 } else if (*p == '1') {
-                    int  i = 0;
-
                     p++;
                     q = 1000;
 
                     if (p < end && *p == '.') {
+                        int  i = 0;
+
                         p++;
                         while (p < end && *p == '0' && i < 3) {
                             p++;
@@ -248,18 +279,19 @@ ngx_http_zstd_eval_qvalue(ngx_str_t *ae, u_char *p)
  * on that).
  */
 static ngx_int_t
-ngx_http_zstd_coding_weight(ngx_str_t *ae, const char *coding,
+ngx_http_zstd_coding_weight(const ngx_str_t *ae, const char *coding,
     size_t coding_len, ngx_uint_t allow_wildcard)
 {
-    u_char     *p   = ae->data;
-    u_char     *end = ae->data + ae->len;
-    ngx_int_t   coding_q = -1;   /* explicit `coding` weight, -1 = absent */
-    ngx_int_t   star_q = -1;     /* "*" wildcard weight,      -1 = absent */
+    u_char        *p   = ae->data;
+    const u_char  *end = ae->data + ae->len;
+    ngx_int_t      coding_q = -1; /* explicit `coding` weight, -1 = absent */
+    ngx_int_t      star_q = -1;   /* "*" wildcard weight,      -1 = absent */
 
     while (p < end) {
 
-        u_char     *tok, *name_end;
-        ngx_int_t   is_coding, is_star, q;
+        u_char        *tok;
+        const u_char  *name_end;
+        ngx_int_t      is_coding, is_star, q;
 
         /* Skip OWS and empty list elements (RFC 9110 allows stray
          * commas, e.g. ", ,zstd"). */
@@ -295,6 +327,26 @@ ngx_http_zstd_coding_weight(ngx_str_t *ae, const char *coding,
         /* Step over any OWS between the name and its ';' or ','. */
         while (p < end && (*p == ' ' || *p == '\t')) {
             p++;
+        }
+
+        /*
+         * Only ';' (parameters), ',' (next element) or end of field may
+         * follow a coding name. RFC 9110 12.5.3 makes `codings` a token,
+         * so anything else means this element is not the coding it looked
+         * like: `zstd"x` and `zstd "x` advertise nothing, and neither does
+         * `zstd x`. nginx's own ngx_http_gzip_accept_encoding() applies
+         * the same rule, so accepting these diverged from the sibling
+         * filter and compressed for clients that never offered zstd.
+         *
+         * The check must sit AFTER the OWS skip: the name scan stops on
+         * OWS as well as on '"', so testing the stopping byte alone
+         * catches `zstd"x` and misses everything hiding behind a space.
+         * The quote-aware element-skip below still swallows the rest of
+         * the element, so the phantom-token guard is unchanged.
+         */
+        if (p < end && *p != ';' && *p != ',') {
+            is_coding = 0;
+            is_star = 0;
         }
 
         q = 1000;       /* no parameters → q=1 */
@@ -351,7 +403,7 @@ ngx_http_zstd_coding_weight(ngx_str_t *ae, const char *coding,
  * fuzz failure, not just a review nit.
  */
 static ngx_int_t
-ngx_http_zstd_accept_encoding(ngx_str_t *ae)
+ngx_http_zstd_accept_encoding(const ngx_str_t *ae)
 {
     ngx_int_t  q;
 
