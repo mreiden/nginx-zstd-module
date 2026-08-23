@@ -12,15 +12,15 @@ env:
   NGINX_VERSION: ""
 
 on:
-  pull_request:
-    branches: [master, main]
   schedule:
     # Monthly, day 1 @ 04:47 UTC (staggered per repo like ci-deep).
     - cron: "47 4 1 * *"
   workflow_dispatch: {}
+  # Called by ci.yml, the single PR entry point (step 15).
+  workflow_call: {}
 
 concurrency:
-  group: codeql-${{ github.ref }}
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -29,15 +29,17 @@ permissions:
 jobs:
   codeql:
     name: CodeQL
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
     permissions:
-      contents: read
-      security-events: write
+      contents: read # build the CodeQL database from the tree
+      security-events: write # upload SARIF to the Security tab; the only write needed
 
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Resolve latest mainline nginx
         run: |
@@ -91,7 +93,7 @@ jobs:
           gnupghome="$(mktemp -d)"
           export GNUPGHOME="$gnupghome"
           chmod 700 "$gnupghome"
-          for keyfile in tools/keys/*.key; do
+          for keyfile in ci/tools/keys/*.key; do
             gpg --quiet --import "$keyfile" 2>/dev/null
           done
           gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"

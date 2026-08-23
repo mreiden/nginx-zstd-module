@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+#
+# Sustained mixed-load soak for the zstd filter. Drives a real nginx
+# (ideally an ASAN/UBSAN build, optionally under valgrind) with
+# concurrent, varied requests for a fixed duration, then asserts the
+# worker survived cleanly: no sanitizer report, no crash, no leak, no
+# error-log [alert]/[emerg]. This is the "survives production-shaped
+# load" check that synthetic single-shot tests do not give.
+#
+# Usage:
+#   tools/soak.sh <nginx-binary> [duration_seconds] [concurrency]
+#   USE_VALGRIND=1 tools/soak.sh <nginx-binary> 120 8
+#
+# Exit non-zero on ANY of: sanitizer error, valgrind error, nginx
+# crash/non-clean exit, error-log alert/emerg, or a corrupted response.
+
+set -euo pipefail
+
+NGINX="${1:?usage: soak.sh <nginx-binary> [duration] [concurrency]}"
+DURATION="${2:-60}"
+CONC="${3:-8}"
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/conf" "$WORK/logs" "$WORK/html"
+
+# Mixed payload sizes: tiny (sub-min_length), medium, large (multi-buffer),
+# and a chunked/no-Content-Length upstream path.
+head -c 50 /dev/urandom | base64 >"$WORK/html/tiny"
+head -c 200000 /dev/urandom | base64 >"$WORK/html/medium"
+head -c 4000000 /dev/urandom | base64 >"$WORK/html/large"
+printf 'AAAAAAAAAA%.0s' $(seq 1 20000) >"$WORK/html/compressible"
+
+# RFC 9842 dcz dictionary. The soak previously sent only zstd/gzip, so the
+# whole dcz path -- negotiation, ZSTD_CCtx_refPrefix, the 40-byte frame
+# header, dictionary lifetime across requests -- ran under NEITHER sanitizer
+# lane despite being the newest and largest block of code in the module.
+# The dictionary content overlaps the response bodies below so refPrefix has
+# real matches to find rather than compressing a miss.
+printf 'shared-boilerplate compute render %.0s' $(seq 1 200) \
+    >"$WORK/html/dcz-dict"
+DICT_B64="$(openssl dgst -sha256 -binary "$WORK/html/dcz-dict" | base64)"
+printf 'shared-boilerplate compute render %.0s' $(seq 1 400) \
+    >"$WORK/html/dczbody"
+
+cat >"$WORK/conf/nginx.conf" <<EOF
+daemon off;
+master_process on;
+worker_processes 2;
+error_log $WORK/logs/error.log info;
+pid $WORK/logs/nginx.pid;
+events { worker_connections 256; }
+http {
+    access_log off;
+    zstd_window_log 21;
+    server {
+        listen 127.0.0.1:18222;
+        root $WORK/html;
+        default_type text/plain;
+        location / {
+            zstd on;
+            zstd_min_length 100;
+            zstd_max_length 8m;
+            zstd_types text/plain;
+        }
+        location /dcz {
+            zstd on;
+            zstd_min_length 100;
+            zstd_types text/plain;
+            zstd_dcz_dict_file $WORK/html/dcz-dict;
+            alias $WORK/html/dczbody;
+        }
+        location /bypass {
+            zstd on;
+            zstd_min_length 1;
+            zstd_types text/plain;
+            zstd_bypass \$arg_nozstd;
+            alias $WORK/html/medium;
+        }
+    }
+}
+EOF
+
+export DICT_B64
+
+ASAN_OPTIONS="${ASAN_OPTIONS:-}:detect_leaks=1:abort_on_error=1:exitcode=42:log_path=$WORK/logs/asan"
+export ASAN_OPTIONS
+export UBSAN_OPTIONS="${UBSAN_OPTIONS:-}:print_stacktrace=1:halt_on_error=1"
+
+RUN=("$NGINX" -p "$WORK" -c "$WORK/conf/nginx.conf")
+if [ "${USE_VALGRIND:-0}" = "1" ]; then
+    SUPP="$(cd "$(dirname "$0")/../.." && pwd)/valgrind.suppress"
+    RUN=(valgrind --error-exitcode=99 --leak-check=full
+        --errors-for-leak-kinds=definite
+        --suppressions="$SUPP" --gen-suppressions=all --log-file="$WORK/logs/valgrind.%p"
+        "${RUN[@]}")
+elif [ "${USE_HELGRIND:-0}" = "1" ]; then
+    # Data-race / lock-order checking under helgrind (thread pool + any
+    # shared state). Reuses the same suppression file.
+    SUPP="$(cd "$(dirname "$0")/../.." && pwd)/valgrind.suppress"
+    RUN=(valgrind --tool=helgrind --error-exitcode=99
+        --suppressions="$SUPP" --gen-suppressions=all --log-file="$WORK/logs/helgrind.%p"
+        "${RUN[@]}")
+fi
+
+"${RUN[@]}" &
+NGINX_PID=$!
+
+ready=0
+for _ in $(seq 1 100); do
+    if curl -fsS -o /dev/null "http://127.0.0.1:18222/tiny" 2>/dev/null; then
+        ready=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$ready" -ne 1 ]; then
+    echo "FAIL: nginx never became ready (no successful /tiny request in 10s)" >&2
+    kill "$NGINX_PID" 2>/dev/null || true
+    tail -40 "$WORK/logs/error.log" || true
+    exit 1
+fi
+
+echo "soak: ${DURATION}s, concurrency ${CONC}$(
+    [ "${USE_VALGRIND:-0}" = 1 ] && echo ' (valgrind)'
+    [ "${USE_HELGRIND:-0}" = 1 ] && echo ' (helgrind)'
+)"
+END=$(($(date +%s) + DURATION))
+fail=0
+
+worker() {
+    local wid="$1"
+    local paths=(/tiny /medium /large /compressible
+        "/bypass" "/bypass?nozstd=1" /dcz)
+    local i=0 ok=0 bad=0 dcz_seen=0
+    while [ "$(date +%s)" -lt "$END" ]; do
+        p=${paths[$((RANDOM % ${#paths[@]}))]}
+        # Vary Accept-Encoding incl. clients that do not support zstd.
+        ae=$([ $((RANDOM % 4)) -eq 0 ] && echo "gzip" || echo "zstd")
+        i=$((i + 1))
+        body="$WORK/r.${wid}.${i}"
+        # /dcz alternates between a request that negotiates dcz and one that
+        # does not, so both the refPrefix path and the plain-zstd fallback
+        # out of the same location run under the sanitizer.
+        #
+        # The FIRST iteration always sends the negotiating variant, and
+        # dcz_seen below records that a dcz frame actually came back. Both
+        # the path pick and the alternation are random, so without that the
+        # worker could take a short duration or an unlucky seed and send no
+        # dcz request at all -- and worse, a dcz regression that silently
+        # served plain zstd would decode fine in the 28b52ffd branch and
+        # keep the soak green. Coverage that can quietly stop covering is
+        # the same trap this oracle was extended to close, one level up.
+        dcz_want=0
+        hdrs=(-H "Accept-Encoding: $ae")
+        if [ "$i" -eq 1 ] || { [ "$p" = "/dcz" ] && [ $((RANDOM % 2)) -eq 0 ]; }
+        then
+            p=/dcz
+            dcz_want=1
+            hdrs=(-H "Accept-Encoding: zstd, dcz"
+                  -H "Available-Dictionary: :${DICT_B64}:"
+                  -H "Sec-Fetch-Site: same-origin")
+        fi
+        if curl -fsS "${hdrs[@]}" \
+            "http://127.0.0.1:18222$p" -o "$body" 2>/dev/null; then
+            # Every served response variant must be enumerated explicitly.
+            # Unrecognized magics are a hard failure, not a silent pass.
+            #
+            # Legitimate response variants:
+            # 1. Plain zstd: magic 28b52ffd (all paths except /bypass?nozstd=1)
+            # 2. DCZ skippable frame: magic 5e2a4d18 (from /dcz with negotiation)
+            # 3. Identity/uncompressed: no magic (only /bypass?nozstd=1, which
+            #    has zstd_bypass active, so the response is not compressed)
+            #
+            # A dcz response starts with 5e2a4d18, NOT 28b52ffd, so testing
+            # only for the zstd magic would let every dcz response fall through
+            # and count as ok without ever being decoded. Decode dcz against
+            # the same dictionary the request advertised: that verifies the
+            # frame header, the refPrefix output and the dictionary content.
+            magic="$(head -c4 "$body" | od -An -tx1 | tr -d ' ')"
+            if [ "$magic" = "28b52ffd" ]; then
+                if zstd -dq -c "$body" >/dev/null 2>&1; then
+                    ok=$((ok + 1))
+                else
+                    echo "BAD zstd $p"
+                    bad=$((bad + 1))
+                fi
+            elif [ "$magic" = "5e2a4d18" ]; then
+                if zstd -dq -D "$WORK/html/dcz-dict" -c "$body" \
+                    >/dev/null 2>&1; then
+                    ok=$((ok + 1))
+                    dcz_seen=$((dcz_seen + 1))
+                else
+                    echo "BAD dcz $p"
+                    bad=$((bad + 1))
+                fi
+            elif [ "$dcz_want" -eq 1 ]; then
+                # Asked for dcz with a matching dictionary and a
+                # same-origin fetch, and got something that is neither a
+                # dcz frame nor a zstd frame.
+                echo "BAD dcz $p: negotiated request returned magic $magic"
+                bad=$((bad + 1))
+            elif [ "$ae" != "zstd" ]; then
+                # This request advertised only gzip (no zstd in
+                # Accept-Encoding), so the module correctly declined to
+                # compress on every path, identity is expected here.
+                ok=$((ok + 1))
+            elif [ "$p" = "/tiny" ]; then
+                # /tiny is a 50-byte fixture, deliberately below
+                # zstd_min_length 100 on location /. Identity is expected.
+                ok=$((ok + 1))
+            elif [ "$p" = "/bypass?nozstd=1" ]; then
+                # zstd_bypass is active on this path, so the response is
+                # uncompressed identity. No magic header, just accept it.
+                ok=$((ok + 1))
+            else
+                # Every other combination (ae advertised zstd, and the path
+                # is not sub-min_length or bypassed) must have compressed.
+                # Identity here is a real "we stopped compressing"
+                # regression, not a benign variant.
+                echo "BAD unknown magic $magic $p (Accept-Encoding: $ae)"
+                bad=$((bad + 1))
+            fi
+
+            # A negotiated request that came back as a plain zstd frame is
+            # a dcz regression, not a pass: the gate silently declined and
+            # the 28b52ffd branch above would otherwise have accepted it.
+            if [ "$dcz_want" -eq 1 ] && [ "$magic" = "28b52ffd" ]; then
+                echo "BAD dcz $p: negotiated request fell back to plain zstd"
+                bad=$((bad + 1))
+            fi
+        else
+            echo "FAIL request $p (curl exit $?)"
+            bad=$((bad + 1))
+        fi
+        rm -f "$body"
+    done
+    echo "worker $wid: $ok ok, $bad bad/failed, $dcz_seen dcz"
+    if [ "$dcz_seen" -eq 0 ]; then
+        echo "FAIL worker $wid: no dcz response was ever verified"
+        return 1
+    fi
+    [ "$bad" -eq 0 ] && [ "$ok" -gt 0 ]
+}
+
+pids=()
+for w in $(seq 1 "$CONC"); do
+    worker "$w" &
+    pids+=($!)
+done
+for pid in "${pids[@]}"; do wait "$pid" || fail=1; done
+
+# Clean shutdown so all pool cleanups (incl. CCtx/CDict) run.
+kill -QUIT "$NGINX_PID" 2>/dev/null || true
+wait "$NGINX_PID" 2>/dev/null
+rc=$?
+
+problems=0
+if ls "$WORK"/logs/asan* >/dev/null 2>&1; then
+    echo "FAIL: ASAN/UBSAN report:"
+    cat "$WORK"/logs/asan*
+    problems=1
+fi
+if ls "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.* >/dev/null 2>&1; then
+    if grep -qE 'ERROR SUMMARY: [1-9]|definitely lost: [1-9]' \
+        "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.* 2>/dev/null; then
+        echo "FAIL: valgrind/helgrind errors:"
+        grep -E 'ERROR SUMMARY|definitely lost' \
+            "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.* 2>/dev/null
+        # Dump every log holding errors in full: the WORK dir is wiped on
+        # exit, so this is the only place the stacks (and the exact
+        # suppression blocks from --gen-suppressions=all) survive, e.g.
+        # in a CI job log.
+        for _vglog in "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.*; do
+            [ -f "$_vglog" ] || continue
+            grep -qE 'ERROR SUMMARY: [1-9]|definitely lost: [1-9]' "$_vglog" || continue
+            echo "---- $_vglog ----"
+            cat "$_vglog"
+        done
+        problems=1
+    fi
+fi
+if grep -nE '\[alert\]|\[emerg\]' "$WORK/logs/error.log" 2>/dev/null; then
+    echo "FAIL: alert/emerg in error.log"
+    problems=1
+fi
+if [ "$fail" -ne 0 ]; then
+    echo "FAIL: a worker reported a corrupted response"
+    problems=1
+fi
+# QUIT is a clean exit; valgrind uses 99, ASAN 42 on error.
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then
+    echo "FAIL: nginx exited $rc"
+    tail -40 "$WORK/logs/error.log" || true
+    problems=1
+fi
+
+[ "$problems" -ne 0 ] && exit 1
+echo "✓ soak clean: ${DURATION}s @ ${CONC} concurrent, no sanitizer/leak/crash"

@@ -1,13 +1,17 @@
-[![Build & Test](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/build-test.yml)
-[![Security scanners](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/security-scanners.yml)
+[![CI](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/ci.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/ci.yml)
+[![Lint](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/lint.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/lint.yml)
+[![Build&Test](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/build-test.yml)
+[![Security Scanners](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/security-scanners.yml)
 [![Fuzzing](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/fuzzing.yml)
 [![Valgrind](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/valgrind.yml)
-[![CI Deep](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/ci-deep.yml)
 [![CodeQL](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/codeql.yml)
+[![A/UBSan](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/asan.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/asan.yml)
+[![CI Deep](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/ci-deep.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/ci-deep.yml)
+[![Windows build](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/windows-build.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/windows-build.yml)
 
 📖 **Background reading:**
-- [zstd nginx module: what it does, bugs fixed](https://deb.myguard.nl/2026/05/zstd-nginx-module-what-it-does-bugs-fixed/)
-- [nginx zstd vs brotli vs zlib-ng — a compression comparison](https://deb.myguard.nl/2026/05/nginx-zstd-vs-brotli-vs-zlib-ng-compression/)
+- [zstd nginx module: what it does, bugs fixed](https://deb.myguard.nl/articles/zstd-nginx-module-bugs-fixed/)
+- [nginx zstd vs brotli vs zlib-ng — a compression comparison](https://deb.myguard.nl/articles/nginx-zstd-vs-brotli-vs-zlib-ng-compression/)
 
 # zstd-nginx-module
 
@@ -170,7 +174,7 @@ load_module modules/ngx_http_zstd_static_module.so;
 * If you are using a custom zstd installation, set `ZSTD_INC` (path to `zstd.h`) and `ZSTD_LIB` (path to the library) before running `configure`. If unset, the system-installed zstd is used.
 * **Windows:** MSVC builds the modules statically into `nginx.exe`; MinGW-w64
   can also build them as dynamic `.so`-named PE DLLs. The SHA-pinned
-  [`tools/build-windows.sh`](tools/build-windows.sh) assembles the MSVC build
+  [`ci/tools/build-windows.sh`](ci/tools/build-windows.sh) assembles the MSVC build
   (and optionally ngx_brotli and headers-more). The usual Windows-nginx caveats
   apply (effectively single-worker via `select()`, no HTTP/3 — local dev use,
   not production), and the `zstd_static` frame probes (magic number and
@@ -927,19 +931,28 @@ identically whether the hash was supplied or computed.
 
 # Testing & CI
 
-Six workflows guard the module (badges at the top): five gate every
-push & PR, and CI Deep runs the exhaustive monthly pass. A seventh,
-[`bump.yml`](.github/workflows/bump.yml) (Bump), runs weekly but only
-opens a version-bump PR — it does not gate anything itself.
+[`ci.yml`](.github/workflows/ci.yml) is the single pull-request entry
+point: it calls every gate below, so one job list answers "what does a PR
+run?". Each member keeps its own `workflow_dispatch:` and can still be run
+alone from the Actions tab.
+
+Two workflows are deliberately NOT called from it. **CI Deep** is the
+unbounded monthly campaign — its verdict lands long after the merge decision
+it would inform, so it stays on `schedule:` + manual dispatch. **Bump** opens
+version-bump PRs rather than gating them.
 
 | Workflow | Cadence | What it does |
 |---|---|---|
-| **Build & Test** | every push & PR | Compiles the module against **nginx mainline** (resolved at run time — see [Compatibility](#compatibility)) with strict `-Werror` flags, then runs the full test suite: 79 `Test::Nginx::Socket` filter tests, 28 static-module tests, 4 config-warning tests, and end-to-end Python smoke tests (truncation, `Vary`, boundary sizes, repeated/concurrent requests, terminal-frame, the proxy-unbuffered and compression-matrix regressions, slow-drain backpressure with data-less flushes, per-request CCtx isolation, reload-under-load, `zstd_long`/LDM, `$zstd_ratio`). A separate matrix entry rebuilds against **libzstd 1.4.x** (from source) to exercise the `< 1.5.6` and `≥ 1.4.0` fallback paths, and a parallel job rebuilds with **ASAN+UBSAN** and re-runs the smoke tests plus a `zstd_dict_file` config-reload leak check. **Angie is not built here** — see CI Deep below, the only workflow that exercises it. |
-| **Security scanners** | every push & PR | flawfinder, clang-tidy (`cert-*`, `clang-analyzer-security.*`), and semgrep, with the reports uploaded as build artifacts. |
-| **Fuzzing** | every push & PR | A 120-second libFuzzer regression run for the `ngx_http_zstd_accept_encoding()` / `ngx_http_zstd_eval_qvalue()` RFC 9110 `Accept-Encoding`/q-value parser. The fuzz target is sliced from the shipped header at build time, so there is no copy drift. See [`fuzz/README.md`](fuzz/README.md). |
-| **Valgrind** | every push & PR | A 60-second Memcheck-lite soak against a debug nginx build, catching uninitialised-value reads and leaks that ASAN cannot. |
-| **CodeQL** | every push & PR + monthly | GitHub's semantic C/C++ analysis (`security-extended` query pack) over the filter/static module sources. |
+| **CI** ([`ci.yml`](.github/workflows/ci.yml)) | every PR | The orchestrator. Calls Lint, Build&Test, Security Scanners, Fuzzing, Valgrind, CodeQL, A/UBSan and Windows build as reusable workflows, and is the only workflow carrying a `pull_request:` trigger. Hands CodeQL the `security-events: write` permission it needs for the SARIF upload, which a called workflow cannot grant itself. |
+| **Lint** ([`lint.yml`](.github/workflows/lint.yml)) | every PR (via CI) | Runs the same `ci/linter/` checks as the local pre-commit hook — nginx-convention, shell, Python, Perl, YAML, spelling, and the CI-policy checkers (runner trust, port bands, cadence, secrets, docs drift) — so a clone that never enabled `core.hooksPath .githooks` still gets the gate on the PR. |
+| **Build&Test** | every PR (via CI) + weekly cron | Compiles the module against **nginx mainline** (resolved at run time — see [Compatibility](#compatibility)) with strict `-Werror` flags, then runs the full test suite: 79 `Test::Nginx::Socket` filter tests, 28 static-module tests, 4 config-warning tests, and end-to-end Python smoke tests (truncation, `Vary`, boundary sizes, repeated/concurrent requests, terminal-frame, the proxy-unbuffered and compression-matrix regressions, slow-drain backpressure with data-less flushes, per-request CCtx isolation, reload-under-load, `zstd_long`/LDM, `$zstd_ratio`). A separate matrix entry rebuilds against **libzstd 1.4.x** (from source) to exercise the `< 1.5.6` and `≥ 1.4.0` fallback paths, and a parallel job rebuilds with **ASAN+UBSAN** and re-runs the smoke tests plus a `zstd_dict_file` config-reload leak check. **Angie is not built here** — see CI Deep below, the only workflow that exercises it. |
+| **Security Scanners** | every PR (via CI) | flawfinder, clang-tidy (`cert-*`, `clang-analyzer-security.*`), and semgrep, with the reports uploaded as build artifacts. |
+| **Fuzzing** | every PR (via CI) | A 120-second libFuzzer regression run for the `ngx_http_zstd_accept_encoding()` / `ngx_http_zstd_eval_qvalue()` RFC 9110 `Accept-Encoding`/q-value parser. The fuzz target is sliced from the shipped header at build time, so there is no copy drift. See [`ci/fuzz/README.md`](ci/fuzz/README.md). |
+| **Valgrind** | every PR (via CI) | A 60-second Memcheck-lite soak against a debug nginx build, catching uninitialised-value reads and leaks that ASAN cannot. |
+| **CodeQL** | every PR (via CI) + monthly | GitHub's semantic C/C++ analysis (`security-extended` query pack) over the module sources in `src/`. |
+| **A/UBSan** ([`asan.yml`](.github/workflows/asan.yml)) | every PR (via CI) | A 60-second ASan+UBSan soak against a static `--add-module` build, driving the same mixed-load traffic as the Valgrind soak. Catches heap overflow/UAF outside nginx's pool blocks that Valgrind's slower pass would also catch, but ~20× faster — complementary to Valgrind, not redundant. |
 | **CI Deep** | monthly + manual dispatch | The exhaustive run: a `build-flavors` matrix that compiles and runs the full `Test::Nginx::Socket` suite against **nginx mainline, nginx stable, and Angie** (the only workflow that builds Angie at all), hours-long fuzzing on the same target, full Memcheck and Helgrind soaks (a valgrind soak is ~20–50× slower than native), and the same security scanners. |
+| **Windows build** ([`windows-build.yml`](.github/workflows/windows-build.yml)) | every PR (via CI) | Builds the module on Windows two ways: MSVC x64 static and MinGW-w64 x64 dynamic, each against a pinned nginx with PCRE2 and zlib, then runs `nginx -t` on the result. Guards the `NGX_WIN32` paths, which no Linux job compiles. No reference-skeleton equivalent — kept because it gates a platform nothing else here covers (see [`ci/skeleton-findings.md`](ci/skeleton-findings.md)). |
 | **Bump** ([`bump.yml`](.github/workflows/bump.yml)) | weekly + manual dispatch | Checks nginx.org/angie.software for newer nginx-stable/Angie releases than what's pinned in CI Deep's `build-flavors` matrix, and opens a PR (never pushes directly to protected `master`) with the updated pin + a freshly-verified sha256 digest. Does not gate merges itself — normal required checks review the PR. |
 
 The test suite includes a dedicated regression test for every known
@@ -972,18 +985,63 @@ Run the suites locally:
 
 ```bash
 # Perl suites (needs Test::Nginx::Socket and a built nginx)
-TEST_NGINX_BINARY=/path/to/nginx prove t/00-filter.t t/01-static.t
+TEST_NGINX_BINARY=/path/to/nginx prove ci/t/00-filter.t ci/t/01-static.t
+
+# Unit tests over the Accept-Encoding decision function
+ci/tests/unit/run.sh
 
 # End-to-end smoke tests
-python3 tools/test_encoding.py --nginx-binary /path/to/nginx
+python3 ci/tools/test_encoding.py --nginx-binary /path/to/nginx
 
 # Build and run the fuzzer (needs clang)
-bash fuzz/build.sh && ./fuzz/fuzz_accept_encoding -max_total_time=60 fuzz/corpus/
+bash ci/fuzz/build.sh && ./ci/fuzz/fuzz_accept_encoding -max_total_time=60 ci/fuzz/corpus/
 ```
+
+## Repository layout
+
+Everything CI needs lives under `ci/`, so the repository root stays the
+module: sources, docs and packaging.
+
+```text
+src/                     the module itself
+  ngx_http_zstd_filter_module.c    the compression filter
+  ngx_http_zstd_static_module.c    the .zst static handler
+  ngx_http_zstd_common.h           shared helpers + the Accept-Encoding parser
+ci/
+  t/                     Test::Nginx::Socket suites (00-filter, 01-static, …)
+  tests/unit/            unit tests over the real decision TU
+  tools/                 soak.sh, test_encoding.py, benchmark.py, ci-build.sh, …
+  fuzz/                  libFuzzer target, corpus, dictionary, regressions
+  linter/                the checker set run by the hook and the Lint workflow
+  ast-grep/              structural rules
+.github/workflows/       ci.yml (the only pull_request entry point) + members
+.githooks/pre-commit     the tracked local gate
+```
+
+The `Accept-Encoding` parser is sliced out of `src/ngx_http_zstd_common.h`
+into the fuzz and unit builds at build time by `ci/fuzz/extract_parser.sh`,
+so those targets always compile production code — there is no second copy to
+drift.
+
+## Linting
+
+The same checkers run in three places: your commit (via `.githooks/pre-commit`),
+`ci/linter/run-all.sh` by hand, and the **Lint** workflow on every PR.
+
+```sh
+git config core.hooksPath .githooks    # enable the hook, once per clone
+ci/linter/install-linters.sh           # install what the checkers need
+ci/linter/install-linters.sh --check   # report presence; non-zero if any missing
+ci/linter/run-all.sh                   # run every checker over the tracked tree
+```
+
+Full description of each checker, what it is blind to, and how to narrow a run
+with `LINT_ONLY`: [`ci/linter/README.md`](ci/linter/README.md). Contributor
+setup and the `git ls-files` trap: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 # Benchmarks
 
-Reproduce with `python3 tools/benchmark.py` (drives the `zstd`/`gzip`
+Reproduce with `python3 ci/tools/benchmark.py` (drives the `zstd`/`gzip`
 CLIs linked against the same libzstd/zlib, so ratio is machine-stable;
 throughput scales with CPU). Figures below: **libzstd 1.5.5**, single
 core, `--repeat 3`, best wall-time.
@@ -1057,7 +1115,7 @@ context; new requests use new workers. There is no shared compression
 state to corrupt across a reload. The `zstd_dict_file` `ZSTD_CDict` is
 loaded once per cycle and freed on the old cycle's cleanup; a
 reload-leak regression for exactly this runs under ASAN in CI
-(`tools/test_reload_leak.sh`).
+(`ci/tools/test_reload_leak.sh`).
 
 **`zstd_dict_file`.** Loaded at config load in the `http` context, into
 a `ZSTD_CDict` shared read-only by all workers (dictionary size capped
@@ -1082,7 +1140,7 @@ purely "load the previous `.so` / previous nginx binary and reload":
 No data migration, no irreversible step. A bad deploy is a one-line
 config change or a binary swap away from rolled back.
 
-**Pre-deploy soak.** `tools/soak.sh <nginx> <seconds> <concurrency>`
+**Pre-deploy soak.** `ci/tools/soak.sh <nginx> <seconds> <concurrency>`
 drives sustained mixed load (tiny/medium/large/compressible payloads,
 zstd and non-zstd clients, the bypass path, a chunked upstream) and
 fails on any sanitizer report, leak, crash, `[alert]`/`[emerg]`, or

@@ -8,18 +8,23 @@ name: CI Deep
 # multi-flavor build matrix (mainline/stable/angie) plus hours-long fuzzing
 # and full Memcheck/Helgrind soaks that would blow the PR-gate time budget.
 #
+# A manual dispatch can run a SUBSET via the `jobs` input (default `all`);
+# the monthly cron passes no inputs and therefore always runs everything.
+# Use a subset when the full set would monopolise the shared pool for the
+# hours the fuzz and helgrind legs need.
+#
 # Jobs: build-flavors (nginx mainline/stable + angie) · fuzz (14400s/target) ·
-#   memcheck soak · helgrind soak · scanners.
-#   * memcheck AND helgrind run under tools/soak.sh, which already passes
+#   memcheck soak · helgrind soak · scanners · coverage (src/).
+#   * memcheck AND helgrind run under ci/tools/soak.sh, which already passes
 #     --suppressions=valgrind.suppress and --error-exitcode=99 for BOTH tools
-#     (see tools/soak.sh) — the drift-fix baseline for every module.
+#     (see ci/tools/soak.sh) — the drift-fix baseline for every module.
 #
 # build-flavors exists because build-test.yml (the fast PR gate) only builds
 # ONE pinned nginx version (mainline) — the module's README documents Angie
 # support and tracks nginx stable too, but nothing in CI actually built angie
 # or nginx stable until this job. It is here (monthly), not in the PR gate,
 # because each leg is a from-scratch configure+compile+Test::Nginx run and
-# three of them would blow the PR gate's budget. Uses tools/ci-build.sh, which
+# three of them would blow the PR gate's budget. Uses ci/tools/ci-build.sh, which
 # supports flavor+version args and sha256-verifies the tarball it downloads.
 #
 # Action pins (keep in sync with build-test.yml header):
@@ -41,9 +46,37 @@ on:
         description: "Per-target fuzz duration (seconds)"
         required: false
         default: "3600"
+      jobs:
+        # Which jobs a manual dispatch should run. The full set occupies most
+        # of the shared self-hosted pool for hours (fuzz alone is capped at
+        # 600min), so an on-demand run usually wants a subset -- e.g. after a
+        # suppression-file fix, only the memcheck soak is meaningful. The
+        # scheduled monthly run supplies no inputs, so `all` is the default and
+        # cron behaviour is unchanged.
+        description: "Jobs to run"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - memcheck+coverage
+          - build-flavors
+          - scanners
 
+# A long soak is often the ONLY evidence for a finding: fuzz is capped at
+# 600 minutes, memcheck and helgrind at 240. Keying the group on the job
+# selection (and on the run id for the scheduled run) keeps a targeted
+# dispatch -- e.g. `jobs=scanners`, a ~2 minute job, the documented common
+# case above -- from cancelling an in-flight monthly cron run on the same
+# ref and destroying hours of soak with no artifact. Two dispatches of the
+# SAME selection still coalesce, which is the only case where cancelling is
+# the intended behaviour.
 concurrency:
-  group: ci-deep-${{ github.workflow }}-${{ github.ref }}
+  group: >-
+    ci-deep-${{ github.workflow }}-${{ github.ref
+    }}-${{ github.event_name == 'schedule'
+    && format('schedule-{0}', github.run_id)
+    || format('dispatch-{0}', inputs.jobs || 'all') }}
   cancel-in-progress: true
 
 permissions:
@@ -52,8 +85,19 @@ permissions:
 jobs:
   build-flavors:
     name: Build & Test::Nginx (${{ matrix.flavor }} ${{ matrix.version }})
-    runs-on: [self-hosted, builder02, lxc]
+    if: ${{ contains(fromJSON('["all","build-flavors"]'), inputs.jobs || 'all') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
+    env:
+      # Job-level band -- see ci/tools/max-port.sh. Each matrix leg still
+      # gets its own port via matrix.port below (they run concurrently on the
+      # SAME runner); this declares the job's OWN territory to the port-band
+      # policy checker, which only understands one band per job. The legs'
+      # individual ports below all sit inside this band's width and are well
+      # clear of the 1984 Test::Nginx default, so a job that forgets to wire
+      # TEST_NGINX_PORT fails loudly on that default instead of silently
+      # landing inside this job's own territory.
+      TEST_BASE_PORT: 19300
     strategy:
       fail-fast: false
       matrix:
@@ -68,18 +112,20 @@ jobs:
           - flavor: nginx
             version: "1.31.2"
             label: mainline
-            port: 1984
+            port: 19300
           - flavor: nginx
             version: "1.30.4"
             label: stable
-            port: 1994
+            port: 19310
           - flavor: angie
             version: "1.12.1"
             label: angie
-            port: 2004
+            port: 19320
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -94,18 +140,54 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential curl libpcre2-dev libzstd-dev pkg-config \
-            wget zstd libperl-dev cpanminus
+            wget zstd libperl-dev cpanminus ccache mold
+
+      - name: Cache ccache objects
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.ccache
+          key: ccache-ci-deep-${{ runner.os }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ hashFiles('ci/tools/ci-build.sh', 'config', 'src/**') }}
+          restore-keys: |
+            ccache-ci-deep-${{ runner.os }}-${{ matrix.flavor }}-${{ matrix.version }}-
+            ccache-ci-deep-${{ runner.os }}-
+
+      # Hybrid restore: this runner is self-hosted and persistent, so
+      # .build/ already survives between runs on disk (ci-build.sh's own
+      # "reuse unless NO_CACHE=1" check) -- this is the FALLBACK for when it
+      # does not (ephemeral runner, first run on a fresh box, or the runner
+      # pool changed). Exact-match only, never a restore-keys ladder: a
+      # PARTIAL build-tree hit (some objects rebuilt at a newer source
+      # revision, others stale) is worse than a clean rebuild, since a
+      # mismatched .o silently links into a binary that matches nothing.
+      - name: Cache build tree
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build/${{ matrix.flavor }}-${{ matrix.version }}
+          key: build-tree-${{ runner.os }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ hashFiles('ci/tools/ci-build.sh', 'config', 'src/**') }}
 
       - name: Build server and dynamic modules
-        run: bash tools/ci-build.sh "${{ matrix.flavor }}" "${{ matrix.version }}"
+        # No CCACHE_DIR override: ccache's own default (~/.ccache) already
+        # matches the "Cache ccache objects" step's path above.
+        env:
+          # Routed through env: rather than spliced into run: directly --
+          # both values come from this file's own hardcoded matrix.include
+          # (never attacker input), but env: indirection is the pattern
+          # zizmor's template-injection audit checks for regardless of
+          # provenance, and the Discord steps below use the same pattern.
+          MATRIX_FLAVOR: ${{ matrix.flavor }}
+          MATRIX_VERSION: ${{ matrix.version }}
+        run: bash ci/tools/ci-build.sh "$MATRIX_FLAVOR" "$MATRIX_VERSION"
 
       - name: Verify built modules
+        env:
+          MATRIX_FLAVOR: ${{ matrix.flavor }}
+          MATRIX_VERSION: ${{ matrix.version }}
         run: |
-          build=".build/${{ matrix.flavor }}-${{ matrix.version }}/objs"
-          test -f "$build/${{ matrix.flavor }}"
+          build=".build/$MATRIX_FLAVOR-$MATRIX_VERSION/objs"
+          test -f "$build/$MATRIX_FLAVOR"
           test -f "$build/ngx_http_zstd_filter_module.so"
           test -f "$build/ngx_http_zstd_static_module.so"
-          echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/$build/${{ matrix.flavor }}" >> "$GITHUB_ENV"
+          echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/$build/$MATRIX_FLAVOR" >> "$GITHUB_ENV"
 
       - name: Cache Perl modules
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -118,37 +200,59 @@ jobs:
           cpanm -l ~/perl5 --notest Test::Nginx::Socket
           echo "PERL5LIB=$HOME/perl5/lib/perl5:$PERL5LIB" >> "$GITHUB_ENV"
 
-      - name: Run t/ (filter + static + conf-warn)
+      - name: Verify test port band
+        # Before the first `prove` -- see ci/tools/max-port.sh. The three
+        # matrix legs run CONCURRENTLY (no max-parallel cap) on their own
+        # ports (matrix.port), each inside this job's declared 19300-width-64
+        # band, so each leg verifies its OWN port here rather than the job's
+        # shared TEST_BASE_PORT -- checking only the mainline leg's port
+        # would leave the stable/angie legs unverified.
+        env:
+          MATRIX_PORT: ${{ matrix.port }}
+        run: ci/tools/max-port.sh "$MATRIX_PORT" 10
+
+      - name: Run ci/t/ (filter + static + conf-warn)
         env:
           # See build-test.yml's identical setting for why this must be 20,
           # not the ~2s Test::Nginx::Socket default.
           TEST_NGINX_TIMEOUT: "20"
-          # Per-leg listen port — see the matrix comment above.
+          # Per-leg listen port — see the matrix comment above. Test::Nginx
+          # prefers TEST_NGINX_SERVER_PORT over TEST_NGINX_PORT when both are
+          # set (see perldoc Test::Nginx::Socket), so the actual bind is the
+          # per-leg matrix.port; TEST_NGINX_PORT carries the job's declared
+          # TEST_BASE_PORT purely so the port-band policy checker (which only
+          # understands TEST_NGINX_PORT) can see this job is wired at all.
           TEST_NGINX_SERVER_PORT: "${{ matrix.port }}"
+          TEST_NGINX_PORT: "${{ env.TEST_BASE_PORT }}"
+          MATRIX_FLAVOR: ${{ matrix.flavor }}
+          MATRIX_VERSION: ${{ matrix.version }}
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
           cd "$GITHUB_WORKSPACE"
-          # t/01-static.t asserts on fixture mtimes (Last-Modified/If-Modified-Since);
+          # ci/t/01-static.t asserts on fixture mtimes (Last-Modified/If-Modified-Since);
           # pin them to a fixed timestamp, same as build-test.yml's tests job.
-          touch -d @1541504307 t/suite/test t/suite/test.zst
-          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-${{ matrix.flavor }}-${{ matrix.version }}"
+          touch -d @1541504307 ci/t/suite/test ci/t/suite/test.zst
+          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-$MATRIX_FLAVOR-$MATRIX_VERSION"
           mkdir -p "$TEST_NGINX_SERVROOT"
-          prove -v t/00-filter.t t/02-conf-warn.t
-          # 01-static.t serves fixtures via "root ../../t/suite", which only
-          # resolves when the servroot sits two levels under the checkout —
-          # a /tmp servroot makes every static case 404. Same split as
-          # build-test.yml's tests job.
-          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/t/servroot-static"
+          prove -v ci/t/00-filter.t ci/t/02-conf-warn.t
+          # 01-static.t serves fixtures via "root ../suite", resolved against
+          # the servroot's PARENT, so the servroot must be a sibling of
+          # ci/t/suite — i.e. inside ci/t/. A /tmp servroot makes every static
+          # case 404. Same split as build-test.yml's tests job.
+          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static"
           mkdir -p "$TEST_NGINX_SERVROOT"
-          prove -v t/01-static.t
+          prove -v ci/t/01-static.t
 
   fuzz:
     name: Fuzz (Accept-Encoding, long)
-    runs-on: [self-hosted, builder02, lxc]
+    if: ${{ (inputs.jobs || 'all') == 'all' }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 600
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Install clang + libFuzzer
         run: |
@@ -166,8 +270,9 @@ jobs:
       - name: Select fuzz duration
         env:
           RAW_FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds }}
+          GH_EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "$GH_EVENT_NAME" = "workflow_dispatch" ]; then
             case "$RAW_FUZZ_SECONDS" in
               ''|*[!0-9]*)
                 echo "::error::fuzz_seconds must be a non-negative integer, got: $RAW_FUZZ_SECONDS"
@@ -183,13 +288,16 @@ jobs:
             printf 'FUZZ_SECS=3600\n' >> "$GITHUB_ENV"
           fi
 
-      - name: Build fuzz target
-        run: bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz/fuzz_accept_encoding"
+      - name: Build fuzz targets
+        run: |
+          bash ci/fuzz/build.sh \
+            "$GITHUB_WORKSPACE/ci/fuzz/fuzz_accept_encoding" \
+            "$GITHUB_WORKSPACE/ci/fuzz/fuzz_dcz"
 
       - name: Fuzz
         run: |
           set -euo pipefail
-          cd fuzz
+          cd ci/fuzz
           set +e
           ./fuzz_accept_encoding \
             -max_total_time="$FUZZ_SECS" \
@@ -202,20 +310,39 @@ jobs:
           [ $rc -eq 0 ] || { echo "❌ fuzzer crash (exit $rc)"; exit 1; }
           echo "✓ no crashes in ${FUZZ_SECS}s"
 
+      - name: Fuzz dcz
+        run: |
+          set -euo pipefail
+          cd ci/fuzz
+          set +e
+          ./fuzz_dcz \
+            -max_total_time="$FUZZ_SECS" \
+            -print_final_stats=1 \
+            -artifact_prefix=crash-dcz- \
+            corpus_dcz/
+          rc=$?
+          set -e
+          [ $rc -eq 0 ] || { echo "❌ dcz fuzzer crash (exit $rc)"; exit 1; }
+          echo "✓ no crashes in ${FUZZ_SECS}s"
+
       - name: Minimize + persist corpus
         if: success()
         run: |
-          cd fuzz
-          mkdir -p corpus-min
+          cd ci/fuzz
+          mkdir -p corpus-min corpus-dcz-min
           ./fuzz_accept_encoding -merge=1 corpus-min/ corpus/
           echo "merged: $(find corpus-min -type f | wc -l) units"
+          ./fuzz_dcz -merge=1 corpus-dcz-min/ corpus_dcz/
+          echo "dcz merged: $(find corpus-dcz-min -type f | wc -l) units"
 
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-deep-crashes
-          path: ${{ github.workspace }}/fuzz/crash-*
+          path: |
+            ${{ github.workspace }}/ci/fuzz/crash-*
+            ${{ github.workspace }}/ci/fuzz/crash-dcz-*
           retention-days: 30
 
       - name: Upload minimized corpus
@@ -223,7 +350,9 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-corpus
-          path: ${{ github.workspace }}/fuzz/corpus-min
+          path: |
+            ${{ github.workspace }}/ci/fuzz/corpus-min
+            ${{ github.workspace }}/ci/fuzz/corpus-dcz-min
           retention-days: 30
 
       - name: Notify Discord on failure
@@ -231,20 +360,28 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
+          msg="🔴 $GH_REPO — CI Deep / fuzz FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID"
+          payload=$(python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$msg")
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / fuzz FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "$payload" || true
 
   memcheck:
     name: Valgrind Memcheck soak
-    runs-on: [self-hosted, builder02, lxc]
+    if: ${{ contains(fromJSON('["all","memcheck+coverage"]'), inputs.jobs || 'all') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - name: Resolve latest mainline nginx
         run: |
           set -euo pipefail
@@ -284,27 +421,35 @@ jobs:
         env:
           USE_VALGRIND: "1"
         run: |
-          bash tools/soak.sh \
+          bash ci/tools/soak.sh \
             "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx" 300 4
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
+          msg="🔴 $GH_REPO — CI Deep / memcheck FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID"
+          payload=$(python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$msg")
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / memcheck FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "$payload" || true
 
   helgrind:
     name: Valgrind Helgrind soak
-    runs-on: [self-hosted, builder02, lxc]
+    if: ${{ (inputs.jobs || 'all') == 'all' }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 240
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - name: Resolve latest mainline nginx
         run: |
           set -euo pipefail
@@ -344,27 +489,35 @@ jobs:
         env:
           USE_HELGRIND: "1"
         run: |
-          bash tools/soak.sh \
+          bash ci/tools/soak.sh \
             "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx" 300 4
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_BUILDS: ${{ secrets.DISCORD_CHANNEL_BUILDS }}
+          GH_REPO: ${{ github.repository }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
           [ -n "$DISCORD_BOT_TOKEN" ] || exit 0
+          msg="🔴 $GH_REPO — CI Deep / helgrind FAILED. $GH_SERVER_URL/$GH_REPO/actions/runs/$GH_RUN_ID"
+          payload=$(python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$msg")
           curl -fsS -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
             -H "Content-Type: application/json" \
             "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_BUILDS/messages" \
-            -d "{\"content\":\"🔴 ${{ github.repository }} — CI Deep / helgrind FAILED. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
+            -d "$payload" || true
 
   scanners:
     name: Security scanners
-    runs-on: [self-hosted, builder02, lxc]
+    if: ${{ contains(fromJSON('["all","scanners"]'), inputs.jobs || 'all') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - name: Install dependencies
         run: |
           # apt profile the bare apt-get lines below rely on: loose
@@ -397,10 +550,17 @@ jobs:
           CC=gcc ./configure --with-compat --add-dynamic-module="$GITHUB_WORKSPACE" >/dev/null
           echo "NGINX_SRC_TREE=$PWD" >> "$GITHUB_ENV"
       - name: flawfinder
+        # Threshold mirrors ci/linter/lint-c.sh and security-scanners.yml
+        # exactly: gate at >=4. --error-level is what makes flawfinder itself
+        # exit non-zero; --minlevel alone only controls what gets PRINTED, so
+        # the previous bare --minlevel=1 could never fail this step regardless
+        # of what it found. Move a threshold here, move it in lint-c.sh and
+        # security-scanners.yml in the SAME commit.
         run: |
-          flawfinder --minlevel=1 \
-            "$GITHUB_WORKSPACE/filter/ngx_http_zstd_filter_module.c" \
-            "$GITHUB_WORKSPACE/static/ngx_http_zstd_static_module.c" 2>&1 | tee flawfinder.log
+          set -o pipefail
+          flawfinder --minlevel=4 --error-level=4 \
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_filter_module.c" \
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_static_module.c" 2>&1 | tee flawfinder.log
       - name: clang-tidy (cert-*, security.*)
         run: |
           set -euo pipefail
@@ -409,8 +569,8 @@ jobs:
             -I$N/src/os/unix -I$N/objs -I$N/src/http -I$N/src/http/modules -I$N/src/http/v2 -I/usr/include"
           status=0
           for f in \
-            "$GITHUB_WORKSPACE/filter/ngx_http_zstd_filter_module.c" \
-            "$GITHUB_WORKSPACE/static/ngx_http_zstd_static_module.c"; do
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_filter_module.c" \
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_static_module.c"; do
             # shellcheck disable=SC2086,SC2046
             clang-tidy "$f" \
               --checks='-*,cert-*,clang-analyzer-security.*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling' \
@@ -420,9 +580,19 @@ jobs:
           done
           exit "$status"
       - name: semgrep
+        # Same target and threshold as ci/linter/lint-c.sh and
+        # security-scanners.yml: src/ is the module's real source directory --
+        # filter/ and static/ are the pre-skeleton layout this job was still
+        # pointed at, so the scan matched no files at all. Gate >=WARNING, and
+        # --jobs=1 --metrics=off (--jobs=1 is a CORRECTNESS flag on this host's
+        # shared RLIMIT_MEMLOCK, not a speed one). The dropped `|| true` meant
+        # this step could never fail on a real finding.
         run: |
+          set -o pipefail
           semgrep scan --config p/c --config p/security-audit \
-            "$GITHUB_WORKSPACE/filter/" "$GITHUB_WORKSPACE/static/" 2>&1 | tee semgrep.log || true
+            --severity=WARNING --severity=ERROR --error \
+            --jobs=1 --metrics=off \
+            "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -432,4 +602,67 @@ jobs:
             ${{ github.workspace }}/flawfinder.log
             ${{ github.workspace }}/clang-tidy.log
             ${{ github.workspace }}/semgrep.log
+          retention-days: 14
+
+  # Coverage is a REPORT, never a gate (step 26) -- the cheapest way to move
+  # the number is a test that touches a line and asserts nothing, so a floor
+  # buys the metric and sells the thing it proxied for. Monthly cadence
+  # (this file, never PR-time) because ci/tools/coverage.sh does a full
+  # from-scratch coverage-instrumented build plus the whole ci/t/ suite.
+  coverage:
+    name: Coverage report (src/)
+    if: ${{ contains(fromJSON('["all","memcheck+coverage"]'), inputs.jobs || 'all') }}
+    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
+    timeout-minutes: 30
+    env:
+      # This job's own Test::Nginx port band -- see ci/tools/max-port.sh.
+      # Distinct from build-flavors' 19300 (width 64) and build-test.yml's
+      # 19200 so a collision needs three concurrent runners occupied, not
+      # two. coverage.sh runs `prove` internally without a caller-supplied
+      # port, so it takes Test::Nginx's compiled-in default (1984) unless
+      # TEST_NGINX_PORT steers it here.
+      TEST_BASE_PORT: 19330
+      TEST_NGINX_PORT: 19330
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Install dependencies
+        run: |
+          # builder02 apt profile: loose timeouts — the box runs jobs
+          # concurrently and never talks to the Azure mirror (PR #121)
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl libpcre2-dev libzstd-dev pkg-config \
+            wget zstd libperl-dev cpanminus gcovr
+      - name: Cache Perl modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/perl5
+          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket
+      - name: Install Test::Nginx::Socket
+        run: |
+          cpanm -l ~/perl5 --notest Test::Nginx::Socket
+          echo "PERL5LIB=$HOME/perl5/lib/perl5:$PERL5LIB" >> "$GITHUB_ENV"
+      - name: Verify test port band
+        # Before the first `prove` inside coverage.sh -- see ci/tools/max-port.sh.
+        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
+      - name: Coverage build + report
+        # No COVERAGE_FAIL_UNDER: this job never fails the workflow on a
+        # coverage number, only on the build/test/gcovr steps themselves
+        # failing outright (a real regression, not a metric).
+        run: bash ci/tools/coverage.sh nginx
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: coverage-report
+          path: .build/coverage-report/
           retention-days: 14

@@ -6,23 +6,12 @@ name: Windows build
 # static addons only; MinGW's GNU linker also supports dynamic PE modules.
 
 on:
-  pull_request:
-    branches: [master, main]
-    paths:
-      - 'auto/**'
-      - 'filter/**'
-      - 'static/**'
-      - '*.h'
-      - 'config'
-      - 'tools/build-windows.sh'
-      - '.github/scripts/configure-msvc.sh'
-      - '.github/workflows/windows-build.yml'
-  push:
-    branches: [master]
   workflow_dispatch: {}
+  # Called by ci.yml, the single PR entry point (step 15).
+  workflow_call: {}
 
 concurrency:
-  group: windows-build-${{ github.ref }}
+  group: windows-build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
