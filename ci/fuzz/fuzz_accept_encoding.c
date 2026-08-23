@@ -120,6 +120,34 @@ ref_accepts(const uint8_t *d, size_t n)
 
         while (i < n && (d[i] == ' ' || d[i] == '\t')) i++;
 
+        /*
+         * Only ';', ',' or end may follow a coding name (RFC 9110 12.5.3:
+         * `codings` is a token). Anything else -- `zstd"x`, `zstd "x`,
+         * `zstd x` -- means the element offers no coding, and the
+         * reference says so CONFIDENTLY rather than returning -1. An
+         * unsure reference makes the differential assert nothing in
+         * either direction, which is exactly how this class stayed
+         * invisible through 15.9M runs. Skip to the element separator,
+         * honouring quoting so a comma inside a quoted run does not
+         * start a phantom element.
+         */
+        if (i < n && d[i] != ';' && d[i] != ',') {
+            int  inq = 0;
+
+            while (i < n && (inq || d[i] != ',')) {
+                if (d[i] == '\\' && inq) {
+                    if (i + 1 >= n) return -1;      /* dangling escape */
+                    i += 2;
+                    continue;
+                }
+                if (d[i] == '"') inq = !inq;
+                i++;
+            }
+            if (inq) return -1;                     /* unterminated quote */
+            if (i < n) i++;                         /* consume the ',' */
+            continue;                               /* contributes nothing */
+        }
+
         q = 1000;   /* no weight → q=1 */
 
         /*
@@ -150,6 +178,12 @@ ref_accepts(const uint8_t *d, size_t n)
                     i++;
                 }
                 pe = i;
+
+                /* empty parameter ("zstd;;q=1"): no such production in
+                 * RFC 9110, so the element is malformed. The parser
+                 * rejects it; stay confident and agree. */
+                if (pe == ps) return -1;
+
                 is_qp = (pe - ps == 1 && (d[ps] == 'q' || d[ps] == 'Q'));
 
                 while (i < n && (d[i] == ' ' || d[i] == '\t')) i++;
