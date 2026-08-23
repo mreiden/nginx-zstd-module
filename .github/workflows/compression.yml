@@ -13,6 +13,9 @@
 
 name: compression
 
+permissions:
+  contents: read
+
 on:
   push:
     paths:
@@ -35,6 +38,13 @@ jobs:
     name: Suites and proxy tools
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # 19200/19300/19330 are taken by ci-deep; this job gets its own band so
+      # two runtime jobs on one runner cannot land on the same port.
+      TEST_BASE_PORT: 19400
+      # Test::Nginx reads TEST_NGINX_PORT, not TEST_BASE_PORT; the band above
+      # is what the port-band policy checker looks for.
+      TEST_NGINX_PORT: 19400
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -91,6 +101,12 @@ jobs:
         run: |
           set -euo pipefail
           export TEST_NGINX_BINARY="$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx"
+          # Test::Nginx resolves its server root to $CWD/t/servroot (or
+          # t/servroot_<port> under prove -j) and does not create the parent.
+          # The suites live in compression/t/, so the repo root has no t/ and
+          # the mkdir bails out before a single test runs.
+          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/compression/t/servroot"
+          mkdir -p "$GITHUB_WORKSPACE/compression/t"
           prove compression/t/00-election.t compression/t/01-dict-store.t \
                 compression/t/02-dict-negotiation.t compression/t/03-static.t \
                 compression/t/04-roundtrip.t compression/t/05-tuning.t \
@@ -261,15 +277,18 @@ jobs:
           make -j"$(nproc)"
 
       - name: Absent coding fails with the build-line pointer
+        env:
+          REJECT_TOKEN: ${{ matrix.reject_token }}
+          REJECT_MSG: ${{ matrix.reject_msg }}
         run: |
           set -euo pipefail
           cd "nginx-${NGINX_VERSION}"
           mkdir -p sprefix/logs
           printf 'events {}\nhttp { server { listen 127.0.0.1:18099;\n  location / { compression_order %s; } } }\n' \
-            "${{ matrix.reject_token }}" > sprefix/s.conf
+            "$REJECT_TOKEN" > sprefix/s.conf
           out=$(objs/nginx -p "$PWD/sprefix" -c s.conf -t 2>&1 || true)
           echo "$out"
-          echo "$out" | grep -q "${{ matrix.reject_msg }}"
+          echo "$out" | grep -qF "$REJECT_MSG"
 
       - name: Static sidecar serving survives every shape
         run: |
