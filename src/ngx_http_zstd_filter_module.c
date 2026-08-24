@@ -27,7 +27,7 @@
  *
  * On platforms with __builtin_clzll (GCC, Clang), uses the compiler builtin
  * for O(1) bit-position lookup. On other platforms (MSVC, others), falls back
- * to an O(log x) binary search loop.
+ * to a linear shift-and-count loop (at most 13 iterations in range).
  *
  * Result: 10 <= returned wlog <= 23 always (respects min and cap).
  */
@@ -45,10 +45,9 @@ ngx_http_zstd_ceil_log2(size_t x)
 #if defined(__GNUC__) || defined(__clang__)
     /* Use compiler builtin for count-leading-zeros on 64-bit. GCC and Clang
      * both provide __builtin_clzll; __builtin_clz is 32-bit but we require
-     * 64-bit size_t here. The bit length (64 - leading_zeros) is already
-     * ceil-log2 for powers of two. For non-powers-of-two, it's one too small,
-     * so we increment. The test is inverted: when x IS a power of two,
-     * decrement back to the correct value. */
+     * 64-bit size_t here. The bit length (64 - leading_zeros) is exactly
+     * ceil-log2 for non-powers-of-two, and one too many for exact powers of
+     * two -- so the only correction needed is a decrement in that case. */
     unsigned long long  ull = (unsigned long long) x;
     int                 leading_zeros = __builtin_clzll(ull);
     ngx_uint_t          wlog = 64 - leading_zeros;
@@ -1270,8 +1269,16 @@ ngx_http_zstd_find_request_header(ngx_http_request_t *r, const char *name,
  *
  * Returns NGX_OK when raw is a well-formed byte-sequence decoding to
  * exactly NGX_HTTP_ZSTD_SHA256_DIGEST_LEN bytes (written to *out*),
- * NGX_DECLINED otherwise (malformed byte-sequence framing, or a decoded
- * length other than 32 bytes) -- *out* is left untouched on NGX_DECLINED.
+ * NGX_DECLINED on malformed byte-sequence framing (bad length, or a
+ * missing leading/trailing colon) -- detected before decoding, so *out*
+ * is untouched -- and NGX_ERROR when the framing is well-formed but the
+ * payload is not a 32-byte base64 value (undecodable, or decoding to a
+ * length other than 32). On NGX_ERROR *out* may have been partially
+ * written by ngx_decode_base64() and its contents are unspecified; the
+ * caller must not read it unless NGX_OK was returned.
+ *
+ * The two failure values exist so ngx_http_zstd_dcz_negotiate() can log
+ * which half rejected the header; both are equally fail-closed.
  */
 static ngx_int_t
 ngx_http_zstd_dcz_decode_digest(ngx_str_t raw,
@@ -1300,7 +1307,7 @@ ngx_http_zstd_dcz_decode_digest(ngx_str_t raw,
     if (ngx_decode_base64(&decoded, &b64) != NGX_OK
         || decoded.len != NGX_HTTP_ZSTD_SHA256_DIGEST_LEN)
     {
-        return NGX_DECLINED;
+        return NGX_ERROR;
     }
 
     return NGX_OK;
@@ -1312,6 +1319,7 @@ ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
     ngx_http_zstd_loc_conf_t *zlcf)
 {
     u_char                     buf[NGX_HTTP_ZSTD_DCZ_DECODE_BUF_LEN];
+    ngx_int_t                  rc;
     ngx_uint_t                 secure;
     ngx_uint_t                 i, nheaders;
     ngx_table_elt_t           *h, *ae;
@@ -1393,23 +1401,21 @@ ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
     /*
      * RFC 8941 byte sequence: colon-delimited standard base64. 32 bytes
      * encode to 44 characters with padding (43 without); anything longer
-     * cannot be a SHA-256 and is rejected before decoding. The framing
-     * check and ngx_decode_base64() call live in
-     * ngx_http_zstd_dcz_decode_digest() so that attacker-controlled-byte
-     * slice can be fuzzed independently of ngx_http_request_t.
+     * cannot be a SHA-256 and is rejected before decoding. The validation
+     * and ngx_decode_base64() call live in ngx_http_zstd_dcz_decode_digest()
+     * so that attacker-controlled-byte slice can be fuzzed independently
+     * of ngx_http_request_t.
      */
-    if (h->value.len < 2
-        || h->value.data[0] != ':'
-        || h->value.data[h->value.len - 1] != ':'
-        || h->value.len - 2 > 44)
-    {
+    rc = ngx_http_zstd_dcz_decode_digest(h->value, buf);
+
+    if (rc == NGX_DECLINED) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "zstd dcz: malformed Available-Dictionary (%uz bytes)",
                        h->value.len);
         return NULL;
     }
 
-    if (ngx_http_zstd_dcz_decode_digest(h->value, buf) != NGX_OK) {
+    if (rc != NGX_OK) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "zstd dcz: Available-Dictionary (%uz bytes) is not a "
                        "valid base64 SHA-256", h->value.len);
