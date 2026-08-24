@@ -17,6 +17,66 @@
 
 
 /*
+ * Compute the ceiling of log₂(x) for a size_t value: the minimum k such that
+ * 2^k >= x. Used for window-log sizing in dcz frame setup, where we must fit
+ * a dictionary and expected content within a power-of-two decompression window.
+ *
+ * Portable implementation: handles all size_t values, including edge cases.
+ * For x <= 2^10: returns 10 (ZSTD_WINDOWLOG_MIN). For x >= 2^23: caps at 23
+ * (RFC 9842 client-guarantee limit).
+ *
+ * On platforms with __builtin_clzll (GCC, Clang), uses the compiler builtin
+ * for O(1) bit-position lookup. On other platforms (MSVC, others), falls back
+ * to an O(log x) binary search loop.
+ *
+ * Result: 10 <= returned wlog <= 23 always (respects min and cap).
+ */
+static ngx_inline ngx_uint_t
+ngx_http_zstd_ceil_log2(size_t x)
+{
+    if (x <= 1024) {  /* 2^10 */
+        return 10;
+    }
+
+    if (x > ((size_t) 1 << 23)) {
+        return 23;  /* RFC 9842 cap */
+    }
+
+#if defined(__GNUC__) || defined(__clang__)
+    /* Use compiler builtin for count-leading-zeros on 64-bit. GCC and Clang
+     * both provide __builtin_clzll; __builtin_clz is 32-bit but we require
+     * 64-bit size_t here. The bit length (64 - leading_zeros) is already
+     * ceil-log2 for powers of two. For non-powers-of-two, it's one too small,
+     * so we increment. The test is inverted: when x IS a power of two,
+     * decrement back to the correct value. */
+    unsigned long long  ull = (unsigned long long) x;
+    int                 leading_zeros = __builtin_clzll(ull);
+    ngx_uint_t          wlog = 64 - leading_zeros;
+
+    if ((ull & (ull - 1)) == 0) {
+        /* Exact power of two: bit length is one too many. */
+        wlog--;
+    }
+
+    return wlog;
+#else
+    /* Fallback: linear shift-and-count to find the highest set bit position.
+     * At most 13 iterations for size_t values in our range (1025 to 2^23).
+     * Declared inside the branch to keep C99+ compound-literal style. */
+    ngx_uint_t  wlog = 10;
+    size_t      pow2 = 1024;  /* 2^10 */
+
+    while (pow2 < x && wlog < 23) {
+        pow2 <<= 1;
+        wlog++;
+    }
+
+    return wlog;
+#endif
+}
+
+
+/*
  * The ONLY sanctioned way to hash a dcz dictionary at config load: the
  * $zstd_dcz_dicts_hashed accounting is inseparable from the operation.
  * An increment sitting beside a call site counts that line running, not
@@ -408,6 +468,8 @@ static char *ngx_http_zstd_set_bufs_slot(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_zstd_check_bufs_product(ngx_conf_t *cf,
     ngx_bufs_t *bufs, ngx_flag_t unsafe, const char *ctx, ngx_flag_t advise);
+static char *ngx_http_zstd_set_bypass_vary(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static void ngx_http_zstd_cleanup_dict(void *data);
 static void ngx_http_zstd_cleanup_cctx(void *data);
 static void ngx_http_zstd_release_cctx(void *data);
@@ -659,7 +721,7 @@ static ngx_command_t  ngx_http_zstd_filter_commands[] = {
 
     { ngx_string("zstd_bypass_vary"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_str_slot,
+      ngx_http_zstd_set_bypass_vary,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_zstd_loc_conf_t, bypass_vary),
       NULL },
@@ -821,18 +883,18 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
         return ngx_http_next_header_filter(r);
     }
 
+    /* header-only response: no body to compress */
+    if (r->header_only) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "zstd: skip, header-only response");
+        return ngx_http_next_header_filter(r);
+    }
+
     /* content type not in zstd_types */
     if (ngx_http_test_content_type(r, &zlcf->types) == NULL) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "zstd: skip, content type \"%V\" not in zstd_types",
                        &r->headers_out.content_type);
-        return ngx_http_next_header_filter(r);
-    }
-
-    /* header-only response: no body to compress */
-    if (r->header_only) {
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "zstd: skip, header-only response");
         return ngx_http_next_header_filter(r);
     }
 
@@ -1276,15 +1338,15 @@ ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
         || h->value.len - 2 > 44)
     {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "zstd dcz: malformed Available-Dictionary \"%V\"",
-                       &h->value);
+                       "zstd dcz: malformed Available-Dictionary (%uz bytes)",
+                       h->value.len);
         return NULL;
     }
 
     if (ngx_http_zstd_dcz_decode_digest(h->value, buf) != NGX_OK) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "zstd dcz: Available-Dictionary \"%V\" is not a "
-                       "base64 SHA-256", &h->value);
+                       "zstd dcz: Available-Dictionary (%uz bytes) is not a "
+                       "valid base64 SHA-256", h->value.len);
         return NULL;
     }
 
@@ -1312,7 +1374,8 @@ ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
                                 sizeof("none") - 1) == 0))
     {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "zstd dcz: skip, Sec-Fetch-Site \"%V\"", &h->value);
+                       "zstd dcz: skip, Sec-Fetch-Site (%uz bytes, "
+                       "not same-origin or none)", h->value.len);
         return NULL;
     }
 
@@ -1812,7 +1875,21 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     *ctx->last_out = cl;
     ctx->last_out  = &cl->next;
 
-    ngx_memzero(&ctx->buffer_out, sizeof(ZSTD_outBuffer));
+    /*
+     * Invalidate out_buf to force get_buf() to acquire a fresh buffer on the
+     * next iteration. The guard at get_buf's top (ctx->out_buf != NULL &&
+     * ctx->buffer_out.pos < ctx->buffer_out.size) fails when out_buf is NULL,
+     * triggering buffer allocation or free-chain reuse.
+     *
+     * The buffer_out fields (dst, pos, size) are stale after this function
+     * queues b; they are always set by get_buf() before compress() reads them.
+     * Safety proof: NGX_DECLINED from get_buf() (nomem case) and error paths
+     * route through ngx_http_next_body_filter() to send queued buffers before
+     * returning (body filter), then ngx_chain_update_chains() recycles buffers
+     * and returns, then out_buf = NULL is set before any reentry to compress().
+     * No path uses stale buffer_out after queueing.
+     */
+    ctx->out_buf = NULL;
 
     return last ? NGX_OK : NGX_AGAIN;
 }
@@ -1886,7 +1963,9 @@ ngx_http_zstd_filter_add_data(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
         ctx->flush = 1;
     }
 
-    if (ngx_buf_size(ctx->in_buf) == 0) {
+    size_t in_size = ngx_buf_size(ctx->in_buf);
+
+    if (in_size == 0) {
         /*
          * Data-less buffer (flush/sync/last carrier, or an empty data
          * buf). Its signal flags were captured above; never load it into
@@ -1902,9 +1981,9 @@ ngx_http_zstd_filter_add_data(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
 
     ctx->buffer_in.src = ctx->in_buf->pos;
     ctx->buffer_in.pos = 0;
-    ctx->buffer_in.size = ngx_buf_size(ctx->in_buf);
+    ctx->buffer_in.size = in_size;
 
-    ctx->bytes_in += ngx_buf_size(ctx->in_buf);
+    ctx->bytes_in += in_size;
 
     return NGX_OK;
 }
@@ -2347,12 +2426,11 @@ ngx_http_zstd_filter_init_cctx(ngx_http_request_t *r,
                       ? (size_t) ctx->pledged_size
                       : 1024 * 1024);
 
-        /* 10 = ZSTD_WINDOWLOG_MIN (static-API constant; literal so the
-         * plain-API build compiles) */
-        for (wlog = 10;
-             wlog < NGX_HTTP_ZSTD_DCZ_MAX_WINDOW_LOG
-             && ((size_t) 1 << wlog) < required;
-             wlog++) { /* void */ }
+        /* Compute the minimum window log that fits both dictionary and
+         * content. ngx_http_zstd_ceil_log2() returns the smallest k such that
+         * 2^k >= required, capped at NGX_HTTP_ZSTD_DCZ_MAX_WINDOW_LOG (23),
+         * bounded at minimum by ZSTD_WINDOWLOG_MIN (10). */
+        wlog = ngx_http_zstd_ceil_log2(required);
 
         if (zlcf->window_log > 0 && zlcf->window_log < wlog) {
             wlog = zlcf->window_log;
@@ -4477,6 +4555,102 @@ ngx_http_zstd_check_bufs_product(ngx_conf_t *cf, ngx_bufs_t *bufs,
  * double-report it for the common case of an explicit large value that
  * survives to the merge unchanged.
  */
+
+
+/*
+ * Custom setter for zstd_bypass_vary directive. Validates that the value is
+ * exactly ONE RFC 9110 field-name token (case-preserving), and rejects:
+ *   - Bare wildcard "*", which disables shared caching
+ *   - Comma or semicolon (list/parameter separators)
+ *   - Quoted strings (DQUOTE), which are never part of a token
+ *   - Any non-tchar byte
+ *
+ * Per RFC 9110 §5.1, tchar includes: ! # $ % & ' * + - . ^ _ ` | ~
+ *   and DIGIT / ALPHA.
+ *
+ * Valid examples: "Accept-Encoding", "X-My-Header", "content-type"
+ * Invalid: "*" (alone), "Accept-Encoding, Custom", "Accept-Encoding;q=1"
+ */
+static char *
+ngx_http_zstd_set_bypass_vary(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_zstd_loc_conf_t  *zlcf = conf;
+    ngx_str_t                 *value;
+    u_char                    *p, *end;
+
+    value = cf->args->elts;
+
+    /* Check for duplicate within the same block: .data != NULL detects
+     * parse-time duplicates (directive appearing twice in same {}). Each
+     * block starts zero-initialized from create_loc_conf (ngx_pcalloc), so
+     * .data is NULL until we set it. Inheritance from parent blocks happens
+     * later via ngx_conf_merge_str_value after parsing, so child blocks can
+     * override parent values without error — normal nginx semantics. */
+    if (zlcf->bypass_vary.data != NULL) {
+        return (char *) "is duplicate";
+    }
+
+    /* ngx_conf_set_str_slot would just dup this; validate first. */
+    value = &value[1];  /* Skip directive name, take the argument */
+
+    if (value->len == 0) {
+        return (char *) "empty value";
+    }
+
+    /* Bare wildcard is never valid: it disables shared caching and matches
+     * any Vary field, defeating the purpose of naming a specific header. */
+    if (value->len == 1 && value->data[0] == '*') {
+        return (char *)
+                   "invalid value: bare wildcard '*' disables shared caching";
+    }
+
+    /* Validate as a single RFC 9110 token. Per RFC 9110 §5.1:
+     *   tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-"
+     *         / "." / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+     * Reject commas and semicolons (list/parameter separators) and quotes
+     * (not tchar; never part of a token). Accept all other tchar including
+     * '*' in non-solitary positions (e.g., X-Foo*Bar is a valid token). */
+    for (p = value->data, end = value->data + value->len; p < end; p++) {
+        u_char  c = *p;
+
+        /* List/parameter separators: reject to prevent ambiguous Vary. */
+        if (c == ',' || c == ';') {
+            return (char *) "invalid value: comma or semicolon (not a token)";
+        }
+
+        /* Quoted string: DQUOTE is never part of a token. */
+        if (c == '"') {
+            return (char *) "invalid value: quoted string (not a token)";
+        }
+
+        /* tchar set per RFC 9110 §5.1. Accept all, including '*' in
+         * non-solitary positions (e.g., X-Foo*Bar is valid). */
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+              || (c >= '0' && c <= '9')
+              || c == '!' || c == '#' || c == '$' || c == '%'
+              || c == '&' || c == '\'' || c == '*' || c == '+'
+              || c == '-' || c == '.' || c == '^' || c == '_'
+              || c == '`' || c == '|' || c == '~'))
+        {
+            return (char *)
+                       "invalid value: not a valid field-name token "
+                       "(RFC 9110)";
+        }
+    }
+
+    /* Valid token: store it. ngx_conf_set_str_slot behavior (dup into
+     * pool). */
+    zlcf->bypass_vary.len = value->len;
+    zlcf->bypass_vary.data = ngx_pstrdup(cf->pool, value);
+
+    if (zlcf->bypass_vary.data == NULL) {
+        return (char *) "allocation failed";
+    }
+
+    return NGX_CONF_OK;
+}
+
+
 static char *
 ngx_http_zstd_set_bufs_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
