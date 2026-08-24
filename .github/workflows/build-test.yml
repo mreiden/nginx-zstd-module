@@ -1527,6 +1527,14 @@ jobs:
           python3 ci/tools/test_cctx_advisory_policy.py \
             --nginx-binary "$TEST_NGINX_BINARY" --port 18130
           echo "✓ CCtx memory advisory policy matrix passed"
+          # Aggregate "zstd_buffers number size" bound: ngx_conf_set_bufs_slot()
+          # (nginx core) never checks the product, and neither does the
+          # merge that applies an inherited or defaulted value. Overflow
+          # is a hard error; a representable-but-large total is advisory
+          # only. ci/t cannot express "PASS and warns"; see the tool.
+          python3 ci/tools/test_bufs_bound_policy.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18141
+          echo "✓ zstd_buffers aggregate bound policy matrix passed"
 
       - name: Run RFC 9842 dcz end-to-end test
         timeout-minutes: 6
@@ -1972,6 +1980,8 @@ jobs:
             --nginx-binary "$TEST_NGINX_BINARY" --port 19122
           python3 ci/tools/test_cctx_advisory_policy.py \
             --nginx-binary "$TEST_NGINX_BINARY" --port 19130
+          python3 ci/tools/test_bufs_bound_policy.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 19141
           python3 ci/tools/test_zstd_long_ldm.py \
             --nginx-binary "$TEST_NGINX_BINARY" --port 19102 --backend-port 19103
           python3 ci/tools/test_dcz.py --nginx-binary "$TEST_NGINX_BINARY" \
