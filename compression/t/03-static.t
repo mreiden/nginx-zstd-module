@@ -46,7 +46,14 @@ our $ss_fcs2     = $magic . "\x60\xFF\xFF";
 our $magic_only  = $magic;                 # 4 bytes: header truncated
 our $desc_trunc  = $magic . "\x00";        # 5 bytes: window byte missing
 our $tiny3       = "\x28\xB5\x2F";         # under the 4-byte minimum
-our $skippable   = "\x50\x2A\x4D\x18" . ("\x00" x 8);  # exempt lead
+our $skippable   = "\x50\x2A\x4D\x18" . ("\x00" x 8);  # bare skippable, nothing after
+# a leading skippable frame (RFC 8878 §3.2): magic + 4-byte LE skip
+# length + that many payload bytes. The window guard must not be
+# bypassable by prepending one (parent #159): the probe walks past the
+# skippable frame to the first regular frame and checks ITS window.
+our $skip4       = "\x50\x2A\x4D\x18" . pack("V", 4) . ("\xAA" x 4);
+our $skip_bigwin = $skip4 . $win16m_desc;   # skippable + 16 MB -> declines
+our $skip_ok     = $skip4 . $win8m_desc;    # skippable + 8 MB -> served (dcz shape)
 
 # 8 KB of randomness for the directio blocks (compressed output stays
 # ~8 KB, comfortably over the directio threshold)
@@ -554,11 +561,38 @@ too small to be a zstd frame
 
 
 
-=== TEST 22: a skippable leading frame is exempt from the window check
-# its real header sits after a variable-length skip; the documented
-# leading-frame scope serves it as-is
+=== TEST 22a: a skippable lead does NOT exempt the regular frame's window (parent #159)
+# the bug this closes: prepend one skippable frame ahead of an
+# oversized-window regular frame and the 8 MB browser guard used to be
+# bypassed entirely. The probe now walks past the skippable frame and
+# checks the regular frame's window — 16 MB, so it DECLINES to identity.
 --- user_files eval
-[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::skippable ] ]
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::skip_bigwin ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding:
+--- response_body eval
+$::src
+--- error_log
+declares a 16777216-byte decompression window
+
+
+
+=== TEST 22b: a valid dcz-shape prefix (skippable + OK window) is served
+# one skippable frame ahead of an 8 MB regular frame — the RFC 8878
+# dictionary-prefix shape — passes the walk and is served as-is.
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::skip_ok ] ]
 --- config
     location /st/ {
         compression_static on;
@@ -573,9 +607,34 @@ Accept-Encoding: zstd
 --- response_headers
 Content-Encoding: zstd
 --- response_body eval
-$::skippable
+$::skip_ok
 --- no_error_log
 [error]
+
+
+
+=== TEST 22c: a bare skippable frame with no following regular frame declines
+# a skippable frame is not a servable stream on its own; the walk lands
+# on non-frame bytes past it and declines to identity.
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::skippable ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding:
+--- response_body eval
+$::src
+--- error_log
+is not a zstd frame
 
 
 

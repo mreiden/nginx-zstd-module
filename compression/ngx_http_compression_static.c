@@ -147,6 +147,40 @@ ngx_module_t  ngx_http_compression_static_module = {
  * directio_alignment when larger */
 #define NGX_HTTP_COMPRESSION_STATIC_DIO_PROBE   4096
 
+/*
+ * The frame probe runs on Win32 too (parent #162) and on any POSIX
+ * build with pread(2); a POSIX build without pread skips it (a
+ * build-time tripwire — every modern target has pread). Gated so the
+ * verdict logic below is shared byte-for-byte across platforms and
+ * cannot drift, which is exactly how Win32 came to serve .zst files
+ * with no validation at all.
+ */
+#if (NGX_WIN32)
+#define NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE  1
+#define NGX_HTTP_COMPRESSION_STATIC_PREAD_NAME  "ReadFile"
+#elif (NGX_HAVE_PREAD)
+#define NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE  1
+#define NGX_HTTP_COMPRESSION_STATIC_PREAD_NAME  "pread"
+#else
+#define NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE  0
+#endif
+
+/* ngx_http_compression_static_probe_frame() verdicts (parent #159) */
+#define NGX_HTTP_COMPRESSION_STATIC_FRAME_OK          0
+#define NGX_HTTP_COMPRESSION_STATIC_FRAME_NOT_ZSTD    1
+#define NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED   2
+#define NGX_HTTP_COMPRESSION_STATIC_FRAME_WINDOW_BIG  3
+#define NGX_HTTP_COMPRESSION_STATIC_FRAME_SKIP        4
+
+/*
+ * How many leading skippable frames the handler follows before it
+ * declines. A dcz-style prefix is exactly ONE skippable frame ahead of
+ * the payload, so 4 is generous headroom while still bounding the walk:
+ * an attacker cannot turn a skippable-frame chain into an unbounded
+ * scan, since each frame past the bound is a hard decline.
+ */
+#define NGX_HTTP_COMPRESSION_STATIC_MAX_SKIP_FRAMES   4
+
 
 static ngx_int_t ngx_http_compression_static_check_zstd(
     ngx_http_request_t *r, ngx_open_file_info_t *of,
@@ -287,30 +321,174 @@ ngx_http_compression_static_default_order(ngx_conf_t *cf,
 }
 
 
+#if (NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE)
+
 /*
- * The parent zstd_static probe, ported intact: magic sanity (a
- * truncated / half-downloaded / mistakenly-renamed file must not be
- * served as zstd) plus the declared-window cap on the LEADING regular
- * frame (streaming encoders that were never told the input size stamp
- * the level's default window — a 93 KB asset can declare 128 MB, and
- * every browser rejects it before decoding a byte). pread only: an
- * lseek would corrupt the open_file_cache's shared fd position. Under
- * directio the read is block-aligned at max(4096, directio_alignment)
- * into an equally aligned buffer, and a failed aligned read DECLINES —
- * for a validation read, falling back beats certifying a file we
- * could not inspect.
+ * Pure frame-header probe (parent #159): decides the leading frame of a
+ * .zst file from the first `n` bytes read at some offset. No I/O, no
+ * logging, no request state — the arithmetic only. Reads at most 18
+ * bytes and never past `n`; every layout path checks it got the bytes
+ * that layout requires. On FRAME_WINDOW_BIG the declared window is
+ * stored through `window`; on FRAME_SKIP the skippable frame's 4-byte
+ * little-endian declared skip length (RFC 8878 §3.2) is stored there
+ * instead — same out-param, different unit, read only against the
+ * matching verdict. Hardcoded magic constants, not zstd.h: the static
+ * module links no compression library.
+ */
+static ngx_int_t
+ngx_http_compression_static_probe_frame(const u_char *hdr, size_t n,
+    uint64_t *window)
+{
+    uint32_t    mw;
+    uint64_t    w;
+    ngx_uint_t  i, fhd, fcs_size, off;
+
+    static const ngx_uint_t  did_len[4] = { 0, 1, 2, 4 };
+
+    mw = ((uint32_t) hdr[0])
+       | ((uint32_t) hdr[1] << 8)
+       | ((uint32_t) hdr[2] << 16)
+       | ((uint32_t) hdr[3] << 24);
+
+    if (mw != NGX_HTTP_COMPRESSION_STATIC_ZSTD_MAGIC
+        && (mw & NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_MASK)
+           != NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_START)
+    {
+        return NGX_HTTP_COMPRESSION_STATIC_FRAME_NOT_ZSTD;
+    }
+
+    /*
+     * Skippable frame: magic(4) + Frame_Size(4, LE) + Frame_Size opaque
+     * bytes. There is no window here, only a length to jump, so the
+     * caller must resolve the skip (bounded) and probe the frame that
+     * follows — an attacker-controlled skippable prefix must not dodge
+     * the window check on the frame that actually decodes. That was the
+     * bug: OK-ing every skippable magic let a one-frame-longer file
+     * bypass the 8 MB guard entirely.
+     */
+    if (mw != NGX_HTTP_COMPRESSION_STATIC_ZSTD_MAGIC) {
+        if (n < 8) {
+            return NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED;
+        }
+
+        *window = ((uint64_t) hdr[4])
+                | ((uint64_t) hdr[5] << 8)
+                | ((uint64_t) hdr[6] << 16)
+                | ((uint64_t) hdr[7] << 24);
+
+        return NGX_HTTP_COMPRESSION_STATIC_FRAME_SKIP;
+    }
+
+    /* declared-window check on the leading regular frame (RFC 8878) */
+    if (n < 5) {
+        return NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED;
+    }
+
+    fhd = hdr[4];
+
+    if (!(fhd & 0x20)) {
+        /* Window_Descriptor follows */
+        if (n < 6) {
+            return NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED;
+        }
+
+        w = (uint64_t) 1 << (10 + (hdr[5] >> 3));
+        w += (w >> 3) * (hdr[5] & 7);
+
+    } else {
+        /* Single_Segment: window = frame content size, behind the
+         * optional dictionary id */
+        fcs_size = (fhd >> 6) ? ((ngx_uint_t) 1 << (fhd >> 6)) : 1;
+        off = 5 + did_len[fhd & 3];
+
+        if (n < off + fcs_size) {
+            return NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED;
+        }
+
+        w = 0;
+        for (i = 0; i < fcs_size; i++) {
+            w |= (uint64_t) hdr[off + i] << (8 * i);
+        }
+
+        if (fcs_size == 2) {
+            w += 256;  /* RFC 8878: the 2-byte field is offset */
+        }
+    }
+
+    if (w > NGX_HTTP_COMPRESSION_STATIC_MAX_WINDOW) {
+        *window = w;
+        return NGX_HTTP_COMPRESSION_STATIC_FRAME_WINDOW_BIG;
+    }
+
+    return NGX_HTTP_COMPRESSION_STATIC_FRAME_OK;
+}
+
+
+/*
+ * The probe's only platform-dependent step (parent #162): fetch up to
+ * `size` bytes from `offset` WITHOUT moving the descriptor's file
+ * position — pread(2) on POSIX, ngx_read_file() (offset-explicit
+ * ReadFile via OVERLAPPED) on Win32. Everything else is shared, so the
+ * two platforms cannot drift. Returns the byte count, or -1 on error,
+ * matching pread(2) so the caller's short-read handling is unchanged.
+ */
+static ssize_t
+ngx_http_compression_static_pread(ngx_fd_t fd, u_char *buf, size_t size,
+    off_t offset, ngx_log_t *log, ngx_str_t *name)
+{
+#if (NGX_WIN32)
+    ssize_t     n;
+    ngx_file_t  file;
+
+    ngx_memzero(&file, sizeof(ngx_file_t));
+    file.fd = fd;
+    file.log = log;
+    file.name = *name;
+
+    n = ngx_read_file(&file, buf, size, offset);
+
+    if (n == NGX_ERROR) {
+        return -1;
+    }
+
+    return n;
+#else
+    (void) log;
+    (void) name;
+
+    return pread(fd, buf, size, offset);
+#endif
+}
+
+#endif /* NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE */
+
+
+/*
+ * The parent zstd_static probe (ported): magic sanity (a truncated /
+ * half-downloaded / mistakenly-renamed file must not be served as zstd)
+ * plus the declared-window cap on the leading REGULAR frame — reached
+ * by walking a bounded chain of leading skippable frames so the guard
+ * cannot be dodged by prepending one (parent #159). Reads are
+ * offset-explicit (parent #162: pread(2)/ngx_read_file()) so they never
+ * corrupt the open_file_cache's shared fd position. Under directio the
+ * read is block-aligned at max(4096, directio_alignment) into an
+ * equally aligned buffer, and a failed aligned read DECLINES — for a
+ * validation read, falling back beats certifying a file we could not
+ * inspect. Runs on Win32 too now (parent #162).
  */
 static ngx_int_t
 ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
     ngx_open_file_info_t *of, ngx_http_core_loc_conf_t *clcf,
     ngx_str_t *path)
 {
-#if !(NGX_WIN32) && (NGX_HAVE_PREAD)
+#if (NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE)
     u_char      hdrbuf[18];
     u_char     *hdr;
     size_t      want;
     ssize_t     n;
-    uint32_t    mw;
+    uint64_t    window, skip;
+    ngx_uint_t  frames;
+    off_t       pos;
     ngx_log_t  *log;
 
     log = r->connection->log;
@@ -338,100 +516,70 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
         want = sizeof(hdrbuf);
     }
 
-    n = pread(of->fd, hdr, want, 0);
-    if (n < 4) {
-        if (of->is_directio) {
-            ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
-                          "compression static: %uz-byte aligned probe on "
-                          "directio file \"%V\" returned %z — declining; "
-                          "check directio_alignment against the device "
-                          "geometry", want, path, n);
+    pos = 0;
+
+    /*
+     * Walk a bounded chain of leading skippable frames to reach the
+     * first regular frame; each iteration reads at the current offset,
+     * exactly like the original single-shot probe did at offset 0.
+     */
+    for (frames = 0; ; frames++) {
+
+        if (frames >= NGX_HTTP_COMPRESSION_STATIC_MAX_SKIP_FRAMES) {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "compression static: \"%V\" has more than %ui "
+                          "leading skippable frames — declining rather "
+                          "than searching further for the first regular "
+                          "frame", path,
+                          (ngx_uint_t)
+                              NGX_HTTP_COMPRESSION_STATIC_MAX_SKIP_FRAMES);
             return NGX_DECLINED;
         }
 
-        ngx_log_error(NGX_LOG_CRIT, log, ngx_errno,
-                      "compression static: pread(\"%V\", frame header) "
-                      "returned %z", path, n);
-        return NGX_DECLINED;
-    }
+        n = ngx_http_compression_static_pread(of->fd, hdr, want, pos, log,
+                                              path);
+        if (n < 4) {
+            if (of->is_directio) {
+                ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                              "compression static: %uz-byte aligned probe "
+                              "on directio file \"%V\" returned %z — "
+                              "declining; check directio_alignment against "
+                              "the device geometry", want, path, n);
+                return NGX_DECLINED;
+            }
 
-    if (of->is_directio) {
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0,
-                       "compression static: %uz-byte aligned probe on "
-                       "directio file \"%V\"", want, path);
-    }
+            ngx_log_error(NGX_LOG_CRIT, log, ngx_errno,
+                          "compression static: "
+                          NGX_HTTP_COMPRESSION_STATIC_PREAD_NAME
+                          "(\"%V\", frame header) returned %z", path, n);
+            return NGX_DECLINED;
+        }
 
-    mw = ((uint32_t) hdr[0])
-       | ((uint32_t) hdr[1] << 8)
-       | ((uint32_t) hdr[2] << 16)
-       | ((uint32_t) hdr[3] << 24);
+        if (of->is_directio) {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0,
+                           "compression static: %uz-byte aligned probe on "
+                           "directio file \"%V\"", want, path);
+        }
 
-    if (mw != NGX_HTTP_COMPRESSION_STATIC_ZSTD_MAGIC
-        && (mw & NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_MASK)
-           != NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_START)
-    {
-        ngx_log_error(NGX_LOG_ERR, log, 0,
-                      "compression static: \"%V\" is not a zstd frame "
-                      "(leading bytes 0x%02xd%02xd%02xd%02xd)", path,
-                      (ngx_uint_t) hdr[0], (ngx_uint_t) hdr[1],
-                      (ngx_uint_t) hdr[2], (ngx_uint_t) hdr[3]);
-        return NGX_DECLINED;
-    }
+        switch (ngx_http_compression_static_probe_frame(hdr, (size_t) n,
+                                                        &window))
+        {
 
-    /* leading REGULAR frame only — a skippable lead is exempt (its
-     * real header sits after a variable skip) and multi-frame assets
-     * are pathological; the parent README documents the scope */
-    if (mw == NGX_HTTP_COMPRESSION_STATIC_ZSTD_MAGIC) {
-        uint64_t    window;
-        ngx_uint_t  i, fhd, fcs_size, off;
+        case NGX_HTTP_COMPRESSION_STATIC_FRAME_NOT_ZSTD:
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "compression static: \"%V\" is not a zstd frame "
+                          "(leading bytes 0x%02xd%02xd%02xd%02xd)", path,
+                          (ngx_uint_t) hdr[0], (ngx_uint_t) hdr[1],
+                          (ngx_uint_t) hdr[2], (ngx_uint_t) hdr[3]);
+            return NGX_DECLINED;
 
-        static const ngx_uint_t  did_len[4] = { 0, 1, 2, 4 };
-
-        if (n < 5) {
+        case NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED:
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" frame header "
                           "truncated", path);
             return NGX_DECLINED;
-        }
 
-        fhd = hdr[4];
-
-        if (!(fhd & 0x20)) {
-            /* Window_Descriptor follows */
-            if (n < 6) {
-                ngx_log_error(NGX_LOG_ERR, log, 0,
-                              "compression static: \"%V\" frame header "
-                              "truncated", path);
-                return NGX_DECLINED;
-            }
-
-            window = (uint64_t) 1 << (10 + (hdr[5] >> 3));
-            window += (window >> 3) * (hdr[5] & 7);
-
-        } else {
-            /* Single_Segment: window = frame content size, behind the
-             * optional dictionary id */
-            fcs_size = (fhd >> 6) ? ((ngx_uint_t) 1 << (fhd >> 6)) : 1;
-            off = 5 + did_len[fhd & 3];
-
-            if ((size_t) n < off + fcs_size) {
-                ngx_log_error(NGX_LOG_ERR, log, 0,
-                              "compression static: \"%V\" frame header "
-                              "truncated", path);
-                return NGX_DECLINED;
-            }
-
-            window = 0;
-            for (i = 0; i < fcs_size; i++) {
-                window |= (uint64_t) hdr[off + i] << (8 * i);
-            }
-
-            if (fcs_size == 2) {
-                window += 256;  /* RFC 8878: the 2-byte field is offset */
-            }
-        }
-
-        if (window > NGX_HTTP_COMPRESSION_STATIC_MAX_WINDOW) {
+        case NGX_HTTP_COMPRESSION_STATIC_FRAME_WINDOW_BIG:
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" declares a %uL-byte "
                           "decompression window, above the 8 MB limit "
@@ -440,7 +588,44 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                           "used; recompress with a window log <= 23", path,
                           window);
             return NGX_DECLINED;
+
+        case NGX_HTTP_COMPRESSION_STATIC_FRAME_SKIP:
+
+            /*
+             * `window` carries the declared skip length here. Prove the
+             * 8-byte skippable header AND the full declared skip both
+             * fit within of->size before trusting the jump — checked
+             * arithmetic throughout, since `skip` is attacker-controlled
+             * and wide enough to overflow a 32-bit add on its own.
+             */
+            skip = window;
+
+            if ((uint64_t) pos > (uint64_t) of->size
+                || (uint64_t) of->size - (uint64_t) pos < 8)
+            {
+                ngx_log_error(NGX_LOG_ERR, log, 0,
+                              "compression static: \"%V\" skippable frame "
+                              "header runs past end of file", path);
+                return NGX_DECLINED;
+            }
+
+            if (skip > (uint64_t) of->size - (uint64_t) pos - 8) {
+                ngx_log_error(NGX_LOG_ERR, log, 0,
+                              "compression static: \"%V\" skippable frame "
+                              "declares a %uL-byte skip past end of file",
+                              path, skip);
+                return NGX_DECLINED;
+            }
+
+            pos += (off_t) 8 + (off_t) skip;
+
+            continue;
+
+        default:
+            break;
         }
+
+        break;
     }
 
 #else
@@ -449,6 +634,8 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
 
     return NGX_OK;
 }
+
+
 
 
 static ngx_int_t
