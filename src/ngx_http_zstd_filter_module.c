@@ -3439,6 +3439,28 @@ ngx_http_zstd_open_dict_file(ngx_conf_t *cf, ngx_str_t *path,
         }
     }
 
+    /*
+     * Clear O_NONBLOCK now that the target is confirmed regular. The flag
+     * exists only so the open() above cannot block the config-parsing
+     * master on a FIFO with no writer; that job is done. Leaving it set
+     * lets the caller's read hit the non-blocking-regular-file behaviour
+     * that some filesystems have but ext4/xfs do not: on a 9p/drvfs mount
+     * (a WSL /mnt/c dictionary, a Plan 9 export) read() returns a SHORT
+     * count on a regular file, and both callers treat a short read as a
+     * fatal "incomplete read" — so a valid dictionary larger than one such
+     * chunk fails config load there. A blocking read loops in the kernel
+     * and returns the whole file on every filesystem. fcntl() is a no-op
+     * that cannot fail meaningfully here (valid fd, defined flags); ignore
+     * its result rather than fail a load over a hardening detail.
+     */
+    {
+        int  fl = fcntl(fd, F_GETFL);
+
+        if (fl != -1) {
+            (void) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+        }
+    }
+
 #endif
 
     return fd;
