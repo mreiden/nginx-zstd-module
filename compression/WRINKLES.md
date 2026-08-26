@@ -725,6 +725,26 @@ last-match), re-derive the attack order for the local code — copying
 the parent's test vectors verbatim would have produced tests that
 pass against the unfixed module.
 
+### 33. `compression_min_length` cannot apply to chunked responses (parent #150)
+
+The threshold is gated on a known Content-Length: the header filter
+checks `r->headers_out.content_length_n != -1 && ... < min_length`
+(module.c). A chunked or proxied response with no declared length skips
+the check entirely and is compressed however small it is — a body below
+the floor can come out *larger* than the origin (the parent measured a
+47-byte chunked body under a 1024 floor returning 56 bytes with a
+`Content-Encoding`). Same shape here; the compression module inherits it
+because the gate is the same.
+
+Enforcing the floor on a streaming body would need deferred-commit
+buffering — holding the response until enough bytes accumulate to decide,
+which moves when headers may be sent. That is a design change the
+directive deliberately does not make (it would also fight the data-less
+flush pin, finding #31). Documented, not fixed: an operator who needs a
+small-response floor makes the upstream send Content-Length, or disables
+compression for that location. The parent carries the same note in its
+README; this module's README defers directive reference to here.
+
 ## Boundary coverage (post round 2)
 
 Round 2's overflow was a boundary bug, so the boundaries got a sweep
