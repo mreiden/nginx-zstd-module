@@ -73,7 +73,7 @@ Content-Encoding: dcz
 --- response_body_like eval
 $::dcz_re
 --- raw_response_headers_like eval
-qr/Vary: Accept-Encoding, Available-Dictionary/
+qr/Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site/
 --- raw_response_headers_unlike eval
 qr/Vary: Accept-Encoding\r/
 --- no_error_log
@@ -127,7 +127,7 @@ Accept-Encoding: zstd, dcz
 --- response_headers
 Content-Encoding: zstd
 --- raw_response_headers_like eval
-qr/Vary: Accept-Encoding, Available-Dictionary/
+qr/Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site/
 --- no_error_log
 [error]
 
@@ -280,7 +280,7 @@ $::dcz_re
 --- request
 GET /t
 --- raw_response_headers_like eval
-qr/Vary: Accept-Encoding, Available-Dictionary/
+qr/Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site/
 --- raw_response_headers_unlike eval
 qr/Vary: Accept-Encoding\r/
 --- response_body
@@ -446,7 +446,7 @@ Content-Encoding: dcz
 --- response_body_like eval
 $::dcz_re
 --- raw_response_headers_like eval
-qr/Vary: Accept-Encoding, Available-Dictionary/
+qr/Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site/
 
 
 === TEST 15b: control — without the bypass, the sidecar wins
@@ -525,6 +525,8 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: cross-site}
 --- response_headers
 Content-Encoding: zstd
+--- raw_response_headers_like eval
+qr/Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site/
 
 
 === TEST 16b: Sec-Fetch-Site same-origin is allowed

@@ -1304,24 +1304,32 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     /*
      * Vary before any accept decision, so identity fallbacks vary too.
      *
-     * Locations WITHOUT dictionaries delegate Accept-Encoding via the
-     * helper (r->gzip_vary with the gzip module — gated on "gzip_vary
-     * on", which merge_conf warns about — or a literal push without).
+     * Locations WITHOUT dictionaries emit Vary: Accept-Encoding via the
+     * helper (which now does it by construction — parent #163).
      *
      * Locations WITH dictionaries push ONE combined line,
-     * "Vary: Accept-Encoding, Available-Dictionary", instead of a
-     * delegated AE line plus a second literal AD line (review round
-     * 2): two Vary lines are legal per RFC 9110, but a fair number of
-     * intermediary caches key on the FIRST line only — precisely the
-     * hazard this header exists to prevent. Delegation is skipped ON
-     * PURPOSE there, so the core emitter cannot add a second line;
-     * these locations therefore need no "gzip_vary on" either (the
-     * merge-time warning skips them). Known narrow corner, accepted
-     * and documented: a gzip DEFERRAL in a dict location lets core
-     * gzip set r->gzip_vary itself and emit its own AE line beside
-     * the combined one — only when gzip is elected ahead of every
-     * better coding, and the combined line is still present for
-     * caches that read all lines.
+     * "Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site",
+     * instead of a delegated AE line plus separate literal lines
+     * (review round 2): two Vary lines are legal per RFC 9110, but a
+     * fair number of intermediary caches key on the FIRST line only —
+     * precisely the hazard this header exists to prevent. Delegation is
+     * skipped ON PURPOSE there so the core emitter cannot add a second
+     * line. Known narrow corner, accepted and documented: a gzip
+     * DEFERRAL in a dict location lets core gzip set r->gzip_vary itself
+     * and emit its own AE line beside the combined one — only when gzip
+     * is elected ahead of every better coding, and the combined line is
+     * still present for caches that read all lines.
+     *
+     * Sec-Fetch-Site rides in the SAME line (parent #160):
+     * match_dict() below refuses dcz for any Sec-Fetch-Site other than
+     * absent / "same-origin" / "none", which makes it a
+     * response-selection input. Without it in Vary a shared cache
+     * filled by a same-origin request would serve the dcz body to a
+     * cross-site request whose gate said no (or vice versa) — a hit on
+     * the wrong variant across the RFC 9842 §8.3 partition. Pushed
+     * unconditionally here for the same reason Available-Dictionary is:
+     * every fallback below (plain zstd/brotli, identity) is a variant a
+     * cache must not reuse across the gate.
      */
     if (conf->dicts != NULL && conf->dicts->nelts > 0) {
         ngx_table_elt_t  *v;
@@ -1333,7 +1341,8 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         v->hash = 1;
         v->next = NULL;
         ngx_str_set(&v->key, "Vary");
-        ngx_str_set(&v->value, "Accept-Encoding, Available-Dictionary");
+        ngx_str_set(&v->value,
+                    "Accept-Encoding, Available-Dictionary, Sec-Fetch-Site");
 
     } else if (ngx_http_compression_vary(r) != NGX_OK) {
         return NGX_ERROR;
