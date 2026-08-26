@@ -500,12 +500,12 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
 {
 #if (NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE)
     u_char      hdrbuf[18];
-    u_char     *hdr;
-    size_t      want;
+    u_char     *hdr, *frame;
+    size_t      want, align, frame_off, avail;
     ssize_t     n;
     uint64_t    window, skip;
     ngx_uint_t  frames;
-    off_t       pos;
+    off_t       pos, base;
     ngx_log_t  *log;
 
     log = r->connection->log;
@@ -518,17 +518,31 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
     }
 
     if (of->is_directio) {
-        want = NGX_HTTP_COMPRESSION_STATIC_DIO_PROBE;
-        if ((size_t) clcf->directio_alignment > want) {
-            want = (size_t) clcf->directio_alignment;
+        align = NGX_HTTP_COMPRESSION_STATIC_DIO_PROBE;
+        if ((size_t) clcf->directio_alignment > align) {
+            align = (size_t) clcf->directio_alignment;
         }
 
-        hdr = ngx_pmemalign(r->pool, want, want);
+        /*
+         * TWO blocks, not one (parent #197). The probe offset is rounded
+         * down to `align` — an O_DIRECT descriptor rejects an unaligned
+         * file offset with EINVAL — so a frame header can start as late
+         * as align-1 bytes into the first block and would then straddle
+         * the boundary; parsing only one block would misreport that
+         * legitimate frame as truncated. A second block guarantees at
+         * least `align` (>= 4096) bytes behind any in-block start, far
+         * more than the 18 a frame header needs. Both the length and the
+         * buffer stay `align`-aligned, which is what O_DIRECT requires.
+         */
+        want = align * 2;
+
+        hdr = ngx_pmemalign(r->pool, want, align);
         if (hdr == NULL) {
             return NGX_ERROR;
         }
 
     } else {
+        align = 0;
         hdr = hdrbuf;
         want = sizeof(hdrbuf);
     }
@@ -537,8 +551,17 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
 
     /*
      * Walk a bounded chain of leading skippable frames to reach the
-     * first regular frame; each iteration reads at the current offset,
-     * exactly like the original single-shot probe did at offset 0.
+     * first regular frame. Each iteration reads at the current offset.
+     * Under directio the O_DIRECT descriptor rejects an unaligned file
+     * offset with EINVAL, and `pos` after a leading skippable frame is
+     * whatever that frame's length made it (40 for the canonical dcz
+     * SHA-256 prefix) — almost never a block multiple. So the read
+     * offset is rounded DOWN to `align` and the frame is parsed at its
+     * offset inside the block: `base` is the aligned read offset,
+     * `frame_off` the distance from there to `pos`, and `avail` the
+     * bytes of the read that lie at or after `pos`. Off the directio
+     * path `base == pos`, `frame_off == 0`, `avail == n` — byte-for-byte
+     * the previous behaviour (parent #197).
      */
     for (frames = 0; ; frames++) {
 
@@ -553,15 +576,36 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
             return NGX_DECLINED;
         }
 
-        n = ngx_http_compression_static_pread(of->fd, hdr, want, pos, log,
+        if (of->is_directio) {
+            frame_off = (size_t) ((uint64_t) pos % (uint64_t) align);
+            base = pos - (off_t) frame_off;
+
+        } else {
+            frame_off = 0;
+            base = pos;
+        }
+
+        n = ngx_http_compression_static_pread(of->fd, hdr, want, base, log,
                                               path);
-        if (n < 4) {
+
+        /*
+         * Bytes of the block that lie at or after `pos`. A short read
+         * that stopped inside the prefix leaves nothing for the frame,
+         * the same "too few bytes" condition as a short read at offset 0
+         * and taking the same branch.
+         */
+        avail = ((size_t) (n > 0 ? n : 0) > frame_off)
+                    ? (size_t) n - frame_off : 0;
+
+        frame = hdr + frame_off;
+
+        if (n < 0 || avail < 4) {
             if (of->is_directio) {
                 ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
                               "compression static: %uz-byte aligned probe "
                               "on directio file \"%V\" returned %z — "
                               "declining; check directio_alignment against "
-                              "the device geometry", want, path, n);
+                              "the device geometry", align, path, n);
                 return NGX_DECLINED;
             }
 
@@ -575,10 +619,10 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
         if (of->is_directio) {
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0,
                            "compression static: %uz-byte aligned probe on "
-                           "directio file \"%V\"", want, path);
+                           "directio file \"%V\"", align, path);
         }
 
-        switch (ngx_http_compression_static_probe_frame(hdr, (size_t) n,
+        switch (ngx_http_compression_static_probe_frame(frame, avail,
                                                         &window))
         {
 
@@ -586,8 +630,8 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" is not a zstd frame "
                           "(leading bytes 0x%02xd%02xd%02xd%02xd)", path,
-                          (ngx_uint_t) hdr[0], (ngx_uint_t) hdr[1],
-                          (ngx_uint_t) hdr[2], (ngx_uint_t) hdr[3]);
+                          (ngx_uint_t) frame[0], (ngx_uint_t) frame[1],
+                          (ngx_uint_t) frame[2], (ngx_uint_t) frame[3]);
             return NGX_DECLINED;
 
         case NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED:

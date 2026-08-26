@@ -54,6 +54,10 @@ our $skippable   = "\x50\x2A\x4D\x18" . ("\x00" x 8);  # bare skippable, nothing
 our $skip4       = "\x50\x2A\x4D\x18" . pack("V", 4) . ("\xAA" x 4);
 our $skip_bigwin = $skip4 . $win16m_desc;   # skippable + 16 MB -> declines
 our $skip_ok     = $skip4 . $win8m_desc;    # skippable + 8 MB -> served (dcz shape)
+# same dcz shape, padded past a directio 512 threshold so O_DIRECT engages:
+# the skippable-frame walk moves the probe offset to 12 (unaligned), which
+# a raw O_DIRECT read rejects with EINVAL — the #197 regression
+our $skip_dio    = $skip_ok . ("\x5A" x 600);
 
 # 8 KB of randomness for the directio blocks (compressed output stays
 # ~8 KB, comfortably over the directio threshold)
@@ -924,5 +928,37 @@ Accept-Encoding: br
 Content-Encoding: br
 Vary: Accept-Encoding
 --- response_body
+--- no_error_log
+[error]
+
+
+=== TEST 35: a skippable-prefixed .zst is served UNDER DIRECTIO (parent #197)
+# The dcz-shape defect: the leading-skippable-frame walk moves the probe
+# offset to the frame end (12 here — unaligned), which an O_DIRECT
+# descriptor rejects with EINVAL unless the offset is rounded down to the
+# block. Pre-fix this DECLINED every such file under directio (a 404 in
+# "always" mode); with the aligned-offset probe it serves 200 +
+# Content-Encoding: zstd. The debug line witnesses the aligned probe ran.
+--- log_level: debug
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::skip_dio ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        directio 512;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- response_body eval
+$::skip_dio
+--- error_log
+aligned probe on directio file
 --- no_error_log
 [error]
