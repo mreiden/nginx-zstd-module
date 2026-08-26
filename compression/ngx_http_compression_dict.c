@@ -270,7 +270,25 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         /* ── first sight of this path: load it ─────────────────────── */
 
-        fd = ngx_open_file(path.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+        /*
+         * O_NONBLOCK always (parent #165): a FIFO at the dictionary path
+         * would otherwise block the config-parsing master in open()
+         * until a writer appeared — nginx -t or a reload would just
+         * hang. Win32's NGX_FILE_NONBLOCK is 0, a no-op. Under
+         * compression_dict_strict_path, add O_NOFOLLOW so a symlinked
+         * dictionary is refused (ELOOP -> the open-fail path below).
+         */
+        {
+            ngx_uint_t  open_mode = NGX_FILE_RDONLY | NGX_FILE_NONBLOCK;
+
+#if !(NGX_WIN32)
+            if (cmcf->dict_strict_path == 1) {
+                open_mode |= O_NOFOLLOW;
+            }
+#endif
+
+            fd = ngx_open_file(path.data, open_mode, NGX_FILE_OPEN, 0);
+        }
         if (fd == NGX_INVALID_FILE) {
             if (optional) {
                 ngx_conf_log_error(NGX_LOG_WARN, cf, ngx_errno,
@@ -297,6 +315,67 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                                &path);
             return NGX_CONF_ERROR;
         }
+
+        /*
+         * Non-regular target rejected UNCONDITIONALLY (parent #165): a
+         * FIFO/socket/directory/device was never a valid dictionary, and
+         * there is no compatible config that depended on the old
+         * behaviour succeeding against one (it always eventually errored
+         * or hung). ngx_is_file() checks S_ISREG.
+         */
+        if (!ngx_is_file(&info)) {
+            ngx_close_file(fd);
+            if (optional) {
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "skipping optional dictionary \"%V\": "
+                                   "not a regular file", &path);
+                return NGX_CONF_OK;
+            }
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "dictionary \"%V\" is not a regular file",
+                               &path);
+            return NGX_CONF_ERROR;
+        }
+
+#if !(NGX_WIN32)
+        /*
+         * Strict trust (parent #165): reject a dictionary writable by
+         * group or other — a lower-privileged local writer must not be
+         * able to swap bytes into every worker on the next reload.
+         * Opt-in, since a release-managed deployment may legitimately
+         * ship such permissions. malformed-hex-still-fatal spirit: this
+         * is fatal even with "optional", because a writable dictionary
+         * is a trust decision to fix, not a deploy race to ride out.
+         */
+        if (cmcf->dict_strict_path == 1
+            && (ngx_file_access(&info) & (S_IWGRP | S_IWOTH)))
+        {
+            ngx_close_file(fd);
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "dictionary \"%V\" is writable by group or "
+                               "other and \"compression_dict_strict_path\" "
+                               "is on", &path);
+            return NGX_CONF_ERROR;
+        }
+
+        /*
+         * The FIFO-hang risk was only in open(); the file is now
+         * confirmed regular, so clear O_NONBLOCK before the single
+         * ngx_read_fd() below. A non-blocking regular-file read can
+         * return SHORT on some filesystems (observed on a 9p/drvfs
+         * mount), which the loader would then reject as an incomplete
+         * read. (The parent keeps O_NONBLOCK through the read; on a
+         * normal filesystem regular-file reads ignore it, so the hazard
+         * is latent there — cleared here to be safe everywhere.)
+         */
+        {
+            int  fl = fcntl(fd, F_GETFL);
+
+            if (fl != -1) {
+                (void) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+            }
+        }
+#endif
 
         entry = ngx_pcalloc(cf->pool, sizeof(ngx_http_compression_dict_t));
         if (entry == NULL) {

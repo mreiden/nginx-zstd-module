@@ -91,6 +91,20 @@ typedef struct {
      * supplied-hash fast path (zero computes).
      */
     ngx_uint_t    dicts_hashed;
+
+    /*
+     * compression_dict_strict_path (parent #165): opt-in, off by
+     * default. When on, dictionary files open with O_NOFOLLOW and a
+     * target writable by group or other is rejected — a symlink or a
+     * loosely-permissioned dictionary must not let a lower-privileged
+     * local writer swap bytes into every worker on the next reload.
+     * MAIN_CONF only: the store is cycle-global, so the policy is a
+     * property of the whole load, declared once in http{}. Independent
+     * of it, a non-regular target (FIFO/socket/dir/device) is rejected
+     * unconditionally, and every open is O_NONBLOCK so a FIFO cannot
+     * hang the config-parsing master.
+     */
+    ngx_flag_t    dict_strict_path;
 } ngx_http_compression_main_conf_t;
 
 

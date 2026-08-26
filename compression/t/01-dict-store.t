@@ -380,3 +380,35 @@ skipping the duplicate
 --- must_die
 --- error_log
 invalid dictionary hash "zzzz"
+
+
+=== TEST 21: a non-regular dictionary path is FATAL, unconditionally (parent #165)
+# html/ resolves to a directory; ngx_is_file() rejects it before any read.
+# Not gated on strict_path — a FIFO/socket/dir was never a valid dictionary.
+--- user_files eval
+[ [ "a.dict" => $::dict_a ] ]
+--- http_config
+    compression_dict_file html;
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+is not a regular file
+--- no_error_log
+[alert]
+
+
+=== TEST 22: compression_dict_strict_path is MAIN_CONF only (parent #165)
+# The store is cycle-global, so the strict-trust policy is a property of the
+# whole load — declared once in http{}, never per-location. A location-level
+# use is a directive-context error caught at config parse.
+--- config
+    location /t {
+        compression_dict_strict_path on;
+        return 200 "x";
+    }
+--- must_die
+--- error_log
+directive is not allowed here
+--- no_error_log
+[alert]

@@ -87,6 +87,7 @@ typedef struct {
 
 static ngx_int_t ngx_http_compression_add_backends(ngx_conf_t *cf);
 static void *ngx_http_compression_create_main_conf(ngx_conf_t *cf);
+static char *ngx_http_compression_init_main_conf(ngx_conf_t *cf, void *conf);
 static void *ngx_http_compression_create_conf(ngx_conf_t *cf);
 static char *ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -202,6 +203,13 @@ static ngx_command_t  ngx_http_compression_commands[] = {
       offsetof(ngx_http_compression_conf_t, dicts),
       NULL },
 
+    { ngx_string("compression_dict_strict_path"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_compression_main_conf_t, dict_strict_path),
+      NULL },
+
     ngx_null_command
 };
 
@@ -211,7 +219,7 @@ static ngx_http_module_t  ngx_http_compression_filter_module_ctx = {
     ngx_http_compression_init,             /* postconfiguration */
 
     ngx_http_compression_create_main_conf, /* create main configuration */
-    NULL,                                  /* init main configuration */
+    ngx_http_compression_init_main_conf,   /* init main configuration */
 
     NULL,                                  /* create server configuration */
     NULL,                                  /* merge server configuration */
@@ -532,7 +540,20 @@ ngx_http_compression_create_main_conf(ngx_conf_t *cf)
 
     /* pcalloc zeroes dicts_hashed — cycle-owned, no reset hook */
 
+    cmcf->dict_strict_path = NGX_CONF_UNSET;
+
     return cmcf;
+}
+
+
+static char *
+ngx_http_compression_init_main_conf(ngx_conf_t *cf, void *conf)
+{
+    ngx_http_compression_main_conf_t  *cmcf = conf;
+
+    ngx_conf_init_value(cmcf->dict_strict_path, 0);   /* off by default */
+
+    return NGX_CONF_OK;
 }
 
 
