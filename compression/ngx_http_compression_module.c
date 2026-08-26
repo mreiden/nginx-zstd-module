@@ -451,9 +451,18 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
              && ngx_strncasecmp(sfs->value.data, (u_char *) "none",
                                 sizeof("none") - 1) == 0))
     {
+        /*
+         * Log the LENGTH, not the raw value (parent #168 row 7): the
+         * header is client-controlled and could carry terminal control
+         * bytes (obs-text, ESC, DEL) that would corrupt or inject into
+         * the error log. The reason ("not same-origin/none") is already
+         * implicit in reaching this branch; the length is enough to
+         * correlate with the request. Debug-gated, so exposure is low —
+         * but bounding it costs nothing.
+         */
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "compression: dict skip, Sec-Fetch-Site \"%V\"",
-                       &sfs->value);
+                       "compression: dict skip, Sec-Fetch-Site not "
+                       "same-origin/none (%uz bytes)", sfs->value.len);
         return NULL;
     }
 
