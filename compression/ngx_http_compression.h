@@ -331,6 +331,21 @@ typedef struct {
     ngx_array_t   *dicts;          /* of ngx_http_compression_dict_t * */
 
     /*
+     * RFC 9842 §8 secure-context escape hatch (parent #158), applied to
+     * every dictionary coding (dcz and dcb): a dictionary-compressed
+     * response is only offered on a secure context, because over
+     * cleartext it hands a network attacker a length oracle over content
+     * the dictionary already describes. The context is secure when this
+     * nginx terminates TLS (r->connection->ssl != NULL); off by default.
+     * compression_dict_assume_secure_transport on asserts that a
+     * TLS-terminating proxy in front made the hop the client actually
+     * spoke secure — an operator acknowledgement, NEVER inferred from
+     * X-Forwarded-Proto or any sibling, which a client can set on a
+     * directly reachable listener to re-enable the coding over cleartext.
+     */
+    ngx_flag_t     dict_assume_secure;
+
+    /*
      * PHASE3: per-request bypass predicates (parent zstd_bypass /
      * fork brotli_bypass semantics — any predicate variable resolving
      * non-empty and not "0" serves identity), plus the operator-named

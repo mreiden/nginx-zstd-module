@@ -75,6 +75,21 @@ add_response_body_check(sub {
     );
 });
 
+# RFC 9842 §8 secure-context gate (#158): dcz/dcb only elect on a secure
+# context and Test::Nginx speaks cleartext, so the dict roundtrips here
+# run behind an http-level compression_dict_assume_secure_transport (the
+# TLS-terminating-proxy acknowledgement). This suite proves byte-exact
+# decoding, not the gate itself — the gate's behaviour lives in
+# 02-dict-negotiation.t.
+add_block_preprocessor(sub {
+    my $block = shift;
+
+    my $hc = $block->http_config;
+    $hc = defined($hc) ? $hc : '';
+    $block->set_value('http_config',
+                      "compression_dict_assume_secure_transport on;\n$hc");
+});
+
 no_long_string();
 log_level 'warn';
 repeat_each(1);

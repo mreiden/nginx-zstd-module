@@ -42,6 +42,25 @@ our $dcz_re = qr/^\x5E\x2A\x4D\x18\x20\x00\x00\x00\Q$raw\E\x28\xB5\x2F\xFD/s;
 # dcb: 36 raw bytes (0xFF "DCB", SHA-256) the decoder never sees
 our $dcb_re = qr/^\xFF\x44\x43\x42\Q$raw\E/s;
 
+# RFC 9842 §8 secure-context gate (#158): a dictionary coding is only
+# elected on a secure context, and Test::Nginx::Socket has no TLS client
+# — every connection here is cleartext. So the negotiation blocks below,
+# which model a normal HTTPS deployment, run behind an http-level
+# compression_dict_assume_secure_transport (the TLS-terminating-proxy
+# acknowledgement) injected here. Blocks whose name contains
+# "secure-context" opt OUT of the injection: they exercise the real
+# fail-closed default over a genuine cleartext connection.
+add_block_preprocessor(sub {
+    my $block = shift;
+
+    return if defined($block->name) && $block->name =~ /secure-context/;
+
+    my $hc = $block->http_config;
+    $hc = defined($hc) ? $hc : '';
+    $block->set_value('http_config',
+                      "compression_dict_assume_secure_transport on;\n$hc");
+});
+
 no_long_string();
 log_level 'warn';
 repeat_each(1);
@@ -714,5 +733,190 @@ Content-Encoding: zstd
 GET /t
 --- more_headers eval
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nAvailable-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: zstd
+
+
+=== TEST 20: secure-context default fail-closed — dcz declines over cleartext
+# No acknowledgement (this block opts out of the injected one via its
+# name), and Test::Nginx speaks cleartext, so RFC 9842 §8 refuses the
+# dictionary coding. The base coding still wins the election.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "secure-context fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: zstd
+
+
+=== TEST 21: secure-context explicit off is identical to the default
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_assume_secure_transport off;
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "secure-context fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: zstd
+
+
+=== TEST 22: secure-context X-Forwarded-Proto https does NOT re-enable dcz
+# The gate is transport, never a client-settable header: a forwarded
+# scheme claim on a directly reachable listener must not switch dcz back
+# on over cleartext. Same for the other three common spellings below.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "secure-context fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nX-Forwarded-Proto: https}
+--- response_headers
+Content-Encoding: zstd
+
+
+=== TEST 23: secure-context Forwarded proto=https does NOT re-enable dcz
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "secure-context fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nForwarded: proto=https}
+--- response_headers
+Content-Encoding: zstd
+
+
+=== TEST 24: secure-context X-Forwarded-Scheme https does NOT re-enable dcz
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "secure-context fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nX-Forwarded-Scheme: https}
+--- response_headers
+Content-Encoding: zstd
+
+
+=== TEST 25: secure-context X-Url-Scheme https does NOT re-enable dcz
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "secure-context fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nX-Url-Scheme: https}
+--- response_headers
+Content-Encoding: zstd
+
+
+=== TEST 26: secure-context acknowledgement at location level re-enables dcz
+# Proves the opt-in path itself works (not just the injected http-level
+# one): this block opts out of the injection, sets the directive in the
+# location, and dcz elects — exactly the TLS-terminating-proxy case.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_dict_assume_secure_transport on;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "secure-context fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: dcz
+--- response_body_like eval
+$::dcz_re
+
+
+=== TEST 27: secure-context inheritance — http on, location off wins
+# Merge semantics: the acknowledgement inherits like any flag, and a
+# location-level off overrides an http-level on.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_assume_secure_transport on;
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_dict_assume_secure_transport off;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "secure-context fixture body, long enough to compress well\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
 --- response_headers
 Content-Encoding: zstd

@@ -210,6 +210,13 @@ static ngx_command_t  ngx_http_compression_commands[] = {
       offsetof(ngx_http_compression_main_conf_t, dict_strict_path),
       NULL },
 
+    { ngx_string("compression_dict_assume_secure_transport"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_compression_conf_t, dict_assume_secure),
+      NULL },
+
     ngx_null_command
 };
 
@@ -317,6 +324,41 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
 
     if (conf->dicts == NULL || conf->dicts->nelts == 0) {
         return NULL;
+    }
+
+    /*
+     * RFC 9842 §8 secure-context gate (parent #158), fail-closed and
+     * ahead of every other test: no dictionary coding — dcz or dcb — is
+     * elected over a non-secure connection, because a dictionary-
+     * compressed response over cleartext is a length oracle over content
+     * the dictionary already describes. The context is secure when this
+     * nginx terminates TLS. The guard mirrors ngx_connection_t's own
+     * condition for the ssl member (#if (NGX_SSL || NGX_COMPAT)), not
+     * NGX_SSL alone: this module ships --with-compat, where the field
+     * exists (always NULL) without an SSL-capable nginx. HTTP/2 and
+     * HTTP/3 both carry a non-NULL connection->ssl, so neither is
+     * excluded. A TLS-terminating proxy makes ssl NULL here; that
+     * deployment opts back in with compression_dict_assume_secure_transport
+     * — an operator acknowledgement, never inferred from a client-settable
+     * X-Forwarded-Proto or sibling.
+     */
+    if (!conf->dict_assume_secure) {
+        ngx_flag_t  secure;
+
+#if (NGX_SSL || NGX_COMPAT)
+        secure = (r->connection->ssl != NULL);
+#else
+        secure = 0;
+#endif
+
+        if (!secure) {
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "compression: dict skip, not a secure context "
+                           "(RFC 9842 §8); set "
+                           "\"compression_dict_assume_secure_transport on\" "
+                           "if TLS terminates upstream");
+            return NULL;
+        }
     }
 
     /* no built-in fields for Available-Dictionary or Sec-Fetch-Site:
@@ -956,6 +998,7 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     conf->bypass = NGX_CONF_UNSET_PTR;
     conf->max_length = NGX_CONF_UNSET;
     conf->http_version = NGX_CONF_UNSET_UINT;
+    conf->dict_assume_secure = NGX_CONF_UNSET;
 
     for (i = 0; i < NGX_HTTP_COMPRESSION_CONF_SLOTS; i++) {
         conf->levels[i] = NGX_CONF_UNSET;
@@ -983,6 +1026,7 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
     ngx_conf_merge_str_value(conf->bypass_vary, prev->bypass_vary, "");
+    ngx_conf_merge_value(conf->dict_assume_secure, prev->dict_assume_secure, 0);
 
     /*
      * compression_bypass_vary only makes sense beside a bypass
