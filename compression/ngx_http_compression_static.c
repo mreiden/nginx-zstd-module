@@ -796,31 +796,14 @@ ngx_http_compression_static_merge_conf(ngx_conf_t *cf, void *parent,
         }
     }
 
-#if (NGX_HTTP_GZIP)
     /*
-     * Parent zstd_static parity, gained naturally with the split (the
-     * unified module's warn only covered the filter's enable):
-     * negotiated mode varies via r->gzip_vary delegation, which core
-     * emits only under "gzip_vary on" — warn when that is off.
-     * "always" is exempt, exactly like the parent: it deliberately
-     * does not vary.
+     * No "gzip_vary off" warning any more (parent #163): the handler's
+     * negotiated path calls ngx_http_compression_vary(), which now
+     * emits Vary: Accept-Encoding by construction regardless of the
+     * gzip_vary directive. "always" mode ignores Accept-Encoding and
+     * deliberately does not call it, so it still carries no Vary — the
+     * correct behaviour for a non-negotiated response.
      */
-    if (conf->enable == NGX_HTTP_COMPRESSION_STATIC_ON) {
-        ngx_http_core_loc_conf_t  *clcf;
-
-        clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-
-        if (!clcf->gzip_vary) {
-            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                               "\"compression_static on\" without "
-                               "\"gzip_vary on\": negotiated static "
-                               "responses will carry no "
-                               "\"Vary: Accept-Encoding\", so a shared "
-                               "cache may serve a compressed response to "
-                               "a client that cannot decode it");
-        }
-    }
-#endif
 
     return NGX_CONF_OK;
 }

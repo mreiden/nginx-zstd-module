@@ -356,10 +356,11 @@ duplicate coding "zstd"
 
 
 
-=== TEST 16: compression on without gzip_vary warns at config load
-# Flag-delegated Vary is gated on a directive whose default is off
-# (review round 1 of the prototype); the observable clcf->gzip_vary
-# makes this warnable where the abandoned gzip-off warning was not.
+=== TEST 16: compression on without gzip_vary still emits Vary by construction
+# Parent #163: the header filter emits Vary: Accept-Encoding itself, so
+# "gzip_vary off" (the default) no longer ships a negotiated compressed
+# body with no Vary — the shared-cache poisoning hazard — and there is
+# nothing to warn about.
 --- config
     location /t {
         compression on;
@@ -371,14 +372,18 @@ duplicate coding "zstd"
 GET /t
 --- more_headers
 Accept-Encoding: zstd
---- error_log
-compression is enabled but "gzip_vary" is off
---- no_error_log
-[error]
+--- response_headers
+Content-Encoding: zstd
+Vary: Accept-Encoding
+--- no_error_log eval
+[qr/"gzip_vary" is off/, qr/\[error\]/]
 
 
 
-=== TEST 17: compression on WITH gzip_vary does not warn
+=== TEST 17: compression WITH gzip_vary emits exactly one Vary line
+# gzip_vary on -> nginx emits from r->gzip_vary and we push nothing;
+# Test::Nginx folds duplicate field lines with ", ", so a single
+# "Accept-Encoding" proves the two emitters did not both fire.
 --- config
     location /t {
         compression on;
@@ -391,6 +396,8 @@ compression is enabled but "gzip_vary" is off
 GET /t
 --- more_headers
 Accept-Encoding: zstd
+--- response_headers
+Vary: Accept-Encoding
 --- no_error_log eval
 [qr/"gzip_vary" is off/, qr/\[error\]/]
 
@@ -1086,7 +1093,7 @@ Content-Encoding: zstd
 [error]
 
 
-=== TEST 29a: compression on without gzip_vary warns at config load
+=== TEST 29a: compression on without gzip_vary does NOT warn (parent #163)
 --- config
     location /t {
         compression on;
@@ -1095,8 +1102,8 @@ Content-Encoding: zstd
     }
 --- request
 GET /t
---- error_log
-"gzip_vary on"
+--- no_error_log eval
+[qr/gzip_vary/, qr/\[error\]/]
 
 
 === TEST 29b: compression on WITH gzip_vary does not warn

@@ -804,9 +804,11 @@ Available-Dictionary: :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:
 $::src
 
 
-=== TEST 33a: compression_static on without gzip_vary warns at config load
-# parent zstd_static parity, gained with the module split: negotiated
-# mode varies via delegation, which core emits only under gzip_vary
+=== TEST 33a: compression_static on emits Vary by construction, no warn
+# Parent #163: the negotiated static path calls
+# ngx_http_compression_vary(), which emits Vary: Accept-Encoding itself,
+# so "gzip_vary off" no longer means a missing Vary and there is nothing
+# to warn about.
 --- user_files eval
 [ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
 --- config
@@ -816,11 +818,18 @@ $::src
     }
 --- request
 GET /st/hello.js
---- error_log
-"compression_static on" without "gzip_vary on"
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+Vary: Accept-Encoding
+--- no_error_log eval
+[qr/"compression_static on" without/, qr/\[error\]/]
 
 
-=== TEST 33b: compression_static always does not warn (it never varies)
+=== TEST 33b: compression_static always never varies (and never warns)
+# "always" ignores Accept-Encoding, so its response is not a negotiated
+# variant: it must NOT call the Vary helper and must carry no Vary.
 --- user_files eval
 [ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
 --- config
@@ -830,5 +839,8 @@ GET /st/hello.js
     }
 --- request
 GET /st/hello.js
+--- response_headers
+Content-Encoding: br
+Vary:
 --- no_error_log eval
-qr/compression_static on/
+[qr/compression_static on/, qr/\[error\]/]

@@ -250,22 +250,74 @@ ngx_http_compression_coding_weight(ngx_str_t *ae, ngx_str_t *coding,
 
 
 /*
- * Vary: Accept-Encoding, requested once per response through whichever
- * mechanism this build has: with the gzip module, delegation via
- * r->gzip_vary (core emits under "gzip_vary on"); without it, a
- * literal push. Header-static like the parser above — since the
- * filter/static MODULE SPLIT each module carries its own copy, so
- * neither .so links symbols from the other (the static module links
- * nothing at all, compression libraries included).
+ * Vary: Accept-Encoding, emitted BY CONSTRUCTION on any response whose
+ * representation was negotiated on Accept-Encoding — parent #163's
+ * hardening, ported. The hazard it closes: r->gzip_vary alone is only
+ * a REQUEST for the header. ngx_http_header_filter_module honours it
+ * solely under "gzip_vary on" and CLEARS the flag otherwise, so the
+ * default "gzip_vary off" used to ship a negotiated compressed body
+ * with no Vary at all — and a shared cache would then hand the
+ * zstd/brotli representation to a client that sent no matching
+ * Accept-Encoding, i.e. an undecodable body. That correctness property
+ * belonged to a directive this module does not own; now it does not.
+ *
+ * With the gzip module we still set r->gzip_vary (other modules read
+ * the flag — e.g. a Vary-flattening filter that keys on it alone), then
+ * defer to nginx when the directive is on and emit our own line when it
+ * is off. The two emitters are mutually exclusive, so exactly one line
+ * results in every build/directive combination. The dedup scan guards
+ * the case where a preceding filter already pushed the field.
+ *
+ * Header-static like the parser above — since the filter/static MODULE
+ * SPLIT each module carries its own copy, so neither .so links symbols
+ * from the other (the static module links nothing at all).
  */
 static ngx_inline ngx_int_t
 ngx_http_compression_vary(ngx_http_request_t *r)
 {
+    ngx_uint_t        i;
+    ngx_table_elt_t  *v, *h;
+    ngx_list_part_t  *part;
 #if (NGX_HTTP_GZIP)
+    ngx_http_core_loc_conf_t  *clcf;
+
     r->gzip_vary = 1;
-    return NGX_OK;
-#else
-    ngx_table_elt_t  *v;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    if (clcf != NULL && clcf->gzip_vary) {
+        /* nginx's header filter emits the line from r->gzip_vary */
+        return NGX_OK;
+    }
+#endif
+
+    for (part = &r->headers_out.headers.part, h = part->elts, i = 0;
+         /* void */;
+         i++)
+    {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0) {
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("Vary") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Vary",
+                               sizeof("Vary") - 1) == 0
+            && h[i].value.len == sizeof("Accept-Encoding") - 1
+            && ngx_strncasecmp(h[i].value.data,
+                               (u_char *) "Accept-Encoding",
+                               sizeof("Accept-Encoding") - 1) == 0)
+        {
+            return NGX_OK;
+        }
+    }
 
     v = ngx_list_push(&r->headers_out.headers);
     if (v == NULL) {
@@ -276,7 +328,6 @@ ngx_http_compression_vary(ngx_http_request_t *r)
     ngx_str_set(&v->key, "Vary");
     ngx_str_set(&v->value, "Accept-Encoding");
     return NGX_OK;
-#endif
 }
 
 

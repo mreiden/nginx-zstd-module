@@ -1065,37 +1065,13 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 #endif
     }
 
-#if (NGX_HTTP_GZIP)
     /*
-     * Setting r->gzip_vary only REQUESTS Vary: Accept-Encoding; the
-     * core header filter emits it solely when the gzip_vary directive
-     * is on — and its default is off (review round 1: the live matrix
-     * had gzip_vary on and never saw this). Without it a shared cache
-     * stores a zstd response with no Vary and serves it to clients
-     * that cannot decode it. clcf->gzip_vary IS observable (core loc
-     * conf, public — contrast WRINKLES #1's abandoned warning about
-     * the gzip module's private conf), so warn like the parent repo
-     * does. PHASE0: per-location; productization collapses this into
-     * the #110-style per-module summary.
+     * No "gzip_vary off" warning any more (parent #163): the header
+     * filter now emits Vary: Accept-Encoding by construction on every
+     * negotiated response — see ngx_http_compression_vary() — so
+     * correctness no longer depends on the gzip_vary directive and
+     * there is nothing to warn about.
      */
-    /* dict-configured locations push their own combined Vary line and
-     * never depend on "gzip_vary on" — the warning would be wrong
-     * advice there (review round 2) */
-    if (conf->enable
-        && (conf->dicts == NULL || conf->dicts->nelts == 0))
-    {
-        ngx_http_core_loc_conf_t  *clcf;
-
-        clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-        if (clcf != NULL && !clcf->gzip_vary) {
-            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                               "compression is enabled but \"gzip_vary\" is "
-                               "off; add \"gzip_vary on\" or shared caches "
-                               "may serve compressed responses to clients "
-                               "that cannot decode them");
-        }
-    }
-#endif
 
     return NGX_CONF_OK;
 }
