@@ -111,6 +111,8 @@ static char *ngx_http_compression_buffers_cmd(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_compression_check_bufs_product(ngx_conf_t *cf,
     ngx_bufs_t *bufs, ngx_flag_t unsafe, const char *ctx, ngx_flag_t advise);
+static char *ngx_http_compression_set_enable_slot(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_compression_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_compression_ratio_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *vv, uintptr_t data);
@@ -133,7 +135,7 @@ static ngx_command_t  ngx_http_compression_commands[] = {
     { ngx_string("compression"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF
                         |NGX_HTTP_LIF_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
+      ngx_http_compression_set_enable_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_compression_conf_t, enable),
       NULL },
@@ -1220,6 +1222,41 @@ ngx_http_compression_predicate_is_direct_header_or_cookie(ngx_str_t *v)
     }
 
     return 0;
+}
+
+
+/*
+ * "compression on|off" (parent #182): the standard flag slot plus a
+ * parse-time latch of the cycle-global any_enabled bit, so
+ * postconfiguration can skip installing the filter hooks when the module
+ * is off in every location. Latched for anything the flag slot accepts
+ * that is not an explicit "off".
+ */
+static char *
+ngx_http_compression_set_enable_slot(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_str_t                         *value;
+    char                              *rc;
+    ngx_http_compression_main_conf_t  *cmcf;
+
+    rc = ngx_conf_set_flag_slot(cf, cmd, conf);
+    if (rc != NGX_CONF_OK) {
+        return rc;
+    }
+
+    /* value[1] is "on" or "off" — the only two ngx_conf_set_flag_slot
+     * accepts (anything else already returned an error above). */
+    value = cf->args->elts;
+    if (value[1].len == 3 && ngx_strncmp(value[1].data, "off", 3) == 0) {
+        return NGX_CONF_OK;
+    }
+
+    cmcf = ngx_http_conf_get_module_main_conf(cf,
+                                        ngx_http_compression_filter_module);
+    cmcf->any_enabled = 1;
+
+    return NGX_CONF_OK;
 }
 
 
@@ -2387,9 +2424,23 @@ ship:
 static ngx_int_t
 ngx_http_compression_init(ngx_conf_t *cf)
 {
+    ngx_http_compression_main_conf_t  *cmcf;
+
     /* the content-phase static handler registers itself from the
      * static MODULE since the split; this module owns the filters */
-    (void) cf;
+
+    /*
+     * Skip the header/body filter hooks when "compression" is off in
+     * every location (parent #182). any_enabled is latched conservatively
+     * at directive parse time (ngx_http_compression_set_enable_slot()),
+     * so a build that carries the module but never enables it pays no
+     * per-response NULL-ctx pass through this filter.
+     */
+    cmcf = ngx_http_conf_get_module_main_conf(cf,
+                                        ngx_http_compression_filter_module);
+    if (cmcf == NULL || !cmcf->any_enabled) {
+        return NGX_OK;
+    }
 
     ngx_http_next_header_filter = ngx_http_top_header_filter;
     ngx_http_top_header_filter = ngx_http_compression_header_filter;

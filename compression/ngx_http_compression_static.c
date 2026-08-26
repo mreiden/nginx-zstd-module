@@ -50,7 +50,24 @@ typedef struct {
 } ngx_http_compression_static_conf_t;
 
 
+typedef struct {
+    /*
+     * "Could this cycle ever serve a sidecar" latch (parent #182), set at
+     * directive PARSE time whenever "compression_static on|always" is
+     * parsed anywhere. compression_static does NOT take NGX_HTTP_LIF_CONF,
+     * so there is no "if"-block conf to reason about — but parse-time
+     * latching stays symmetric with the filter module and avoids walking
+     * the merge tree. When it stays clear, postconfiguration skips
+     * registering the content-phase handler entirely.
+     */
+    ngx_flag_t     any_enabled;
+} ngx_http_compression_static_main_conf_t;
+
+
 static char *ngx_http_compression_static_order(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static void *ngx_http_compression_static_create_main_conf(ngx_conf_t *cf);
+static char *ngx_http_compression_static_set_enable_slot(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_compression_static_default_order(ngx_conf_t *cf,
     ngx_http_compression_static_conf_t *conf);
@@ -73,7 +90,7 @@ static ngx_command_t  ngx_http_compression_static_commands[] = {
 
     { ngx_string("compression_static"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_enum_slot,
+      ngx_http_compression_static_set_enable_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_compression_static_conf_t, enable),
       &ngx_http_compression_static_enum },
@@ -100,7 +117,7 @@ static ngx_http_module_t  ngx_http_compression_static_module_ctx = {
     NULL,                                    /* preconfiguration */
     ngx_http_compression_static_init,        /* postconfiguration */
 
-    NULL,                                    /* create main configuration */
+    ngx_http_compression_static_create_main_conf, /* create main config */
     NULL,                                    /* init main configuration */
 
     NULL,                                    /* create server configuration */
@@ -958,6 +975,49 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
 }
 
 static void *
+ngx_http_compression_static_create_main_conf(ngx_conf_t *cf)
+{
+    /* pcalloc zeroes any_enabled — cycle-owned, no reset hook needed */
+    return ngx_pcalloc(cf->pool,
+                       sizeof(ngx_http_compression_static_main_conf_t));
+}
+
+
+/*
+ * "compression_static off|on|always" (parent #182): the standard enum
+ * slot plus a parse-time latch of the cycle-global any_enabled bit, so
+ * postconfiguration can skip the content-phase handler when static
+ * serving is off in every location. Latched for "on"/"always", not "off".
+ */
+static char *
+ngx_http_compression_static_set_enable_slot(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+    ngx_str_t                                *value;
+    char                                     *rc;
+    ngx_http_compression_static_main_conf_t  *smcf;
+
+    rc = ngx_conf_set_enum_slot(cf, cmd, conf);
+    if (rc != NGX_CONF_OK) {
+        return rc;
+    }
+
+    /* value[1] is "off", "on", or "always" — the enum already rejected
+     * anything else above. */
+    value = cf->args->elts;
+    if (value[1].len == 3 && ngx_strncmp(value[1].data, "off", 3) == 0) {
+        return NGX_CONF_OK;
+    }
+
+    smcf = ngx_http_conf_get_module_main_conf(cf,
+                                        ngx_http_compression_static_module);
+    smcf->any_enabled = 1;
+
+    return NGX_CONF_OK;
+}
+
+
+static void *
 ngx_http_compression_static_create_conf(ngx_conf_t *cf)
 {
     ngx_http_compression_static_conf_t  *conf;
@@ -1012,8 +1072,21 @@ ngx_http_compression_static_merge_conf(ngx_conf_t *cf, void *parent,
 static ngx_int_t
 ngx_http_compression_static_init(ngx_conf_t *cf)
 {
-    ngx_http_handler_pt        *h;
-    ngx_http_core_main_conf_t  *cmcf;
+    ngx_http_handler_pt                      *h;
+    ngx_http_core_main_conf_t                *cmcf;
+    ngx_http_compression_static_main_conf_t  *smcf;
+
+    /*
+     * Skip registering the content-phase handler when "compression_static"
+     * is off in every location (parent #182). any_enabled is latched at
+     * directive parse time, so a build that carries the static module but
+     * never enables it pays no per-request always-declining handler.
+     */
+    smcf = ngx_http_conf_get_module_main_conf(cf,
+                                        ngx_http_compression_static_module);
+    if (smcf == NULL || !smcf->any_enabled) {
+        return NGX_OK;
+    }
 
     /* the content phase, exactly like gzip_static and the parent
      * *_static modules */

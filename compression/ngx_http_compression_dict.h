@@ -105,6 +105,20 @@ typedef struct {
      * hang the config-parsing master.
      */
     ngx_flag_t    dict_strict_path;
+
+    /*
+     * "Could this cycle ever compress a response" latch (parent #182),
+     * set at directive PARSE time by ngx_http_compression_set_enable_slot()
+     * whenever a "compression on;" is parsed ANYWHERE — main, srv, loc, or
+     * an NGX_HTTP_LIF_CONF conf synthesized for a rewrite-phase "if" block.
+     * Parse time, not a merged-location walk: an "if" block's conf is not
+     * reliably reachable from the ordinary merge tree, and a false negative
+     * would silently drop compression for a live location. When it stays
+     * clear, postconfiguration skips installing the header/body filter
+     * hooks entirely — no per-response NULL-ctx pass on a build that
+     * carries the module but never enables it.
+     */
+    ngx_flag_t    any_enabled;
 } ngx_http_compression_main_conf_t;
 
 
