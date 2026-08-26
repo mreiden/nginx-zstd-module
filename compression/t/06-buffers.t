@@ -184,3 +184,65 @@ invalid size "zap" in "compression_buffers"
 --- must_die
 --- error_log
 is duplicate
+
+
+=== TEST 7: an overflowing compression_buffers product is a hard error (parent #167)
+# each argument parses fine on its own; only their product overflows the
+# address space. Refused unconditionally — no size means "meant it".
+--- config
+    location / {
+        compression_buffers 1000000000 1000000000000;
+    }
+--- must_die
+--- error_log
+overflows the address space
+
+
+=== TEST 8: a huge but representable product is refused above the hard cap
+# 1024 x 1m = 1 GB of output-chain memory per response, past the 256 MB
+# cap; the advisory/cap tier fires at merge time (the parse slot checks
+# only overflow), so the merged value is what is refused.
+--- config
+    location / {
+        compression_buffers 1024 1m;
+    }
+--- must_die
+--- error_log
+above the 256 MB hard cap
+
+
+=== TEST 9: compression_buffers_unsafe on accepts a total above the hard cap
+# the operator acknowledges the 1 GB total in words; it loads with a
+# warning instead of failing.
+--- config
+    location /t {
+        compression on;
+        compression_buffers 1024 1m;
+        compression_buffers_unsafe on;
+        default_type text/html;
+        return 200 "unsafe-acknowledged buffers fixture body to compress\n";
+    }
+--- request
+GET /t
+--- error_code: 200
+--- error_log
+acknowledges it
+
+
+=== TEST 10: a total between the advisory and the hard cap warns and loads
+# 32 x 1m = 32 MB per response: past the 8 MB advisory, under the 256 MB
+# cap. Warns, does not fail.
+--- config
+    location /t {
+        compression on;
+        compression_buffers 32 1m;
+        default_type text/html;
+        return 200 "advisory-tier buffers fixture body long enough to compress\n";
+    }
+--- request
+GET /t
+--- error_code: 200
+--- error_log
+output-chain memory PER RESPONSE
+--- no_error_log
+[emerg]

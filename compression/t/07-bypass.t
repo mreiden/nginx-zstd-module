@@ -249,3 +249,83 @@ Content-Encoding: gzip
 GET /b/a.txt
 --- error_log
 "compression_bypass_vary" is set without a "compression_bypass" predicate
+
+
+=== TEST 8: a direct $http_* bypass without bypass_vary warns (parent #185)
+# the inverse misconfig: reading a request header directly in the
+# predicate, with no compression_bypass_vary, lets a shared cache mix
+# identity and compressed responses under one key.
+--- user_files eval
+[ [ "b/a.txt" => $::body ] ]
+--- config
+    location /b/ {
+        compression on;
+        compression_bypass $http_x_no_compression;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /b/a.txt
+--- error_log
+reads a request header or cookie directly without a "compression_bypass_vary"
+
+
+=== TEST 8b: a direct $cookie_* bypass without bypass_vary warns
+--- user_files eval
+[ [ "b/a.txt" => $::body ] ]
+--- config
+    location /b/ {
+        compression on;
+        compression_bypass $cookie_nocompress;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /b/a.txt
+--- error_log
+reads a request header or cookie directly without a "compression_bypass_vary"
+
+
+=== TEST 8c: a direct $http_* bypass WITH bypass_vary is silent
+# pairing the predicate with a Vary field is the correct configuration —
+# no warning.
+--- user_files eval
+[ [ "b/a.txt" => $::body ] ]
+--- config
+    location /b/ {
+        compression on;
+        compression_bypass $http_x_no_compression;
+        compression_bypass_vary X-No-Compression;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /b/a.txt
+--- no_error_log
+reads a request header or cookie directly
+
+
+=== TEST 8d: an indirect predicate ($request_uri) is silent
+# only the literal $http_*/$cookie_* spellings are recognized; a
+# URI-based predicate (already part of the cache key) never warns.
+--- user_files eval
+[ [ "b/a.txt" => $::body ] ]
+--- config
+    location /b/ {
+        compression on;
+        compression_bypass $arg_nocompress;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /b/a.txt
+--- no_error_log
+reads a request header or cookie directly

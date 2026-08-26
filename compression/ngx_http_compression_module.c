@@ -99,6 +99,8 @@ static char *ngx_http_compression_window_cmd(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_compression_buffers_cmd(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_compression_check_bufs_product(ngx_conf_t *cf,
+    ngx_bufs_t *bufs, ngx_flag_t unsafe, const char *ctx, ngx_flag_t advise);
 static ngx_int_t ngx_http_compression_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_compression_ratio_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *vv, uintptr_t data);
@@ -166,6 +168,13 @@ static ngx_command_t  ngx_http_compression_commands[] = {
       ngx_http_compression_buffers_cmd,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
+      NULL },
+
+    { ngx_string("compression_buffers_unsafe"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_compression_conf_t, bufs_unsafe),
       NULL },
 
     { ngx_string("compression_http_version"),
@@ -819,6 +828,128 @@ ngx_http_compression_buffers_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
     ccf->bufs.num = n;
     ccf->bufs.size = (size_t) size;
 
+    /*
+     * Overflow-only check on an EXPLICIT value at the earliest point
+     * (#167). advise=0: the advisory/hard-cap tiers are owned by the
+     * post-merge check alone — it is the only site that also covers an
+     * inherited or defaulted value, and the only one where the merged
+     * bufs_unsafe flag is final (the flag may appear before or after
+     * this directive, or at an outer level). A size of 0
+     * (backend-recommended) is unbounded here and the helper returns OK.
+     */
+    return ngx_http_compression_check_bufs_product(cf, &ccf->bufs, 0,
+                                                   "explicit directive", 0);
+}
+
+
+/*
+ * Aggregate memory bound for compression_buffers number*size (#167).
+ *
+ * The parse handler above range-checks each argument independently but
+ * never their product, and neither an inherited value nor the module's
+ * own default (32 bufs, backend-recommended size) re-validates the pair.
+ * A typo ("compression_buffers 100000 100000;" for "100 100k;") or a
+ * value inherited from an outer block could request an overflowing or
+ * merely enormous per-response OUTPUT-chain pool that nginx commits for
+ * every concurrent response.
+ *
+ * Three tiers on the representable (non-overflowing) product:
+ *   <= 8 MB   silent (the ordinary range; the 32-buf default lands far
+ *             under it);
+ *   >  8 MB, <= 256 MB   warn — large, but a config that loads today
+ *             keeps loading;
+ *   >  256 MB  emerg, refused UNLESS compression_buffers_unsafe on:
+ *             number and size are two integers the operator wrote
+ *             literally, so at this magnitude a refusal-by-default is the
+ *             safe reading of "probably a mistake", with an explicit
+ *             opt-out for the deployment that means it.
+ * Overflow is refused unconditionally — no size means "the operator
+ * meant this", so no acknowledgement spelling exists for it.
+ *
+ * A size of 0 means "backend-recommended", resolved small at runtime and
+ * not knowable here, so the product is not bounded in that case.
+ */
+#ifndef NGX_HTTP_COMPRESSION_BUFS_ADVISORY_BYTES
+#define NGX_HTTP_COMPRESSION_BUFS_ADVISORY_BYTES  (8 * 1024 * 1024)
+#endif
+
+#ifndef NGX_HTTP_COMPRESSION_BUFS_HARD_CAP_BYTES
+#define NGX_HTTP_COMPRESSION_BUFS_HARD_CAP_BYTES  (256 * 1024 * 1024)
+#endif
+
+static char *
+ngx_http_compression_check_bufs_product(ngx_conf_t *cf, ngx_bufs_t *bufs,
+    ngx_flag_t unsafe, const char *ctx, ngx_flag_t advise)
+{
+    size_t  total;
+
+    if (bufs->num <= 0 || bufs->size == 0) {
+        /* size 0 = backend-recommended (unbounded here); num<1 is already
+         * rejected at parse — defend anyway rather than assume */
+        return NGX_CONF_OK;
+    }
+
+    /*
+     * Division-based pre-check, not "num * size < num": bufs->num is a
+     * signed ngx_int_t, so comparing the already-wrapped product would
+     * itself be operating on signed overflow (undefined behaviour).
+     * Comparing against NGX_MAX_SIZE_T_VALUE / size never multiplies past
+     * the type's range at all.
+     */
+    if ((size_t) bufs->num > NGX_MAX_SIZE_T_VALUE / bufs->size) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"compression_buffers\" (%s) requests "
+                           "%i x %uz bytes, which overflows the address "
+                           "space", ctx, bufs->num, bufs->size);
+        return NGX_CONF_ERROR;
+    }
+
+    if (!advise) {
+        return NGX_CONF_OK;
+    }
+
+    total = (size_t) bufs->num * bufs->size;
+
+    if (total > NGX_HTTP_COMPRESSION_BUFS_HARD_CAP_BYTES) {
+
+        if (unsafe) {
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "\"compression_buffers\" (%s) requests "
+                               "%i x %uz bytes = ~%uz bytes of output-chain "
+                               "memory PER RESPONSE, above the %d MB hard "
+                               "cap; accepted because "
+                               "\"compression_buffers_unsafe on;\" "
+                               "acknowledges it. That total is multiplied "
+                               "by concurrent responses under load",
+                               ctx, bufs->num, bufs->size, total,
+                               (int) (NGX_HTTP_COMPRESSION_BUFS_HARD_CAP_BYTES
+                                      / (1024 * 1024)));
+            return NGX_CONF_OK;
+        }
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"compression_buffers\" (%s) requests "
+                           "%i x %uz bytes = ~%uz bytes of output-chain "
+                           "memory PER RESPONSE, above the %d MB hard cap "
+                           "— that is multiplied by concurrent responses "
+                           "under load. Lower \"compression_buffers\", or "
+                           "set \"compression_buffers_unsafe on;\" to "
+                           "acknowledge this total is intentional",
+                           ctx, bufs->num, bufs->size, total,
+                           (int) (NGX_HTTP_COMPRESSION_BUFS_HARD_CAP_BYTES
+                                  / (1024 * 1024)));
+        return NGX_CONF_ERROR;
+    }
+
+    if (total > NGX_HTTP_COMPRESSION_BUFS_ADVISORY_BYTES) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "\"compression_buffers\" (%s) requests "
+                           "%i x %uz bytes = ~%uz bytes of output-chain "
+                           "memory PER RESPONSE, multiplied by concurrent "
+                           "responses under load",
+                           ctx, bufs->num, bufs->size, total);
+    }
+
     return NGX_CONF_OK;
 }
 
@@ -999,6 +1130,7 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     conf->max_length = NGX_CONF_UNSET;
     conf->http_version = NGX_CONF_UNSET_UINT;
     conf->dict_assume_secure = NGX_CONF_UNSET;
+    conf->bufs_unsafe = NGX_CONF_UNSET;
 
     for (i = 0; i < NGX_HTTP_COMPRESSION_CONF_SLOTS; i++) {
         conf->levels[i] = NGX_CONF_UNSET;
@@ -1006,6 +1138,56 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     }
 
     return conf;
+}
+
+
+/*
+ * Detects a DIRECT "$http_*" or "$cookie_*" reference in one
+ * compression_bypass predicate's source text (#185).
+ * ngx_http_complex_value_t.value keeps the raw argument as written, even
+ * for a script with embedded variables (ngx_http_compile_complex_value()
+ * copies the source into ccv->complex_value->value).
+ *
+ * Deliberately narrow: only the literal "$http_" / "$cookie_" spellings
+ * count. A map or any other indirection (e.g. a map result variable
+ * derived from a header) is a documented operator responsibility and
+ * stays silent — a false warning on a map is worse than missing the
+ * direct case.
+ */
+static ngx_uint_t
+ngx_http_compression_predicate_is_direct_header_or_cookie(ngx_str_t *v)
+{
+    u_char  *p, *last;
+
+    p = v->data;
+    last = v->data + v->len;
+
+    while (p < last) {
+        p = ngx_strlchr(p, last, '$');
+        if (p == NULL) {
+            return 0;
+        }
+
+        p++;
+
+        if (p < last && *p == '{') {
+            p++;
+        }
+
+        if ((size_t) (last - p) >= sizeof("http_") - 1
+            && ngx_strncmp(p, "http_", sizeof("http_") - 1) == 0)
+        {
+            return 1;
+        }
+
+        if ((size_t) (last - p) >= sizeof("cookie_") - 1
+            && ngx_strncmp(p, "cookie_", sizeof("cookie_") - 1) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 
@@ -1044,6 +1226,41 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
                            "on", &conf->bypass_vary);
     }
 
+    /*
+     * Inverse check (#185): a compression_bypass predicate that reads a
+     * request header or cookie DIRECTLY (e.g.
+     * "compression_bypass $http_x_no_compression;") without a matching
+     * compression_bypass_vary lets a shared cache mix an identity
+     * response with a compressed one under the same key — a
+     * cache-poisoning / wrong-variant-served hazard. Only the literal
+     * "$http_*" / "$cookie_*" spellings are checked; a map or other
+     * indirection stays a documented operator responsibility (see
+     * ngx_http_compression_predicate_is_direct_header_or_cookie()).
+     */
+    if (conf->bypass != NULL && conf->bypass_vary.len == 0) {
+        ngx_http_complex_value_t  *cv;
+
+        cv = conf->bypass->elts;
+
+        for (i = 0; i < conf->bypass->nelts; i++) {
+            if (ngx_http_compression_predicate_is_direct_header_or_cookie(
+                    &cv[i].value))
+            {
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "\"compression_bypass\" predicate \"%V\" "
+                                   "reads a request header or cookie "
+                                   "directly without a "
+                                   "\"compression_bypass_vary\"; a shared "
+                                   "cache may mix identity and compressed "
+                                   "responses under the same key. Add a "
+                                   "\"compression_bypass_vary\" directive "
+                                   "naming the header this varies on",
+                                   &cv[i].value);
+                break;
+            }
+        }
+    }
+
     /* default cap 32 in-flight bufs (core gzip's number), size 0 =
      * backend-recommended */
     if (conf->bufs.num == NGX_CONF_UNSET) {
@@ -1054,6 +1271,26 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
             conf->bufs.num = 32;
             conf->bufs.size = 0;
         }
+    }
+
+    ngx_conf_merge_value(conf->bufs_unsafe, prev->bufs_unsafe, 0);
+
+    /*
+     * The parse-time slot only sees an EXPLICIT compression_buffers
+     * written at this exact location. A value inherited from an outer
+     * block (the conf->bufs = prev->bufs branch above) or the module's
+     * own default never passes through it, so re-run the product bound
+     * here — with the advisory/hard-cap tiers (advise=1) and the now-final
+     * bufs_unsafe flag — so every value conf->bufs can hold at request
+     * time is validated exactly once (#167). A defaulted size of 0 is a
+     * no-op in the helper.
+     */
+    if (ngx_http_compression_check_bufs_product(cf, &conf->bufs,
+                                                conf->bufs_unsafe,
+                                                "merged value", 1)
+        != NGX_CONF_OK)
+    {
+        return NGX_CONF_ERROR;
     }
 
     /*

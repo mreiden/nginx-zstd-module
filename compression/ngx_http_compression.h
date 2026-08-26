@@ -367,6 +367,17 @@ typedef struct {
      * either source.
      */
     ngx_bufs_t     bufs;
+
+    /*
+     * Acknowledgement (parent #167) for an aggregate compression_buffers
+     * number*size above the hard cap. Mirrors the RFC's "say it in words"
+     * posture: an output-chain pool this large per response is refused at
+     * config load unless the operator writes
+     * compression_buffers_unsafe on. Only consulted when an EXPLICIT size
+     * makes the product knowable — size 0 (backend-recommended) resolves
+     * small at runtime and is never bounded here.
+     */
+    ngx_flag_t     bufs_unsafe;
 } ngx_http_compression_conf_t;
 
 
