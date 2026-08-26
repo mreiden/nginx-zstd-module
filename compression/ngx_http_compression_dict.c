@@ -540,21 +540,18 @@ static ngx_int_t
 ngx_http_compression_dicts_hashed_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
-    u_char                            *p;
     ngx_http_compression_main_conf_t  *cmcf;
 
     cmcf = ngx_http_get_module_main_conf(r, ngx_http_compression_filter_module);
 
-    p = ngx_pnalloc(r->pool, NGX_INT_T_LEN);
-    if (p == NULL) {
-        return NGX_ERROR;
-    }
-
-    v->len = ngx_sprintf(p, "%ui", cmcf->dicts_hashed) - p;
+    /* preformatted once in init_main_conf() — constant for the worker's
+     * life, so no per-request ngx_sprintf (parent #154). The bytes live
+     * in the cycle config pool, which outlives every request. */
+    v->len = cmcf->dicts_hashed_str.len;
+    v->data = cmcf->dicts_hashed_str.data;
     v->valid = 1;
     v->no_cacheable = 0;
     v->not_found = 0;
-    v->data = p;
 
     return NGX_OK;
 }

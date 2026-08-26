@@ -636,6 +636,22 @@ ngx_http_compression_init_main_conf(ngx_conf_t *cf, void *conf)
 
     ngx_conf_init_value(cmcf->dict_strict_path, 0);   /* off by default */
 
+    /*
+     * Preformat $compression_dicts_hashed once (parent #154): every
+     * compression_dict_file has been parsed and hashed by now — all
+     * increments live in that directive handler, which runs before
+     * init_main_conf — so the count is final and constant for the
+     * worker's life. The variable handler then just points at these
+     * bytes instead of ngx_sprintf'ing per lookup.
+     */
+    cmcf->dicts_hashed_str.data = ngx_pnalloc(cf->pool, NGX_INT_T_LEN);
+    if (cmcf->dicts_hashed_str.data == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    cmcf->dicts_hashed_str.len =
+        ngx_sprintf(cmcf->dicts_hashed_str.data, "%ui", cmcf->dicts_hashed)
+        - cmcf->dicts_hashed_str.data;
+
     return NGX_CONF_OK;
 }
 

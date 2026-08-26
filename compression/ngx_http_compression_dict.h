@@ -93,6 +93,16 @@ typedef struct {
     ngx_uint_t    dicts_hashed;
 
     /*
+     * Preformatted decimal of dicts_hashed (parent #154), rendered once
+     * in init_main_conf() — the count is final after config parsing (all
+     * hashing happens in the compression_dict_file directive handler,
+     * before init_main_conf runs) and never changes for the worker's
+     * life. The $compression_dicts_hashed handler returns this instead of
+     * ngx_sprintf'ing into a fresh per-request buffer on every lookup.
+     */
+    ngx_str_t     dicts_hashed_str;
+
+    /*
      * compression_dict_strict_path (parent #165): opt-in, off by
      * default. When on, dictionary files open with O_NOFOLLOW and a
      * target writable by group or other is rejected — a symlink or a
