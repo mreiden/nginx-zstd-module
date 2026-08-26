@@ -329,3 +329,69 @@ reads a request header or cookie directly
 GET /b/a.txt
 --- no_error_log
 reads a request header or cookie directly
+
+
+=== TEST 9: compression_bypass_vary rejects a comma-separated value (parent #168)
+# the value becomes a literal Vary field-name; a list would emit a
+# malformed Vary. Must be exactly one RFC 9110 token.
+--- config
+    location /b/ {
+        compression on;
+        compression_bypass_vary "Accept-Encoding, X-Custom";
+    }
+--- must_die
+--- error_log
+comma or semicolon
+
+
+=== TEST 9b: compression_bypass_vary rejects a bare wildcard
+--- config
+    location /b/ {
+        compression on;
+        compression_bypass_vary *;
+    }
+--- must_die
+--- error_log
+bare wildcard
+
+
+=== TEST 9c: compression_bypass_vary rejects a semicolon parameter
+--- config
+    location /b/ {
+        compression on;
+        compression_bypass_vary "X-Custom;q=1";
+    }
+--- must_die
+--- error_log
+comma or semicolon
+
+
+=== TEST 9d: a valid field-name token loads (with a bypass predicate)
+--- user_files eval
+[ [ "b/a.txt" => $::body ] ]
+--- config
+    location /b/ {
+        compression on;
+        compression_bypass $http_x_no_compression;
+        compression_bypass_vary X-No-Compression;
+        compression_types text/plain;
+        default_type text/plain;
+        root html;
+    }
+--- request
+GET /b/a.txt
+--- error_code: 200
+--- no_error_log
+[error]
+
+
+=== TEST 9e: compression_bypass_vary is duplicate in one block
+--- config
+    location /b/ {
+        compression on;
+        compression_bypass_vary X-One;
+        compression_bypass_vary X-Two;
+    }
+--- must_die
+--- error_log
+is duplicate

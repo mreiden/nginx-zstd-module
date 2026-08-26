@@ -113,6 +113,8 @@ static char *ngx_http_compression_check_bufs_product(ngx_conf_t *cf,
     ngx_bufs_t *bufs, ngx_flag_t unsafe, const char *ctx, ngx_flag_t advise);
 static char *ngx_http_compression_set_enable_slot(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+static char *ngx_http_compression_set_bypass_vary(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_compression_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_compression_ratio_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *vv, uintptr_t data);
@@ -170,7 +172,7 @@ static ngx_command_t  ngx_http_compression_commands[] = {
 
     { ngx_string("compression_bypass_vary"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_str_slot,
+      ngx_http_compression_set_bypass_vary,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_compression_conf_t, bypass_vary),
       NULL },
@@ -1255,6 +1257,83 @@ ngx_http_compression_set_enable_slot(ngx_conf_t *cf, ngx_command_t *cmd,
     cmcf = ngx_http_conf_get_module_main_conf(cf,
                                         ngx_http_compression_filter_module);
     cmcf->any_enabled = 1;
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * "compression_bypass_vary <field-name>" (parent #168 row 6). The value
+ * becomes a literal Vary field on bypassed and compressed responses alike,
+ * so it must be exactly ONE RFC 9110 field-name token — a comma, a
+ * semicolon, a quoted string, or a bare "*" would emit a malformed or
+ * cache-defeating Vary. ngx_conf_set_str_slot would store any of them
+ * verbatim; validate first, then store the same way.
+ */
+static char *
+ngx_http_compression_set_bypass_vary(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_http_compression_conf_t  *ccf = conf;
+    ngx_str_t                    *value;
+    u_char                       *p, *end;
+
+    (void) cmd;
+
+    /* .data stays NULL from create_conf's pcalloc until set here, so a
+     * non-NULL value means the directive appeared twice in one block
+     * (inheritance runs later, via ngx_conf_merge_str_value). */
+    if (ccf->bypass_vary.data != NULL) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+    value = &value[1];      /* the single argument */
+
+    if (value->len == 0) {
+        return "empty value";
+    }
+
+    /* A bare wildcard disables shared caching and names no header — never
+     * what the operator meant. ('*' inside a longer token is fine.) */
+    if (value->len == 1 && value->data[0] == '*') {
+        return "invalid value: bare wildcard \"*\" disables shared caching";
+    }
+
+    /*
+     * RFC 9110 §5.1 token: tchar = DIGIT / ALPHA / one of
+     * ! # $ % & ' * + - . ^ _ ` | ~ . Commas and semicolons (list /
+     * parameter separators) and DQUOTE are rejected explicitly for a
+     * clearer message; every other non-tchar falls through to the generic
+     * arm.
+     */
+    for (p = value->data, end = value->data + value->len; p < end; p++) {
+        u_char  c = *p;
+
+        if (c == ',' || c == ';') {
+            return "invalid value: comma or semicolon (not a token)";
+        }
+
+        if (c == '"') {
+            return "invalid value: quoted string (not a token)";
+        }
+
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+              || (c >= '0' && c <= '9')
+              || c == '!' || c == '#' || c == '$' || c == '%'
+              || c == '&' || c == '\'' || c == '*' || c == '+'
+              || c == '-' || c == '.' || c == '^' || c == '_'
+              || c == '`' || c == '|' || c == '~'))
+        {
+            return "invalid value: not a valid field-name token (RFC 9110)";
+        }
+    }
+
+    ccf->bypass_vary.len = value->len;
+    ccf->bypass_vary.data = ngx_pstrdup(cf->pool, value);
+    if (ccf->bypass_vary.data == NULL) {
+        return NGX_CONF_ERROR;
+    }
 
     return NGX_CONF_OK;
 }
