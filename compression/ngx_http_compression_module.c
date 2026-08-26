@@ -538,6 +538,16 @@ ngx_http_compression_add_backends(ngx_conf_t *cf)
      * $compression_ratio / $compression_bytes_in / $compression_bytes_out
      * (parent $zstd_* parity): log-phase variables fed by the ctx
      * counters; not_found until the response finished compressing.
+     *
+     * No blanket NGX_HTTP_VAR_NOCACHEABLE (parent #184): each handler
+     * sets vv->no_cacheable per call instead — 1 while compression has
+     * not finished (ctx missing / !done, a retryable not_found), 0 once
+     * it reports the final value. nginx's flushed-variable cache retries
+     * an early no_cacheable lookup but reuses a cacheable one, so a
+     * request that references one of these more than once (e.g. a
+     * rewrite-phase set and the access log) formats the final value once
+     * and reuses it — versus reformatting, and redoing $compression_ratio's
+     * 64-bit scaled division, on every lookup under the blanket flag.
      */
     {
         ngx_http_variable_t  *var;
@@ -546,21 +556,20 @@ ngx_http_compression_add_backends(ngx_conf_t *cf)
         static ngx_str_t  in_name = ngx_string("compression_bytes_in");
         static ngx_str_t  out_name = ngx_string("compression_bytes_out");
 
-        var = ngx_http_add_variable(cf, &ratio_name,
-                                    NGX_HTTP_VAR_NOCACHEABLE);
+        var = ngx_http_add_variable(cf, &ratio_name, 0);
         if (var == NULL) {
             return NGX_ERROR;
         }
         var->get_handler = ngx_http_compression_ratio_variable;
 
-        var = ngx_http_add_variable(cf, &in_name, NGX_HTTP_VAR_NOCACHEABLE);
+        var = ngx_http_add_variable(cf, &in_name, 0);
         if (var == NULL) {
             return NGX_ERROR;
         }
         var->get_handler = ngx_http_compression_bytes_variable;
         var->data = offsetof(ngx_http_compression_ctx_t, bytes_in);
 
-        var = ngx_http_add_variable(cf, &out_name, NGX_HTTP_VAR_NOCACHEABLE);
+        var = ngx_http_add_variable(cf, &out_name, 0);
         if (var == NULL) {
             return NGX_ERROR;
         }
@@ -1056,6 +1065,8 @@ ngx_http_compression_ratio_variable(ngx_http_request_t *r,
     ctx = ngx_http_get_module_ctx(r, ngx_http_compression_filter_module);
 
     if (ctx == NULL || !ctx->done || ctx->bytes_out == 0) {
+        /* retryable: a later lookup (once compression finished) recomputes */
+        vv->no_cacheable = 1;
         vv->not_found = 1;
         return NGX_OK;
     }
@@ -1073,7 +1084,7 @@ ngx_http_compression_ratio_variable(ngx_http_request_t *r,
               - vv->data;
 
     vv->valid = 1;
-    vv->no_cacheable = 1;
+    vv->no_cacheable = 0;   /* final value: cache and reuse within request */
     vv->not_found = 0;
 
     return NGX_OK;
@@ -1091,6 +1102,8 @@ ngx_http_compression_bytes_variable(ngx_http_request_t *r,
     ctx = ngx_http_get_module_ctx(r, ngx_http_compression_filter_module);
 
     if (ctx == NULL || !ctx->done || ctx->bytes_out == 0) {
+        /* retryable: a later lookup (once compression finished) recomputes */
+        vv->no_cacheable = 1;
         vv->not_found = 1;
         return NGX_OK;
     }
@@ -1104,7 +1117,7 @@ ngx_http_compression_bytes_variable(ngx_http_request_t *r,
 
     vv->len = ngx_sprintf(vv->data, "%uz", val) - vv->data;
     vv->valid = 1;
-    vv->no_cacheable = 1;
+    vv->no_cacheable = 0;   /* final value: cache and reuse within request */
     vv->not_found = 0;
 
     return NGX_OK;
