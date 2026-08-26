@@ -29,11 +29,52 @@ set -euo pipefail
 NGINX="${1:?usage: test_dict_path_hardening.sh <nginx-binary> <module-dir>}"
 MODDIR="${2:?usage: test_dict_path_hardening.sh <nginx-binary> <module-dir>}"
 
+# Both arguments MUST be absolutized before anything else. Every fixture
+# below runs nginx with -p "$WORK" (a mktemp dir), and nginx resolves a
+# relative load_module path against that prefix -- so a caller passing
+# "nginx-1.31.4/objs" yields load_module /tmp/tmp.XXXX/nginx-1.31.4/objs/...
+# and dlopen() fails. The damage is not a plain red: every fixture that
+# EXPECTS a rejection still "passes", because the config was refused for
+# the wrong reason. Resolve here rather than trusting the caller.
+NGINX="$(readlink -f -- "$NGINX")"
+MODDIR="$(readlink -f -- "$MODDIR")"
+
+if [ ! -x "$NGINX" ]; then
+    echo "❌ $NGINX is not an executable nginx binary"
+    exit 1
+fi
+
 FILTER_MOD="$MODDIR/ngx_http_zstd_filter_module.so"
 if [ ! -f "$FILTER_MOD" ]; then
     echo "❌ $FILTER_MOD not found"
     exit 1
 fi
+
+# Non-vacuity gate for the whole matrix. A "rejected cleanly" fixture
+# only means something if the module loads at all in the baseline; a
+# dlopen failure would satisfy every negative fixture for free. Prove
+# the plain config loads BEFORE asserting anything about dictionaries.
+PRELUDE_WORK="$(mktemp -d)"
+mkdir -p "$PRELUDE_WORK/conf" "$PRELUDE_WORK/logs"
+cat >"$PRELUDE_WORK/conf/nginx.conf" <<EOF
+daemon off;
+master_process off;
+load_module $FILTER_MOD;
+error_log $PRELUDE_WORK/logs/error.log info;
+pid $PRELUDE_WORK/logs/nginx.pid;
+events { worker_connections 16; }
+http { access_log off; }
+EOF
+if ! timeout 10 "$NGINX" -t -p "$PRELUDE_WORK" \
+        -c "$PRELUDE_WORK/conf/nginx.conf" >"$PRELUDE_WORK/out" 2>&1; then
+    echo "❌ baseline config with $FILTER_MOD does not even load --"
+    echo "   every rejection fixture below would pass vacuously. Aborting."
+    cat "$PRELUDE_WORK/out"
+    rm -rf "$PRELUDE_WORK"
+    exit 1
+fi
+rm -rf "$PRELUDE_WORK"
+echo "✓ baseline: module loads, rejection fixtures are non-vacuous"
 
 WORK="$(mktemp -d)"
 cleanup() {
@@ -287,6 +328,72 @@ else
     kill -QUIT "$NGINX_PID" 2>/dev/null || true
     wait "$NGINX_PID" 2>/dev/null || true
     NGINX_PID=""
+fi
+
+# ── Read completeness: both loaders must read a dictionary to the end ──
+#
+# Both loaders used to issue ONE ngx_read_fd() and treat any short count
+# as a fatal "incomplete read". read() on a regular file may legally
+# return fewer bytes than asked for, and an EINTR-interrupted read
+# returns early on any filesystem regardless of O_NONBLOCK -- so a valid
+# dictionary could fail config load for no reason. They now loop via
+# ngx_http_zstd_read_dict_file().
+#
+# NOTE ON WHAT THESE FIXTURES DO AND DO NOT PROVE. The read loop itself
+# is NOT covered here and cannot be: read() on a local tmpfs/ext4 regular
+# file does not return a short count, and a signal cannot be steered into
+# the master's read window from a shell. Measured -- with the loop
+# reverted to a single read whose short count is fatal, every fixture in
+# this file still passed, the 1 MiB dictionary included. The loop's three
+# exits (resume-on-short, retry-on-EINTR, fail-on-EOF) are covered by
+# ci/tools/test_read_dict_file_unit.sh, which extracts the helper and
+# scripts ngx_read_fd; all three mutants are killed there.
+#
+# What these fixtures DO pin is the config-level contract around it: a
+# large dictionary loads, and the two rejections stay rejections.
+
+# A dictionary comfortably larger than one page. This is an end-to-end
+# smoke check that a big dictionary loads through the real loader on the
+# real filesystem -- it is NOT the short-read regression test (see the
+# note above; that lives in test_read_dict_file_unit.sh).
+head -c 1048576 /dev/urandom >"$WORK/html/large.dict"
+chmod 0644 "$WORK/html/large.dict"
+r=$(conf_test "    zstd_dict_file_unsafe on;
+    zstd_dict_file $WORK/html/large.dict;")
+check "1 MiB dictionary loads (zstd_dict_file)" regular "$r"
+
+r=$(conf_test "    zstd_dcz_dict_file $WORK/html/large.dict;")
+check "1 MiB dictionary loads (zstd_dcz_dict_file)" regular "$r"
+
+# Zero-length dictionary: rejected, and rejected the SAME way by both
+# loaders. ZSTD_createCDict(buf, 0, level) returns a valid do-nothing
+# CDict and a 0-byte read "succeeds", so without an explicit check the
+# operator silently gets no dictionary at all.
+: >"$WORK/html/empty.dict"
+chmod 0644 "$WORK/html/empty.dict"
+r=$(conf_test "    zstd_dict_file_unsafe on;
+    zstd_dict_file $WORK/html/empty.dict;")
+check "zero-length dictionary (zstd_dict_file)" reject "$r"
+
+r=$(conf_test "    zstd_dcz_dict_file $WORK/html/empty.dict;")
+check "zero-length dictionary (zstd_dcz_dict_file)" reject "$r"
+
+# Unreadable regular file: config load must fail rather than proceed
+# with an unpopulated buffer. This is refused at open() -- it never
+# reaches the read loop -- but it pins that a permission failure is
+# fatal at config time and not deferred to first use. Skipped under
+# root, which bypasses mode 0000 and would make the fixture vacuous.
+if [ "$(id -u)" -ne 0 ]; then
+    head -c 8192 /dev/urandom >"$WORK/html/noperm.dict"
+    chmod 0000 "$WORK/html/noperm.dict"
+    r=$(conf_test "    zstd_dict_file_unsafe on;
+    zstd_dict_file $WORK/html/noperm.dict;")
+    check "unreadable dictionary (zstd_dict_file)" reject "$r"
+
+    r=$(conf_test "    zstd_dcz_dict_file $WORK/html/noperm.dict;")
+    check "unreadable dictionary (zstd_dcz_dict_file)" reject "$r"
+else
+    echo "• unreadable dictionary: skipped (running as root bypasses mode 0000)"
 fi
 
 if [ "$fail" -ne 0 ]; then
