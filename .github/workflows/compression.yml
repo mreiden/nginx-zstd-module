@@ -123,6 +123,9 @@ jobs:
           python3 compression/tools/test_slow_drain.py \
             --nginx-binary "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx"
 
+      - name: Dictionary read-completeness unit test (short reads / EINTR / EOF)
+        run: bash compression/tools/test_read_dict_file_unit.sh
+
   gzipless:
     name: Build without the gzip module (no compat)
     runs-on: ubuntu-latest
