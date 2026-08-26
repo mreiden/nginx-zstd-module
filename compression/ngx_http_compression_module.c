@@ -36,6 +36,16 @@ typedef struct {
     ngx_http_compression_backend_t  *backend;
     void                            *bctx;
     ngx_chain_t                     *in;
+    /*
+     * Tail of ctx->in (points at the last link's &->next, or at &ctx->in
+     * when empty) so the body filter appends each callback's input in
+     * O(1) instead of ngx_chain_add_copy() re-walking the whole retained
+     * backlog every time — the backlog grows under downstream
+     * backpressure, making the naive append O(n^2) (parent #157/#176).
+     * Re-pointed at &ctx->in whenever the last retained link drains,
+     * because ngx_free_chain() immediately overwrites that link's ->next.
+     */
+    ngx_chain_t                    **last_in;
     ngx_buf_t                       *ob;        /* current output buf */
     size_t                           out_size;
 
@@ -1770,6 +1780,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     }
 
     ctx->backend = elected;
+    ctx->last_in = &ctx->in;    /* empty chain: tail is the head slot */
     ctx->out_size = elected->out_size(r->headers_out.content_length_n);
 
     /* operator geometry: an explicit compression_buffers size beats
@@ -1975,8 +1986,27 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
 
     if (in != NULL) {
-        if (ngx_chain_add_copy(r->pool, &ctx->in, in) != NGX_OK) {
-            return NGX_ERROR;
+        /*
+         * O(1) append (parent #157/#176): allocate one fresh link per
+         * incoming buffer and splice it onto the tracked tail, advancing
+         * the tail in the same pass — instead of ngx_chain_add_copy(),
+         * which re-walks ctx->in from the head to find its tail on every
+         * callback (O(n^2) as the retained backlog grows under
+         * backpressure). The consumer below only ever advances ctx->in
+         * link-by-link from the head and frees drained links, so the
+         * tracked tail cannot go stale mid-chain.
+         */
+        ngx_chain_t  *cl_in;
+
+        for (cl_in = in; cl_in != NULL; cl_in = cl_in->next) {
+            cl = ngx_alloc_chain_link(r->pool);
+            if (cl == NULL) {
+                return NGX_ERROR;
+            }
+            cl->buf = cl_in->buf;
+            cl->next = NULL;
+            *ctx->last_in = cl;
+            ctx->last_in = &cl->next;
         }
     }
 
@@ -2258,6 +2288,17 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         cl = ctx->in;
         ctx->in = cl->next;
         ngx_free_chain(r->pool, cl);
+
+        /*
+         * Just freed the last retained link: ngx_free_chain() has
+         * overwritten cl->next, so ctx->last_in (which pointed at it)
+         * is now dangling into the pool free-list. Re-point it at the
+         * head slot, or the next callback's append would splice into
+         * the free list and hang the request (parent #157's regression).
+         */
+        if (ctx->in == NULL) {
+            ctx->last_in = &ctx->in;
+        }
     }
 
 ship:
