@@ -900,6 +900,19 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
                        "compression static: serving \"%s\"", path.data);
 
+        /*
+         * HEAD fast path (parent #179): the response headers already
+         * carry everything a HEAD needs — Content-Encoding above and the
+         * Vary line emitted earlier in the negotiated path — so send them
+         * and skip the body buffer + ngx_file_t allocations below. Strict
+         * r->method == NGX_HTTP_HEAD, NOT r->header_only: the latter also
+         * covers 304/204, whose existing header_only return past the
+         * body-buffer setup stays correct.
+         */
+        if (r->method == NGX_HTTP_HEAD) {
+            return ngx_http_send_header(r);
+        }
+
         b = ngx_calloc_buf(r->pool);
         if (b == NULL) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;

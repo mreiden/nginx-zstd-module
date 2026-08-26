@@ -903,3 +903,26 @@ Content-Encoding: br
 Vary:
 --- no_error_log eval
 [qr/compression_static on/, qr/\[error\]/]
+
+
+=== TEST 34: HEAD fast path keeps the negotiated headers, sends no body
+# Parent #179: a HEAD returns after ngx_http_send_header(), skipping the
+# body buffer allocations — but the Content-Encoding and the Vary line
+# (set before the fast path) must be identical to what the GET produces.
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        root html;
+    }
+--- request
+HEAD /st/hello.js
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+Vary: Accept-Encoding
+--- response_body
+--- no_error_log
+[error]
