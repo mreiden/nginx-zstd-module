@@ -10,6 +10,7 @@
 [![Windows build](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/windows-build.yml/badge.svg)](https://github.com/myguard-labs/nginx-zstd-module/actions/workflows/windows-build.yml)
 
 📖 **Background reading:**
+
 - [zstd nginx module: what it does, bugs fixed](https://deb.myguard.nl/articles/zstd-nginx-module-bugs-fixed/)
 - [nginx zstd vs brotli vs zlib-ng — a compression comparison](https://deb.myguard.nl/articles/nginx-zstd-vs-brotli-vs-zlib-ng-compression/)
 
@@ -40,7 +41,9 @@ This is a hardened fork: every push/PR is exercised against **nginx mainline**, 
     * [zstd_bypass](#zstd_bypass)
     * [zstd_bypass_vary](#zstd_bypass_vary)
     * [zstd_dict_file](#zstd_dict_file)
+    * [zstd_dict_strict_path](#zstd_dict_strict_path)
     * [zstd_dcz_dict_file](#zstd_dcz_dict_file)
+    * [zstd_dcz_assume_secure_transport](#zstd_dcz_assume_secure_transport)
   * [ngx_http_zstd_static_module](#ngx_http_zstd_static_module)
     * [zstd_static](#zstd_static)
 * [Variables](#variables)
@@ -177,9 +180,13 @@ load_module modules/ngx_http_zstd_static_module.so;
   [`ci/tools/build-windows.sh`](ci/tools/build-windows.sh) assembles the MSVC build
   (and optionally ngx_brotli and headers-more). The usual Windows-nginx caveats
   apply (effectively single-worker via `select()`, no HTTP/3 — local dev use,
-  not production), and the `zstd_static` frame probes (magic number and
-  declared-window checks) are `pread`-based and compiled out under
-  `NGX_WIN32`. [`.github/workflows/windows-build.yml`](.github/workflows/windows-build.yml)
+  not production). The `zstd_static` frame probes (magic number, truncation,
+  declared-window and skippable-frame-chain checks) run on Windows too: the
+  probe needs an offset-explicit read that does not move the shared cached
+  descriptor's file position, which is `pread(2)` on POSIX and
+  `ngx_read_file()` — `ReadFile()` with an `OVERLAPPED` offset — on Win32.
+  The verdict logic itself is one shared function on both platforms.
+  [`.github/workflows/windows-build.yml`](.github/workflows/windows-build.yml)
   is the executable MinGW recipe and verifies both toolchains.
 * Dynamic modules (`.so`) require dynamic linking against `libzstd.so`. The build scripts auto-detect and prefer this. Ensure the zstd shared library is installed and available at runtime (`libzstd-dev` on Debian/Ubuntu, `libzstd-devel` on RHEL/Fedora).
 * On POSIX, when `ZSTD_LIB` is set to a non-standard path, the build embeds an RPATH pointing to that directory in the module `.so`. This means the module will load `libzstd.so` from that exact path at runtime. If the library is later moved (e.g. by a package upgrade), the module will fail to load. Use the system package and leave `ZSTD_LIB` unset to avoid this.
@@ -225,13 +232,17 @@ continuously exercised.
 
 This filter module compresses responses on the fly using zstd. It runs after the upstream or file handler generates the response, and before nginx sends it to the client. Compression is applied only when the client signals support via `Accept-Encoding: zstd`. 2xx responses are eligible for compression — except the bodyless `204 No Content` and `205 Reset Content` — as well as `403` and `404` (which often carry compressible error bodies). All other non-2xx statuses are passed through uncompressed.
 
-> **Required:** Enable `gzip_vary on;` alongside this module. When compression is applied, the module sets `r->gzip_vary = 1`, which causes nginx to emit a `Vary: Accept-Encoding` response header — but only when `gzip_vary` is enabled. Without it, proxies and CDNs may cache and serve compressed responses to clients that do not support zstd. Both this module and `zstd_static` warn at config load when they are enabled in a location whose effective `gzip_vary` is off.
+> **`Vary: Accept-Encoding` is emitted automatically — you do not need `gzip_vary on`.** Whenever a response's encoding depends on `Accept-Encoding`, both this module and `zstd_static on` emit the `Vary: Accept-Encoding` header themselves, so proxies and CDNs keep the compressed and uncompressed variants apart without any directive on your part. Emission is duplicate-safe: with `gzip_vary on` nginx emits the field and the module stays quiet, with `gzip_vary off` the module emits it — exactly one `Vary: Accept-Encoding` line either way.
 >
-> The one exception: if [ngx_http_compression_vary_filter_module](https://github.com/HanadaLee/ngx_http_compression_vary_filter_module) is loaded, that module emits (and flattens) `Vary: Accept-Encoding` from `r->gzip_vary` on its own wherever `compression_vary on` applies, replacing the `gzip_vary` directive (its author recommends `gzip_vary off` alongside `compression_vary on`). Because `compression_vary` itself defaults to **off** — and one module cannot read another's merged configuration to verify it — the warnings are not silenced outright when that module is present: the per-location lines are withheld and each module emits a single summary warning naming how many locations are affected and asking you to verify `compression_vary on` covers them.
+> This used to be a deployment prerequisite backed only by a config-load warning: with the default `gzip_vary off`, nginx *suppresses* the header entirely, so a single overlooked location shipped zstd bodies that a shared cache would then hand to clients unable to decode them. Correctness now belongs to the module rather than to an operator directive, and the warning is gone with it. `gzip_vary on` remains perfectly fine to set (it also covers other encoders such as `gzip`); it is simply no longer load-bearing for zstd.
+>
+> `zstd_static always` is deliberately excluded: it ignores `Accept-Encoding` entirely, so its response is not a negotiated variant and correctly carries no `Vary: Accept-Encoding`.
+>
+> Interoperating with [ngx_http_compression_vary_filter_module](https://github.com/HanadaLee/ngx_http_compression_vary_filter_module) is safe in every combination. That module emits and *flattens* `Vary` from `r->gzip_vary`, which this module still sets; because it folds the fields it finds rather than appending blindly, the header this module emits is merged rather than doubled. With `compression_vary off` (its default) this module's own emission still covers you — previously that exact combination produced no `Vary` at all, which is the residual risk the old summary warning existed to describe. CI asserts the single-`Vary` contract against the real module in both of its states.
 
 > **ETag behaviour:** When a response is compressed, nginx automatically weakens the `ETag` value (converting `"abc"` to `W/"abc"` if it was strong). This is correct per HTTP semantics — a compressed representation is a different entity variant — but it means strong ETag validation (`If-Match`) will not match across compressed and uncompressed responses. CDN edge nodes that cache both variants will see different ETags for each.
 
-> **Coexisting with `gzip` and `brotli`:** It is safe to enable `zstd`, the [`brotli`](https://github.com/google/ngx_brotli) filter, and the built-in [`gzip`](https://nginx.org/en/docs/http/ngx_http_gzip_module.html) filter on the same location with overlapping `*_types`. A response is only ever compressed once: nginx body filters run in a fixed chain, and the first encoder whose `Accept-Encoding` test passes wins, setting `Content-Encoding` so the later encoders skip the already-encoded body. Relative to the built-in `gzip`, `zstd` is always ordered to run **before** it (both in static and dynamic builds), so a client advertising `Accept-Encoding: gzip, zstd` receives `zstd`; clients that do not advertise `zstd` fall through to `gzip`. Always pair this with `gzip_vary on;` so each encoded variant is cached separately by proxies and CDNs.
+> **Coexisting with `gzip` and `brotli`:** It is safe to enable `zstd`, the [`brotli`](https://github.com/google/ngx_brotli) filter, and the built-in [`gzip`](https://nginx.org/en/docs/http/ngx_http_gzip_module.html) filter on the same location with overlapping `*_types`. A response is only ever compressed once: nginx body filters run in a fixed chain, and the first encoder whose `Accept-Encoding` test passes wins, setting `Content-Encoding` so the later encoders skip the already-encoded body. Relative to the built-in `gzip`, `zstd` is always ordered to run **before** it (both in static and dynamic builds), so a client advertising `Accept-Encoding: gzip, zstd` receives `zstd`; clients that do not advertise `zstd` fall through to `gzip`. Each encoded variant is cached separately by proxies and CDNs because every encoder in that chain advertises `Vary: Accept-Encoding`; this module emits it itself, and `gzip`/`brotli` emit theirs via `gzip_vary`, so set `gzip_vary on` if you rely on those encoders too.
 >
 > **`zstd` vs `brotli` ordering (dynamic builds):** the fixed `before brotli` guarantee holds for **static** builds, where `filter/config` explicitly places `zstd` ahead of `ngx_http_brotli_filter_module` in the module array. For **dynamic** modules, `ngx_brotli` and this module share the same filter anchor and neither constrains itself relative to the other, so the body-filter chain is built in **reverse `load_module` order** — whichever is loaded **last** runs first and wins. To make `zstd` win a `br, zstd` negotiation, load it last:
 >
@@ -259,7 +270,7 @@ Enables or disables on-the-fly zstd compression for responses.
 ```nginx
 http {
     zstd       on;          # enable everywhere
-    gzip_vary  on;          # required: see the note above
+    gzip_vary  on;          # optional for zstd (emitted automatically); covers gzip/brotli too
 
     server {
         location /downloads/ {
@@ -334,6 +345,19 @@ Sets the minimum response size (in bytes) required for compression to apply. The
 > **Note:** The built-in default is `1024` bytes. Smaller responses often lose
 > their savings to zstd frame overhead while still consuming compression CPU.
 
+> **Caveat — chunked and proxied responses bypass this directive entirely.**
+> The threshold can only be applied when the body length is known up front, so
+> the check is skipped whenever `Content-Length` is absent — which is the normal
+> case for chunked transfer encoding and for most proxied upstreams. Such
+> responses are compressed regardless of how small they turn out to be, and a
+> body below the threshold can come out *larger* than the original: a 47-byte
+> chunked body under `zstd_min_length 1024` is returned as 56 bytes with
+> `Content-Encoding: zstd`. Enforcing the threshold on a streaming body would
+> require buffering the response until the threshold is decided, which changes
+> when headers may be sent; the directive deliberately does not do this. If a
+> small-response floor matters for an upstream, ensure the upstream sets
+> `Content-Length`, or disable compression for that location.
+
 **Example:**
 
 ```nginx
@@ -380,6 +404,7 @@ zstd_types text/html text/plain text/css text/csv application/json
            application/rss+xml application/vnd.api+json
            application/xhtml+xml application/wasm text/wgsl;
 ```
+
 **Context:** `http, server, location`
 
 When omitted, the default covers common textual web representations. If set
@@ -459,6 +484,86 @@ http {
 > human-readable equivalent for that version. Prefer leaving the
 > directive unset so the size always tracks the library — only write it
 > explicitly when you are deliberately overriding it.
+
+#### Aggregate bound on `number × size`
+
+`number` and `size` are each range-checked on their own by nginx core,
+but the **product** was not checked at all until this policy was added —
+a typo (`zstd_buffers 100000 100000;` instead of `100 100k;`) or a value
+inherited unchanged from an outer block could request an overflowing or
+merely enormous per-response output-chain pool, multiplied by every
+concurrent response under load. Four tiers apply to the resolved value,
+in ascending severity:
+
+1. **`≤ 8 MB`** — silent. This covers nginx's own `zstd_buffers 32 4k`
+   default (128 KB) and this module's own `2 × ZSTD_CStreamOutSize()`
+   default (~256 KB at level 6) with generous headroom.
+
+2. **`> 8 MB`, `≤ 256 MB`** — a **warning**, not an error. A config that
+   loads today keeps loading after an upgrade:
+
+   ```text
+   nginx: [warn] "zstd_buffers" (merged value) requests 1 x 8388609 bytes
+   = ~8388609 bytes of output-chain memory PER RESPONSE; that is on top
+   of the per-request compressor (CCtx) working set -- see the
+   "zstd_max_cctx_memory" advisory above for that figure -- and both are
+   multiplied by concurrent responses under load
+   ```
+
+3. **`> 256 MB`, no acknowledgement** — a **hard config-load error**.
+   Unlike the CCtx memory estimate (which depends on libzstd internals
+   the operator never directly sees), `number` and `size` are two
+   integers the operator typed out literally, so at 256 MB — two hundred
+   times nginx's own default — a refusal by default is the safer
+   reading of "this is almost certainly a mistake":
+
+   ```text
+   nginx: [emerg] "zstd_buffers" (merged value) requests 2147483647 x
+   1073741824 bytes = ~2305843008139952128 bytes of output-chain memory
+   PER RESPONSE, above the 256 MB hard cap -- that is on top of the
+   per-request compressor (CCtx) working set (see the
+   "zstd_max_cctx_memory" advisory above) and both are multiplied by
+   concurrent responses under load. Lower "zstd_buffers", or set
+   "zstd_buffers_unsafe on;" to acknowledge this total is intentional
+   ```
+
+4. **`> 256 MB`, with `zstd_buffers_unsafe on;`** — accepted, still
+   logged as a **warning** (not silenced) so the acknowledgement remains
+   visible in the log:
+
+   ```text
+   nginx: [warn] "zstd_buffers" (merged value) requests 2147483647 x
+   1073741824 bytes = ~2305843008139952128 bytes of output-chain memory
+   PER RESPONSE, above the 256 MB hard cap; accepted because
+   "zstd_buffers_unsafe on;" acknowledges it. ...
+   ```
+
+`number × size` **overflowing the platform's `size_t`** is refused
+unconditionally at every tier, including with `zstd_buffers_unsafe on;`
+set — there is no representable acknowledgement for a product that
+cannot exist:
+
+```text
+nginx: [emerg] "zstd_buffers" (explicit directive) requests
+9223372036854775807 buffers of 9223372036854775807 bytes each; that
+product overflows the platform's size_t and cannot be a config any
+operator meant to write
+```
+
+The total named in tiers 2–4 is **per response**; add it to the CCtx
+figure from the [`zstd_max_cctx_memory`](#zstd_max_cctx_memory) advisory
+to size the full per-request compressor + output-chain budget, then
+multiply by expected concurrency.
+
+`zstd_buffers_unsafe` is `http, server, location` scoped and inherits
+like any other directive here — set it once at the level that also sets
+`zstd_buffers`, or higher up if every location beneath needs the same
+acknowledgement.
+
+The check runs once the value is fully resolved (explicit, inherited
+from an outer block, or this module's own default) so all three sources
+are covered by the same bound; an explicit value that also happens to be
+the one that ends up in effect is reported once, not twice.
 
 ---
 
@@ -558,7 +663,7 @@ location /api/bulk-export {
 ### zstd_max_cctx_memory
 
 **Syntax:** `zstd_max_cctx_memory size;`
-**Default:** `—` (disabled, no budget enforced)
+**Default:** `—` (no budget enforced; see [the advisory](#implicit-advisory-when-no-budget-is-set) below)
 **Context:** `http, server, location`
 **Requires:** module built with `-DZSTD_STATIC_LINKING_ONLY` against libzstd ≥ 1.4.0 (the project's production and CI builds do; see [Compatibility](#compatibility)).
 
@@ -597,6 +702,72 @@ server {
 }
 ```
 
+> **Interaction with `zstd_long`.** Enabling long-distance matching
+> raises libzstd's default window to 128 MB (`windowLog` 27) unless
+> `zstd_window_log` sets one explicitly, and adds the LDM hash table on
+> top. That is a large jump: level 3 costs ~3.6 MB per request without
+> `zstd_long` and ~144 MB with it. The budget check accounts for this —
+> it derives the same LDM sub-parameters libzstd would and estimates
+> against them, so `zstd_long on` with a budget below ~128 MB is
+> refused at config load rather than accepted and blown at runtime.
+> Pair `zstd_long on` with an explicit `zstd_window_log` to bring it
+> back down (level 3 with `zstd_window_log 20` costs ~2.7 MB).
+
+#### Implicit advisory when no budget is set
+
+Setting `zstd_max_cctx_memory` is optional, and most configurations
+never do. Compression enabled with **no** `zstd_max_cctx_memory`
+anywhere in the inheritance chain therefore still runs the same
+estimate at config load, and emits a **warning** — not an error — when
+the profile needs more than **32 MB** of per-request compressor memory:
+
+```text
+nginx: [warn] the configured zstd parameters need ~144328225 bytes of
+per-request compressor memory (zstd_comp_level 3); each worker retains
+up to 4 such contexts, so worker RSS can reach ~577312900 bytes, and
+that again per worker process. Set "zstd_max_cctx_memory" to a budget
+to have this enforced at config load, or "zstd_max_cctx_memory 0" to
+acknowledge the profile and silence this warning
+```
+
+This exists because the expensive levers are one line away from a
+working config: a later `zstd_comp_level 22` or `zstd_long on` commits
+hundreds of MB per concurrent response, and without the advisory the
+module knew that number at config load and said nothing.
+
+The 32 MB threshold sits in the natural gap between `zstd_comp_level`
+11 (~28.7 MB) and 12 (~52.7 MB), so the ordinary web-serving range is
+silent and only genuinely large profiles are named:
+
+| profile (level 3 unless stated) | per request | per worker (×4) | advisory |
+| --- | ---: | ---: | :---: |
+| `zstd_comp_level 1` | 1.3 MB | 5.2 MB | no |
+| default (`zstd_comp_level 3`) | 3.5 MB | 14.0 MB | no |
+| `zstd_comp_level 9` | 16.7 MB | 67.0 MB | no |
+| `zstd_comp_level 11` | 28.7 MB | 115.0 MB | no |
+| `zstd_comp_level 12` | 52.7 MB | 211.0 MB | **yes** |
+| `zstd_comp_level 19` | 89.5 MB | 358.0 MB | **yes** |
+| `zstd_comp_level 22` | 769.5 MB | 3078.0 MB | **yes** |
+| `zstd_long on` | 137.6 MB | 550.6 MB | **yes** |
+| `zstd_window_log 27` | 129.5 MB | 518.0 MB | **yes** |
+| `zstd_long on` + `zstd_window_log 20` | 2.6 MB | 10.3 MB | no |
+
+*(`ZSTD_estimateCStreamSize_usingCCtxParams()`, libzstd 1.5.7,
+streaming with unknown content size — the module's own path.)*
+
+Two ways to silence it, and they mean different things:
+
+* **`zstd_max_cctx_memory <size>;`** — you want the bound *enforced*.
+  Exceeding it is a hard config-load error, as documented above.
+* **`zstd_max_cctx_memory 0;`** — you have read the number and accept
+  it. Nothing is enforced and nothing is warned about.
+
+It never fails the configuration on its own: a config that loads today
+keeps loading after an upgrade. Note that the advisory requires the
+same `-DZSTD_STATIC_LINKING_ONLY` build as the directive; a build
+without the estimator API simply does not warn, rather than implying a
+guarantee it cannot compute.
+
 **Why a config-load assert and not a runtime cap.** The directive does
 **not** silently tune anything. A too-tight budget is a hard error so
 operators see the misconfiguration up front, instead of discovering it
@@ -609,6 +780,26 @@ clear message, never silently no-op'd.
 > worker memory ceiling at the request limit is roughly
 > `worker_connections × zstd_max_cctx_memory` in the worst case
 > (every connection actively compressing).
+
+> **Retained memory between requests.** Each worker keeps a small ring
+> of compression contexts (4 slots) so consecutive responses reuse an
+> already-allocated workspace instead of building one per response.
+> A slot is keyed on the complete set of parameters that drive that
+> workspace — `zstd_comp_level`, `zstd_long` and the **effective** window
+> log — and is never re-parameterised, so a slot's retained size stays at
+> the figure `zstd_max_cctx_memory` vetted for that profile at config load.
+> "Effective" matters for one case: a [dcz](#zstd_dcz_dict_file)
+> request derives its own window from the negotiated dictionary rather than
+> from `zstd_window_log`, so it is keyed on that derived value and occupies
+> its own slot instead of raising a plain request's slot permanently.
+> An idle worker therefore holds up to 4 workspaces rather than
+> releasing them between requests. Budget that constant, not the number
+> of configured profiles: a busy slot is skipped before its profile is
+> compared, so concurrent requests on a single profile can seed several
+> slots with that same profile. Each retained workspace stays at its own
+> profile's vetted figure, so this is a floor well below the
+> `worker_connections × zstd_max_cctx_memory` ceiling above, not an
+> addition to it.
 
 ---
 
@@ -707,6 +898,16 @@ server {
 > `Cache-Control: private` / `no-store`. Bypass predicates that depend
 > only on `$request_uri`/`$uri` (already part of the cache key) do not
 > need this.
+>
+> The module warns at config load when a `zstd_bypass` predicate reads a
+> `$http_*` or `$cookie_*` variable **directly** with no
+> `zstd_bypass_vary` configured in the same location — the same
+> misconfiguration named above, caught before it reaches a shared cache.
+> The check only recognizes the literal `$http_*`/`$cookie_*` spellings;
+> an indirect predicate (e.g. a `map` result variable derived from a
+> header or cookie) is not resolved and stays silent — pairing
+> `zstd_bypass_vary` with a map-derived predicate remains an explicit
+> operator responsibility.
 
 ---
 
@@ -731,8 +932,8 @@ server {
 ```
 
 The module emits this as an additional `Vary` header line; caches union all
-`Vary` fields, so it coexists with the `Vary: Accept-Encoding` produced by
-`gzip_vary on;`. It does not itself decide anything — it only makes the
+`Vary` fields, so it coexists with the `Vary: Accept-Encoding` the module
+emits automatically. It does not itself decide anything — it only makes the
 existing bypass behaviour cacheable without poisoning.
 
 ---
@@ -775,17 +976,42 @@ http {
 
 ---
 
+### zstd_dict_strict_path
+
+**Syntax:** `zstd_dict_strict_path on | off;`
+**Default:** `off`
+**Context:** `http`
+
+Both dictionary loaders ([`zstd_dict_file`](#zstd_dict_file) and [`zstd_dcz_dict_file`](#zstd_dcz_dict_file)) always reject a FIFO, socket, directory, device node, or empty file — a config-load error either way, `on` or `off`. This directive controls an *additional*, opt-in trust policy on top of that: with it `on`, both loaders also refuse a **symlink at any component of the path** (not only the final one), a target **writable by group or other**, and a target **not owned by the loading principal or by root**. It additionally requires the path to be **absolute** and free of `.`/`..` components.
+
+> **Why it matters.** A root master reloads its configuration (`nginx -s reload` or a supervisor-driven SIGHUP) and re-reads every dictionary from disk at that moment. If the path is a symlink a less-privileged local writer can repoint, or the file itself is group/world-writable, that writer chooses or mutates the bytes the master snapshots into every worker on the next reload — without ever needing privilege to touch the running nginx process. `on` closes that. The path is resolved **one component at a time** with `openat(O_NOFOLLOW|O_DIRECTORY)`, so an intermediate symlink (`/srv/current/dict.bin` with `current` a symlink) is refused rather than silently traversed — a whole-path `O_NOFOLLOW` guards only the final component and would follow `current` without complaint. The leaf is then opened relative to the verified parent descriptor, and before a single byte is read its mode is checked against `S_IWGRP|S_IWOTH` **and** its owner against the effective uid of the config-parsing master (root-owned files are also accepted, root not being less privileged than the loader). Owner-writability alone is not enough: a dictionary owned by an unprivileged account at an entirely ordinary mode `0644` lets that owner rewrite the bytes a later privileged reload snapshots, which is precisely the writer this directive exists to exclude. Every check runs against the **already-open file descriptor** — never by re-opening the path — so a rename or symlink swap after the check cannot smuggle in a different file (no TOCTOU window).
+
+> **Platform support.** The component walk needs POSIX.1-2008 `openat()`. Where it is unavailable (including Windows), `zstd_dict_strict_path on` **fails closed** with a config-load error rather than falling back to the weaker leaf-only guarantee — the directive never claims a protection the platform cannot deliver. `off` (the default) is unaffected everywhere.
+
+> **Default is `off`.** A release-symlink layout (`/srv/current -> /srv/releases/<n>/`, with the dictionary loaded from a path through `current`) is a common, legitimate deployment pattern, and it depends on exactly the symlink indirection `on` refuses — at the intermediate `current` component as much as at the leaf. Turning this on is a deliberate hardening step for operators who deploy dictionaries to an immutable, content-addressed path (e.g. a filename embedding the content hash) rather than through a movable symlink — do not enable it against an existing release-symlink deployment without first moving to that layout, or every reload will fail with `nginx -s reload` and the **old worker generation keeps serving** (a rejected reload never tears down the running cycle).
+
+**Example (hardened, content-addressed dictionary path):**
+
+```nginx
+http {
+    zstd_dict_strict_path on;
+    zstd_dcz_dict_file /srv/dicts/app-a1b2c3d4.bin;
+}
+```
+
+---
+
 ### zstd_dcz_dict_file
 
 **Syntax:** `zstd_dcz_dict_file /path/to/dictionary [sha256hex];`
 **Default:** `—`
 **Context:** `http`, `server`, `location` (repeatable)
 
-Standards-based dictionary compression per [RFC 9842](https://www.rfc-editor.org/rfc/rfc9842) (Compression Dictionary Transport). Each occurrence loads one dictionary — typically a **previous version of the resource** (delta-style) or a trained dictionary — and registers its SHA-256 as a negotiation key. When a request arrives whose `Available-Dictionary` header matches a loaded dictionary **and** whose `Accept-Encoding` lists `dcz` explicitly with a non-zero weight, the response is compressed against that dictionary and sent as `Content-Encoding: dcz`: a fixed 40-byte header (a zstd skippable frame carrying the dictionary's SHA-256) followed by an ordinary zstd frame. Chrome 130+ negotiates this automatically for same-origin resources. Every gate miss — unknown hash, no explicit `dcz` token (`*` deliberately does not match), `dcz;q=0`, a malformed `Available-Dictionary`, or `Sec-Fetch-Site` other than `same-origin`/`none` — falls back to the plain `zstd` path.
+Standards-based dictionary compression per [RFC 9842](https://www.rfc-editor.org/rfc/rfc9842) (Compression Dictionary Transport). Each occurrence loads one dictionary — typically a **previous version of the resource** (delta-style) or a trained dictionary — and registers its SHA-256 as a negotiation key. When a request arrives whose `Available-Dictionary` header matches a loaded dictionary **and** whose `Accept-Encoding` lists `dcz` explicitly with a non-zero weight, the response is compressed against that dictionary and sent as `Content-Encoding: dcz`: a fixed 40-byte header (a zstd skippable frame carrying the dictionary's SHA-256) followed by an ordinary zstd frame. Chrome 130+ negotiates this automatically for same-origin resources. Every gate miss — a non-secure context ([see below](#zstd_dcz_assume_secure_transport)), unknown hash, no explicit `dcz` token (`*` deliberately does not match), `dcz;q=0`, a malformed `Available-Dictionary`, or `Sec-Fetch-Site` other than `same-origin`/`none` — falls back to the plain `zstd` path.
 
-Unlike `zstd_dict_file`, no opt-in flag is needed: dcz is real HTTP negotiation, and only clients that advertised the dictionary ever receive it.
+Unlike `zstd_dict_file`, no opt-in flag is needed to make dcz *safe*: dcz is real HTTP negotiation, and only clients that advertised the dictionary ever receive it. One flag can still be required by your topology — RFC 9842 §8 restricts dcz to secure contexts, so a deployment where TLS is terminated *in front of* this nginx needs [zstd_dcz_assume_secure_transport](#zstd_dcz_assume_secure_transport). On a listener that terminates TLS itself, nothing extra is needed.
 
-The optional second argument supplies the dictionary's SHA-256 as 64 hex characters, trusted **verbatim** in place of hashing the file at config load — deploy tooling that generates the directive list has usually just computed every hash anyway (for deduplication), and skipping the load-time pass removes the dominant cost of `nginx -t` and reloads at hundreds of registered dictionaries. Only supply hashes for content-hashed immutable assets, from tooling that owns the config: a *stale* supplied hash keeps matching, and every client advertising it (and any shared cache serving them) gets responses compressed against the wrong dictionary. dcz frames carry a **content checksum** (XXH64 of the uncompressed content, verified by browsers' zstd decoders) precisely so this fails as a visible decode error — without it, a same-size stale dictionary decodes *successfully* to wrong bytes. Visible is still broken: the checksum bounds the damage, it does not excuse a stale hash. A self-computed hash of a changed file simply stops matching (safe fallback to plain `zstd`). Malformed values are config-load errors.
+The optional second argument supplies the dictionary's SHA-256 as 64 hex characters. It is **verified** against the bytes actually read at config load, never substituted for hashing them: it declares what the operator believes the file to be, and a mismatch fails the load with an error naming the file, the supplied hash and the computed one. Use it as a deploy-time guard that the file on this host is the one the config was generated for — a dictionary replaced or truncated behind the config is caught by `nginx -t` instead of reaching clients. Malformed values (wrong length, non-hex) are config-load errors, reported before the file is opened. The negotiation key is always the hash of the loaded bytes, so a dictionary that changes on disk simply stops matching and responses fall back to plain `zstd`.
 
 The module handles the response side; **advertising** the dictionary to clients is one `add_header` on the dictionary resource (usually the resource itself, so today's file becomes the dictionary for tomorrow's):
 
@@ -808,12 +1034,13 @@ http {
 
 Operational notes:
 
-* **Caching.** Whenever dictionaries are configured, the module emits `Vary: Available-Dictionary` on **both** the dcz and the plain-zstd variants — which encoding a client receives depends on that request header for every client, and a shared cache that failed to key on it could serve an undecodable dcz body to a dictionary-less client. Keep `gzip_vary on` so `Vary: Accept-Encoding` is emitted alongside.
+* **Caching.** Whenever dictionaries are configured, the module emits `Vary: Available-Dictionary, Sec-Fetch-Site` on **both** the dcz and the plain-zstd variants — which encoding a client receives depends on that request header for every client, and a shared cache that failed to key on it could serve an undecodable dcz body to a dictionary-less client. `Sec-Fetch-Site` is in that list for the same reason: dcz is refused for any value other than `same-origin`/`none`, so a shared cache that ignored it would hand the dcz representation to a cross-site request — bypassing the origin gate — or suppress dcz for a legitimate same-origin client, depending on which one filled the cache first. Security decision inputs stay in `Vary`. `Vary: Accept-Encoding` is emitted alongside automatically, on its own header line.
 * **Dictionary lifecycle.** Files are read once at config parse, and hashed only when no hash is supplied (`nginx -t` validates them; empty or > 10 MB files and duplicate dictionary hashes are load errors — supplied hashes are compared as declared, so with computed hashes "duplicate" means identical content). Rotate dictionaries by updating the config and reloading. A location that declares its own `zstd_dcz_dict_file` list replaces the inherited one wholesale. Hashing uses libcrypto's EVP SHA-256 when detected at build time — roughly an order of magnitude faster, which at hundreds of registered dictionaries turns seconds of `nginx -t`/reload time into a blip (`NGX_ZSTD_NO_LIBCRYPTO=1` in the configure environment opts out) — with a portable implementation built in as the fallback.
-* **Window and memory.** dcz frames never declare a window above 8 MB (the RFC's unconditional client guarantee), sized down to dictionary + expected content when smaller. An explicit `zstd_window_log` below that still wins — a dictionary does not void the memory cap. Dictionaries are referenced per request via `ZSTD_CCtx_refPrefix()` (RFC 9842 `type=raw` semantics); the per-request table build over the dictionary costs roughly milliseconds per MB of dictionary, so prefer focused dictionaries (the previous version of one resource) over giant blobs.
-* **Cross-origin.** Requests with `Sec-Fetch-Site` other than `same-origin`/`none` fall back to plain zstd rather than attempting RFC 9842's CORS legs. `Dictionary-ID` is not consumed — the hash is a complete key — so omit `id=` from `Use-As-Dictionary` (clients would echo it, but nothing here needs it).
+* **Window and memory.** dcz frames never declare a window above 8 MB (the RFC's unconditional client guarantee), sized down to dictionary + expected content when smaller. Either memory ceiling below that still wins — a dictionary does not void a cap the operator asked for. An explicit [`zstd_window_log`](#zstd_window_log) clamps the dcz window directly, and [`zstd_max_cctx_memory`](#zstd_max_cctx_memory) set to a POSITIVE budget clamps it to the largest window log whose estimated CCtx memory still fits that budget (computed once at config load, so the request path only compares). Both are **opt-in**: with `zstd_window_log` unset and `zstd_max_cctx_memory` either unset or `0` — the default, or an explicit "accept the estimate, do not enforce it" — the dcz window is the dictionary-derived one, unchanged. Note that a budget tight enough to move the window costs ratio on dcz responses, which is the trade an explicit memory bound asks for. Dictionaries are referenced per request via `ZSTD_CCtx_refPrefix()` (RFC 9842 `type=raw` semantics); the per-request table build over the dictionary costs roughly milliseconds per MB of dictionary, so prefer focused dictionaries (the previous version of one resource) over giant blobs.
+* **Secure context.** RFC 9842 §8 restricts dictionary transport to secure contexts, so dcz is only negotiated over TLS. A plain-HTTP request that would otherwise match falls back to plain `zstd`. Behind a TLS-terminating proxy, see [zstd_dcz_assume_secure_transport](#zstd_dcz_assume_secure_transport).
+* **Cross-origin.** Requests with `Sec-Fetch-Site` other than `same-origin`/`none` fall back to plain zstd rather than attempting RFC 9842's CORS legs. That decision is declared in `Vary` (see Caching above) so a shared cache partitions on it. `Dictionary-ID` is not consumed — the hash is a complete key — so omit `id=` from `Use-As-Dictionary` (clients would echo it, but nothing here needs it).
 
-**Troubleshooting:** if `Vary: Available-Dictionary` appears but dcz never negotiates for hashes you know are right, run `nginx -T | grep dcz_dict_file` and check the loaded entries are your dictionary *files* — a deploy-generated list of directives must be pulled in with `include`, not passed to `zstd_dcz_dict_file` itself (which loyally loads the list file as a one-entry dictionary that matches nothing). Also check the error log for a rejected reload: a failed `nginx -t` leaves the previous configuration running.
+**Troubleshooting:** if `Vary: Available-Dictionary, Sec-Fetch-Site` appears but dcz never negotiates for hashes you know are right, run `nginx -T | grep dcz_dict_file` and check the loaded entries are your dictionary *files* — a deploy-generated list of directives must be pulled in with `include`, not passed to `zstd_dcz_dict_file` itself (which loyally loads the list file as a one-entry dictionary that matches nothing). Also check the error log for a rejected reload: a failed `nginx -t` leaves the previous configuration running.
 
 Verify a response end-to-end with the zstd CLI (the 40-byte header is a valid skippable frame, so no stripping is needed):
 
@@ -823,6 +1050,32 @@ curl -s -H 'Accept-Encoding: zstd, dcz' \
      https://example.com/app/app-v42.js \
 | zstd -d -D app-v41.js | diff - app-v42.js && echo "byte-exact"
 ```
+
+---
+
+### zstd_dcz_assume_secure_transport
+
+**Syntax:** `zstd_dcz_assume_secure_transport on | off;`
+**Default:** `zstd_dcz_assume_secure_transport off;`
+**Context:** `http`, `server`, `location`
+
+Asserts that the client-facing hop is TLS even though this nginx sees plaintext, re-enabling [`dcz`](#zstd_dcz_dict_file) negotiation on a non-TLS connection.
+
+[RFC 9842](https://www.rfc-editor.org/rfc/rfc9842) §8 requires compression dictionary transport to be used only in a **secure context**. By default the module enforces that directly: `dcz` is negotiated only when the request arrived on a TLS connection, and a plain-HTTP request that would otherwise match falls back to plain `zstd`. That is the fail-closed direction — dictionary compression over cleartext hands a network attacker a length oracle over content the dictionary already describes.
+
+When TLS is terminated by a load balancer or CDN in front of this nginx, the connection nginx sees *is* plaintext and the check fires even though the client spoke HTTPS. Set this directive on in that deployment:
+
+```nginx
+server {
+    listen 8080;                                # behind a TLS terminator
+
+    zstd on;
+    zstd_dcz_assume_secure_transport on;        # the client hop is HTTPS
+    zstd_dcz_dict_file /var/www/releases/app-v41.js;
+}
+```
+
+The directive is an **operator acknowledgement, not a detection**. The module deliberately does not infer the client's scheme from `X-Forwarded-Proto`, `Forwarded` or any other request header: those are client-supplied on a directly reachable listener, so trusting one would let any client re-enable `dcz` over cleartext simply by sending it. Only enable this on a listener that is genuinely unreachable except through your TLS terminator — if the same listener can be hit directly over HTTP, enabling it puts those clients back in the situation §8 forbids.
 
 ---
 
@@ -843,14 +1096,14 @@ Controls how pre-compressed `.zst` files are served.
 | Value | Behaviour |
 |---|---|
 | `off` | Disabled. Always serve the original file. |
-| `on` | Check whether the client supports zstd (`Accept-Encoding: zstd`). If yes and a `.zst` file exists, serve it. Otherwise fall back to the original. Also emits `Vary: Accept-Encoding` (via `gzip_vary`). |
+| `on` | Check whether the client supports zstd (`Accept-Encoding: zstd`). If yes and a `.zst` file exists, serve it. Otherwise fall back to the original. Emits `Vary: Accept-Encoding` automatically on both outcomes. |
 | `always` | Always serve the `.zst` file if it exists, regardless of `Accept-Encoding`. Use this when you know all clients support zstd (e.g. internal services). |
 
-When set to `on`, the module sets `r->gzip_vary = 1`, which causes nginx to add a `Vary: Accept-Encoding` response header (controlled by [`gzip_vary`](https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_vary)). Enable `gzip_vary on;` alongside `zstd_static on;` to ensure correct caching by proxies and CDNs.
+When set to `on`, the module emits a `Vary: Accept-Encoding` response header itself as soon as a `.zst` sibling makes the URI depend on `Accept-Encoding` — including on the fallback path where the client does not accept zstd and the original file is served. Correct caching by proxies and CDNs therefore does not require [`gzip_vary`](https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_vary); setting `gzip_vary on` is compatible and never produces a duplicate header. `zstd_static always` ignores `Accept-Encoding` and emits no `Vary`.
 
 > **Warning (`always` mode):** When `zstd_static always` is set, `.zst` files are served to every client regardless of whether they advertise `Accept-Encoding: zstd`. No `Vary` header is emitted and no `Content-Encoding` negotiation occurs. Any client that does not support zstd will receive a compressed body it cannot decode. Only use `always` on locations where every client is guaranteed to support zstd — for example, internal service-to-service calls where you control both ends.
 
-> **Magic-number validation.** Before serving a `.zst`, the module reads the first bytes of the file (one `pread(2)` at offset 0) and verifies they are the zstd frame magic (`ZSTD_MAGICNUMBER` `0xFD2FB528`) or a skippable-frame magic (`ZSTD_MAGIC_SKIPPABLE_*`). On mismatch — a truncated download, mistaken rename (`cp foo.txt foo.zst`), or any other non-zstd content — the handler logs `zstd static: "..." is not a zstd frame (leading bytes 0x...)` and **declines**; nginx then falls back to serving the uncompressed original, or returns 404 if no original is present. Without this, the client would receive a body labelled `Content-Encoding: zstd` that it cannot decode. The check is Linux/BSD-only (uses `pread(2)`) and is skipped under `NGX_WIN32`.
+> **Magic-number validation.** Before serving a `.zst`, the module reads the first bytes of the file (one `pread(2)` at offset 0) and verifies they are the zstd frame magic (`ZSTD_MAGICNUMBER` `0xFD2FB528`) or a skippable-frame magic (`ZSTD_MAGIC_SKIPPABLE_*`). On mismatch — a truncated download, mistaken rename (`cp foo.txt foo.zst`), or any other non-zstd content — the handler logs `zstd static: "..." is not a zstd frame (leading bytes 0x...)` and **declines**; nginx then falls back to serving the uncompressed original, or returns 404 if no original is present. Without this, the client would receive a body labelled `Content-Encoding: zstd` that it cannot decode. The read is offset-explicit so it never disturbs the file position of the `open_file_cache` descriptor shared with other in-flight requests: `pread(2)` on POSIX, `ngx_read_file()` (a `ReadFile()` with an `OVERLAPPED` offset) on Win32. The verdict logic is a single shared function, so both platforms accept and reject exactly the same files. The probe is compiled out only on a POSIX build whose `configure` found no `pread(2)`, rather than degraded to a `read`+`lseek` pair that would corrupt those concurrent requests.
 >
 > **Declared-window validation.** The same probe parses the frame header (RFC 8878) and **declines any `.zst` whose leading frame declares a decompression window above 8 MB** — the limit browsers enforce for `Content-Encoding: zstd`; Firefox (`NS_ERROR_INVALID_CONTENT_ENCODING`) and Chromium (`ERR_CONTENT_DECODING_FAILED`) reject such frames before decoding a single byte. The scope is exactly the leading frame: a skippable leading frame is exempt, and in a (pathological, no common tooling emits one) concatenation of regular frames only the first is inspected — a regular frame's header does not declare its compressed length, so walking the sequence would mean decoding every block header in every frame. `zstd -t --memory=8MB` remains the complete pre-deploy check. This traps a nasty build-pipeline failure mode: streaming encoders that are not told the input size stamp the *compression level's* default window into every frame header, so a Node-based bundler can emit a 90 KB asset declaring a 128 MB window — the file decodes fine with the `zstd` CLI and serves byte-identically through nginx, yet fails in every browser. On decline the error log names the file and its declared window, and the request falls through to the zstd filter / `gzip_static` / identity, so the site keeps working while the build gets fixed (recompress with a window log ≤ 23; verify a build with `zstd -t --memory=8MB *.zst`). Single-segment frames are checked against their declared content size, which is their window.
 
@@ -931,10 +1184,11 @@ identically whether the hash was supplied or computed.
 
 # Testing & CI
 
-[`ci.yml`](.github/workflows/ci.yml) is the single pull-request entry
-point: it calls every gate below, so one job list answers "what does a PR
-run?". Each member keeps its own `workflow_dispatch:` and can still be run
-alone from the Actions tab.
+[`ci.yml`](.github/workflows/ci.yml) is the single gate entry point: it calls
+every gate below, so one job list answers "what does a PR run?". It fires on
+pull requests and again on each merge to `master`, which is what gives the
+default branch a CI result of its own. Each member keeps its own
+`workflow_dispatch:` and can still be run alone from the Actions tab.
 
 Two workflows are deliberately NOT called from it. **CI Deep** is the
 unbounded monthly campaign — its verdict lands long after the merge decision
@@ -943,16 +1197,17 @@ version-bump PRs rather than gating them.
 
 | Workflow | Cadence | What it does |
 |---|---|---|
-| **CI** ([`ci.yml`](.github/workflows/ci.yml)) | every PR | The orchestrator. Calls Lint, Build&Test, Security Scanners, Fuzzing, Valgrind, CodeQL, A/UBSan and Windows build as reusable workflows, and is the only workflow carrying a `pull_request:` trigger. Hands CodeQL the `security-events: write` permission it needs for the SARIF upload, which a called workflow cannot grant itself. |
-| **Lint** ([`lint.yml`](.github/workflows/lint.yml)) | every PR (via CI) | Runs the same `ci/linter/` checks as the local pre-commit hook — nginx-convention, shell, Python, Perl, YAML, spelling, and the CI-policy checkers (runner trust, port bands, cadence, secrets, docs drift) — so a clone that never enabled `core.hooksPath .githooks` still gets the gate on the PR. |
-| **Build&Test** | every PR (via CI) + weekly cron | Compiles the module against **nginx mainline** (resolved at run time — see [Compatibility](#compatibility)) with strict `-Werror` flags, then runs the full test suite: 79 `Test::Nginx::Socket` filter tests, 28 static-module tests, 4 config-warning tests, and end-to-end Python smoke tests (truncation, `Vary`, boundary sizes, repeated/concurrent requests, terminal-frame, the proxy-unbuffered and compression-matrix regressions, slow-drain backpressure with data-less flushes, per-request CCtx isolation, reload-under-load, `zstd_long`/LDM, `$zstd_ratio`). A separate matrix entry rebuilds against **libzstd 1.4.x** (from source) to exercise the `< 1.5.6` and `≥ 1.4.0` fallback paths, and a parallel job rebuilds with **ASAN+UBSAN** and re-runs the smoke tests plus a `zstd_dict_file` config-reload leak check. **Angie is not built here** — see CI Deep below, the only workflow that exercises it. |
-| **Security Scanners** | every PR (via CI) | flawfinder, clang-tidy (`cert-*`, `clang-analyzer-security.*`), and semgrep, with the reports uploaded as build artifacts. |
-| **Fuzzing** | every PR (via CI) | A 120-second libFuzzer regression run for the `ngx_http_zstd_accept_encoding()` / `ngx_http_zstd_eval_qvalue()` RFC 9110 `Accept-Encoding`/q-value parser. The fuzz target is sliced from the shipped header at build time, so there is no copy drift. See [`ci/fuzz/README.md`](ci/fuzz/README.md). |
-| **Valgrind** | every PR (via CI) | A 60-second Memcheck-lite soak against a debug nginx build, catching uninitialised-value reads and leaks that ASAN cannot. |
-| **CodeQL** | every PR (via CI) + monthly | GitHub's semantic C/C++ analysis (`security-extended` query pack) over the module sources in `src/`. |
-| **A/UBSan** ([`asan.yml`](.github/workflows/asan.yml)) | every PR (via CI) | A 60-second ASan+UBSan soak against a static `--add-module` build, driving the same mixed-load traffic as the Valgrind soak. Catches heap overflow/UAF outside nginx's pool blocks that Valgrind's slower pass would also catch, but ~20× faster — complementary to Valgrind, not redundant. |
-| **CI Deep** | monthly + manual dispatch | The exhaustive run: a `build-flavors` matrix that compiles and runs the full `Test::Nginx::Socket` suite against **nginx mainline, nginx stable, and Angie** (the only workflow that builds Angie at all), hours-long fuzzing on the same target, full Memcheck and Helgrind soaks (a valgrind soak is ~20–50× slower than native), and the same security scanners. |
-| **Windows build** ([`windows-build.yml`](.github/workflows/windows-build.yml)) | every PR (via CI) | Builds the module on Windows two ways: MSVC x64 static and MinGW-w64 x64 dynamic, each against a pinned nginx with PCRE2 and zlib, then runs `nginx -t` on the result. Guards the `NGX_WIN32` paths, which no Linux job compiles. No reference-skeleton equivalent — kept because it gates a platform nothing else here covers (see [`ci/skeleton-findings.md`](ci/skeleton-findings.md)). |
+| **CI** ([`ci.yml`](.github/workflows/ci.yml)) | every PR + every merge to `master` | The orchestrator. Calls Lint, Build&Test, Security Scanners, Fuzzing, Valgrind, CodeQL, A/UBSan and Windows build as reusable workflows, and is the only workflow carrying a `pull_request:` or `push:` trigger. The `push: [master]` leg runs the same job list once per merge, so the default branch has a result of its own — without it a merge that breaks `master` (two independently-green PRs conflicting, or a runner toolchain upgrade) goes unreported until the next unrelated PR goes red. `concurrency:` is keyed on `github.ref`, so the master leg never cancels a PR leg. Hands CodeQL the `security-events: write` permission it needs for the SARIF upload, which a called workflow cannot grant itself. |
+| **Lint** ([`lint.yml`](.github/workflows/lint.yml)) | every PR + merge to `master` (via CI) | Runs the same `ci/linter/` checks as the local pre-commit hook — nginx-convention, shell, Python, Perl, YAML, spelling, and the CI-policy checkers (runner trust, port bands, cadence, secrets, docs drift) — so a clone that never enabled `core.hooksPath .githooks` still gets the gate on the PR. |
+| **Build&Test** | every PR + merge to `master` (via CI) + weekly cron | Compiles the module against **nginx mainline** (resolved at run time — see [Compatibility](#compatibility)) with strict `-Werror` flags, then runs the full test suite: 79 `Test::Nginx::Socket` filter tests, 28 static-module tests, 4 config-warning tests, and end-to-end Python smoke tests (truncation, `Vary`, boundary sizes, repeated/concurrent requests, terminal-frame, the proxy-unbuffered and compression-matrix regressions, slow-drain backpressure with data-less flushes, per-request CCtx isolation, reload-under-load, `zstd_long`/LDM, `$zstd_ratio`). A separate matrix entry rebuilds against **libzstd 1.4.x** (from source) to exercise the `< 1.5.6` and `≥ 1.4.0` fallback paths, and a parallel job rebuilds with **ASAN+UBSAN** and re-runs the smoke tests plus a `zstd_dict_file` config-reload leak check. **Angie is not built here** — see CI Deep below, the only workflow that exercises it. |
+| **Security Scanners** | every PR + merge to `master` (via CI) | flawfinder, clang-tidy (`cert-*`, `clang-analyzer-security.*`), and semgrep, with the reports uploaded as build artifacts. |
+| **Fuzzing** | every PR + merge to `master` (via CI) | A 120-second libFuzzer regression run for the `ngx_http_zstd_accept_encoding()` / `ngx_http_zstd_eval_qvalue()` RFC 9110 `Accept-Encoding`/q-value parser. The fuzz target is sliced from the shipped header at build time, so there is no copy drift. See [`ci/fuzz/README.md`](ci/fuzz/README.md). |
+| **Valgrind** | every PR + merge to `master` (via CI) | A 60-second Memcheck-lite soak against a debug nginx build, catching uninitialised-value reads and leaks that ASAN cannot. |
+| **CodeQL** | every PR + merge to `master` (via CI) + monthly | GitHub's semantic C/C++ analysis (`security-extended` query pack) over the module sources in `src/`. |
+| **A/UBSan** ([`asan.yml`](.github/workflows/asan.yml)) | every PR + merge to `master` (via CI) | A 60-second ASan+UBSan soak against a static `--add-module` build, driving the same mixed-load traffic as the Valgrind soak. Catches heap overflow/UAF outside nginx's pool blocks that Valgrind's slower pass would also catch, but ~20× faster — complementary to Valgrind, not redundant. |
+| **CI Deep** | monthly + manual dispatch | The exhaustive run: a `build-flavors` matrix that compiles and runs the full `Test::Nginx::Socket` suite against **nginx mainline, nginx stable, and Angie** (the only workflow that builds Angie at all), hours-long fuzzing on the same target, full Memcheck and Helgrind soaks (a valgrind soak is ~20–50× slower than native), a **harness-memcheck** job that runs the TEST_HARNESS scenarios ([`fault-arms`](ci/t/harness-scenarios/fault-arms) and [`alloc-neutral`](ci/t/harness-scenarios/alloc-neutral)) with libzstd faults **armed** under Memcheck — the only oracle in the suite that can see a leak on a libzstd *error* path, since the ASAN legs run with `detect_leaks=0` (nginx never frees its configuration pool) and the PR-lane Memcheck soak drives happy-path traffic only — and the same security scanners. |
+| **Windows build** ([`windows-build.yml`](.github/workflows/windows-build.yml)) | every PR + merge to `master` (via CI) | Builds the module on Windows two ways: MSVC x64 static and MinGW-w64 x64 dynamic, each against a pinned nginx with PCRE2 and zlib, then runs `nginx -t` on the result. Guards the `NGX_WIN32` paths, which no Linux job compiles. No reference-skeleton equivalent — kept because it gates a platform nothing else here covers (see [`ci/skeleton-findings.md`](ci/skeleton-findings.md)). |
+| **Harness Fault Arms** ([`harness-fault-arms.yml`](.github/workflows/harness-fault-arms.yml)) | every PR + merge to `master` (via CI), **not required** | Builds a separate nginx tree with the [`nginx-module-testkit`](https://github.com/myguard-labs/nginx-module-testkit) fault-injection harness compiled in (`TEST_HARNESS=1` + `-DNGX_TEST_HARNESS`, never the packaged build), then runs two scenarios against that one build. [`ci/t/harness-scenarios/fault-arms`](ci/t/harness-scenarios/fault-arms) injects a `ZSTD_compressStream2()` failure at both the mid-stream and end-of-frame call sites, asserting the request fails closed rather than serving corrupt output, and a success-with-zero-output at the end-of-frame site, asserting the empty-output suppression path still returns a complete zstd frame that decodes back to the origin bytes. Zero-output is injectable at the mid-stream site too (`fault_codec=1000+n`); no oracle arms it yet. [`ci/t/harness-scenarios/alloc-neutral`](ci/t/harness-scenarios/alloc-neutral) then proves the per-request path is **allocation-neutral**: cycle-pool counters (`cycle_used`, `cycle_blocks`, `cycle_large`), worker fd count and master fd count are all flat across two post-drain quiescent probe snapshots taken around one extra fully-served compressed request, with an anti-vacuity oracle asserting the filter demonstrably ran (`Content-Encoding: zstd`). That oracle catches a leak into a pool nginx never frees — a class LSan-at-exit is structurally blind to, because it only reports at process teardown. Deliberately not a required check — see the workflow's own header. |
 | **Bump** ([`bump.yml`](.github/workflows/bump.yml)) | weekly + manual dispatch | Checks nginx.org/angie.software for newer nginx-stable/Angie releases than what's pinned in CI Deep's `build-flavors` matrix, and opens a PR (never pushes directly to protected `master`) with the updated pin + a freshly-verified sha256 digest. Does not gate merges itself — normal required checks review the PR. |
 
 The test suite includes a dedicated regression test for every known
@@ -1131,9 +1386,12 @@ purely "load the previous `.so` / previous nginx binary and reload":
 1. Keep the previously-known-good module `.so` (or full nginx binary).
 2. To disable instantly without a binary change: set `zstd off;` (and
    `zstd_static off;`) and `nginx -s reload` — responses immediately
-   serve identity; no client/cache corruption (compressed and
-   identity variants differ only by `Content-Encoding`, and
-   `gzip_vary on` keeps caches correct).
+   serve identity; no client/cache corruption. The compressed and
+   identity responses are different representations — the body bytes
+   differ, not just the `Content-Encoding` field — and the automatic
+   `Vary: Accept-Encoding` is what keeps each in its own cache
+   variant, so a cache filled before the reload never hands a
+   compressed body to a client that did not ask for one.
 3. To revert the binary: restore the prior `.so`/binary, `nginx -t`,
    then `nginx -s reload`.
 

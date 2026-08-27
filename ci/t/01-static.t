@@ -462,6 +462,7 @@ Accept-Encoding: zstd
 --- error_code: 404
 --- response_headers
 !Content-Encoding
+!Vary
 --- error_log
 is not a zstd frame
 
@@ -518,6 +519,7 @@ Accept-Encoding: zstd
 --- error_code: 404
 --- response_headers
 !Content-Encoding
+!Vary
 
 
 
@@ -569,6 +571,53 @@ GET /test
 Accept-Encoding: gzip
 --- response_headers
 !Content-Encoding
+Vary: Accept-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 25a: zstd_static on sets Vary with gzip_vary OFF (non-accepting client)
+# G5: the gzip_vary-off cell of TEST 25, and the one that was broken.
+# With no "gzip_vary on", the handler used to return early WITHOUT even
+# probing for the .zst, so this identity response carried no Vary at
+# all — a shared cache then pinned every later client, including
+# zstd-capable ones, to the identity variant. The handler now emits the
+# field itself before declining.
+--- config
+    location /test {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: gzip
+--- response_headers
+!Content-Encoding
+Vary: Accept-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 25b: zstd_static on sets Vary with gzip_vary OFF (accepting client)
+# The served-.zst arm of the same cell: the compressed representation
+# must announce that it was negotiated on Accept-Encoding, or a cache
+# hands it to a client that cannot decode it. Together with TEST 15,
+# TEST 16 and TEST 25a this completes the static handler's
+# gzip_vary x Accept-Encoding matrix.
+--- config
+    location /test {
+        zstd_static on;
+        root ../suite;
+    }
+--- request
+GET /test
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
 Vary: Accept-Encoding
 --- no_error_log
 [error]
@@ -725,6 +774,7 @@ GET /isdir/dir.txt
 Accept-Encoding: zstd
 --- response_headers
 ! Content-Encoding
+! Vary
 --- response_body
 plain origin body served because the .zst sibling is a directory
 --- error_code: 200
@@ -951,5 +1001,277 @@ Content-Encoding: zstd
 Content-Range: bytes 0-3/12
 --- response_body eval
 pack("C*", 0x28, 0xB5, 0x2F, 0xFD)
+--- no_error_log
+[error]
+
+
+
+=== TEST 38: a 4-byte skippable-magic-only file is declined (truncated skip header)
+# sec/g5-static-skippable-frame: ngx_http_zstd_static_probe_frame() must
+# see the 4-byte Frame_Size field before it can trust a skippable frame
+# at all. A file that is only the magic cannot supply it, so this must
+# fail closed exactly like any other truncated header — decline, fall
+# back to serving the uncompressed original.
+--- config
+    location /skip/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> skip/magiconly.js\nmagic only origin\n>>> skip/magiconly.js.zst\n"
+. pack("C*", 0x50, 0x2A, 0x4D, 0x18)
+--- request
+GET /skip/magiconly.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+magic only origin
+--- error_code: 200
+--- error_log
+frame header truncated
+
+
+
+=== TEST 39: a 7-byte skippable header (Frame_Size one byte short) is declined
+--- config
+    location /skip/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> skip/seven.js\nseven byte origin\n>>> skip/seven.js.zst\n"
+. pack("C*", 0x50, 0x2A, 0x4D, 0x18, 0x00, 0x00, 0x00)
+--- request
+GET /skip/seven.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+seven byte origin
+--- error_code: 200
+--- error_log
+frame header truncated
+
+
+
+=== TEST 40: an exact 8-byte skippable header with nothing after it is declined
+# A zero-length-payload skippable header parses fine (Frame_Size = 0)
+# and passes the bounds check (8 header bytes exactly fill of.size), so
+# the walk advances to offset 8 and probes again — there is nothing
+# left to read there, so the follow-up pread(2) returns 0 and the
+# handler declines exactly as it does for any other pread short-read,
+# rather than reading past EOF looking for a frame that isn't there.
+--- config
+    location /skip/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> skip/eightonly.js\neight byte origin\n>>> skip/eightonly.js.zst\n"
+. pack("C*", 0x50, 0x2A, 0x4D, 0x18, 0x00, 0x00, 0x00, 0x00)
+--- request
+GET /skip/eightonly.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+eight byte origin
+--- error_code: 200
+--- error_log
+pread
+
+
+
+=== TEST 41: a skippable Frame_Size that overflows 32-bit arithmetic is declined
+# Frame_Size 0xFFFFFFFF (4294967295) must not be added to the 8-byte
+# header offset with plain 32-bit/size_t arithmetic on a narrow
+# platform — the handler does the bounds check in 64-bit so this fails
+# closed instead of wrapping into a small, in-bounds offset.
+--- config
+    location /skip/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> skip/overflow.js\noverflow origin\n>>> skip/overflow.js.zst\n"
+. pack("C*", 0x50, 0x2A, 0x4D, 0x18, 0xFF, 0xFF, 0xFF, 0xFF)
+--- request
+GET /skip/overflow.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+overflow origin
+--- error_code: 200
+--- error_log
+skippable frame declares a 4294967295-byte skip past end of file
+
+
+
+=== TEST 42: a skippable Frame_Size declaring a skip past EOF is declined
+# Frame_Size 1000 in an 8-byte file: 8 + 1000 is nowhere near
+# overflowing, but it is far past of.size. This is the "declared skip
+# length past EOF" case, distinct from TEST 41's overflow case.
+--- config
+    location /skip/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> skip/pasteof.js\npast eof origin\n>>> skip/pasteof.js.zst\n"
+. pack("C*", 0x50, 0x2A, 0x4D, 0x18, 0xE8, 0x03, 0x00, 0x00)
+--- request
+GET /skip/pasteof.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+past eof origin
+--- error_code: 200
+--- error_log
+skippable frame declares a 1000-byte skip past end of file
+
+
+
+=== TEST 43: a valid dcz-style skippable prefix followed by a good regular frame IS served
+# The bypass fix must not break the legitimate shape it exists
+# alongside: RFC 9842 dcz frames are exactly a skippable frame ahead of
+# the real payload frame (see README "Standards-based dictionary
+# compression"). One skippable frame (Frame_Size 4, four bytes of
+# opaque payload) followed by a small-window regular frame must still
+# be served normally.
+--- config
+    location /skip/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> skip/prefix.js\nprefix origin body\n>>> skip/prefix.js.zst\n"
+. pack("C*", 0x50, 0x2A, 0x4D, 0x18, 0x04, 0x00, 0x00, 0x00,
+             0x00, 0x00, 0x00, 0x00,
+             0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x19, 0x00, 0x00)
+. "hi\n"
+--- request
+GET /skip/prefix.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- error_code: 200
+--- no_error_log
+[error]
+
+
+
+=== TEST 44: a chain of skippable frames longer than the bound is declined
+# NGX_HTTP_ZSTD_STATIC_MAX_SKIP_FRAMES caps the walk at 4 leading
+# skippable frames. Five zero-length skippable frames ahead of an
+# otherwise-good regular frame must be declined — the handler gives up
+# rather than searching indefinitely.
+--- config
+    location /skip/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> skip/toolong.js\ntoo long origin\n>>> skip/toolong.js.zst\n"
+. (pack("C*", 0x50, 0x2A, 0x4D, 0x18, 0x00, 0x00, 0x00, 0x00) x 5)
+. pack("C*", 0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x19, 0x00, 0x00)
+. "hi\n"
+--- request
+GET /skip/toolong.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+too long origin
+--- error_code: 200
+--- error_log
+leading skippable frames
+
+
+
+=== TEST 45: a skippable prefix hiding an oversized-window regular frame is REJECTED
+# THE BYPASS THIS ITEM FIXES: before this change, ANY skippable magic
+# made the probe return OK immediately, so prepending a trivial
+# skippable frame to an oversized-window regular frame skipped the 8 MB
+# window guard entirely — the whole point of the probe. The handler
+# must now resolve the skip and check the frame that actually follows.
+--- config
+    location /skip/ {
+        zstd_static on;
+        root html;
+    }
+--- user_files eval
+">>> skip/bypass.js\nbypass origin body\n>>> skip/bypass.js.zst\n"
+. pack("C*", 0x50, 0x2A, 0x4D, 0x18, 0x04, 0x00, 0x00, 0x00,
+             0x00, 0x00, 0x00, 0x00,
+             0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x88, 0x00, 0x00, 0x00)
+. "payloadbytes"
+--- request
+GET /skip/bypass.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+! Content-Encoding
+--- response_body
+bypass origin body
+--- error_code: 200
+--- error_log
+declares a 134217728-byte decompression window
+above the 8 MB limit browsers enforce for Content-Encoding: zstd
+
+
+
+=== TEST 46: a dcz-style skippable prefix on a directio file IS served
+# M1 regression. Under directio the probe buffer is aligned and the
+# first read at offset 0 succeeds, but the skippable walk then moves
+# `pos` to 40 (the canonical dcz SHA-256 prefix: 8-byte skippable
+# header + 32-byte payload) and the NEXT read used that offset raw. An
+# O_DIRECT descriptor rejects an unaligned file offset with EINVAL, so
+# the read returned -1, the probe took the "aligned probe ... returned
+# -1" branch and DECLINED — every request for a dcz-shaped .zst on a
+# directio location silently lost its precompressed variant (a 404 with
+# "zstd_static always" and no identity file). The fix rounds the read
+# offset down to the alignment and parses the frame at its offset
+# inside the block.
+#
+# Fail-first control (observed): reverting the alignment (reading at
+# `pos` instead of `base`) turns this into "! Content-Encoding" plus
+# the "returned -1" error line, so both the 200-with-zstd assertion and
+# the --- no_error_log [error] assertion go red.
+#
+# The .zst is padded past the "directio 512" threshold so the open
+# really is O_DIRECT; "aligned probe on directio file" is the positive
+# witness that is_directio was set for this request, so the block
+# cannot pass vacuously through the stack-read path on a filesystem
+# where O_DIRECT does not take.
+--- config
+    location /skip/ {
+        zstd_static on;
+        directio 512;
+        root html;
+    }
+--- user_files eval
+">>> skip/dioprefix.js\ndirectio prefix origin\n>>> skip/dioprefix.js.zst\n"
+. pack("C*", 0x50, 0x2A, 0x4D, 0x18, 0x20, 0x00, 0x00, 0x00)
+. ("\0" x 32)
+. pack("C*", 0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x19, 0x00, 0x00)
+. "hi\n"
+. ("\0" x 1024)
+--- request
+GET /skip/dioprefix.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- error_code: 200
 --- no_error_log
 [error]

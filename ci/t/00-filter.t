@@ -1277,6 +1277,59 @@ Vary: Accept-Encoding
 
 
 
+=== TEST 48a: Vary: Accept-Encoding is emitted with gzip_vary OFF (accepting client)
+# G5, the cell that used to be broken. No "gzip_vary" anywhere — its
+# compiled-in default is off, which is what most deployments actually
+# run. Before G5 this response was zstd-encoded with NO Vary header at
+# all: a shared cache stored it and served that zstd body to clients
+# that cannot decode zstd. The module now emits the field itself, so
+# correctness no longer depends on an operator directive it does not
+# own. Paired with TEST 47 (gzip_vary on) this is the dynamic half of
+# the gzip_vary x Accept-Encoding matrix.
+--- config
+    location /filter {
+        zstd on;
+        zstd_min_length 1;
+        zstd_types text/plain;
+        return 200 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    }
+--- request
+GET /filter
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+Vary: Accept-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 48b: Vary: Accept-Encoding is emitted with gzip_vary OFF (non-accepting client)
+# The identity arm of TEST 48a, and the more dangerous fill order: a
+# cache that stores THIS response without Vary pins every later client
+# to identity, silently losing compression for everyone. Emitting the
+# field before negotiating the encoding is what keeps the two variants
+# apart, with gzip_vary off.
+--- config
+    location /filter {
+        zstd on;
+        zstd_min_length 1;
+        zstd_types text/plain;
+        return 200 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    }
+--- request
+GET /filter
+--- more_headers
+Accept-Encoding: gzip
+--- response_headers
+!Content-Encoding
+Vary: Accept-Encoding
+--- no_error_log
+[error]
+
+
+
 === TEST 49: zstd_buffers with a small custom value still produces a valid stream
 # The zstd_buffers directive was previously not exercised by any test.
 # A very small buffer count forces the body filter through the
@@ -1716,6 +1769,11 @@ Content-Range: bytes 0-9/100
 
 === TEST 66: zstd_bypass_vary appends the named field to Vary
 # S1: header-driven bypass must be advertised to shared caches via Vary.
+# G5: this location has no "gzip_vary on", and the module now emits
+# "Vary: Accept-Encoding" itself rather than depending on that directive,
+# so the compressed response carries both fields. Before G5 it carried
+# only X-No-Compression — a zstd body that never told a shared cache it
+# was negotiated on Accept-Encoding.
 --- config
     location /filter {
         zstd on;
@@ -1733,7 +1791,7 @@ GET /filter
 Accept-Encoding: zstd
 --- response_headers
 Content-Encoding: zstd
-Vary: X-No-Compression
+Vary: X-No-Compression, Accept-Encoding
 --- no_error_log
 [error]
 
@@ -1768,6 +1826,12 @@ Content-Encoding: zstd
 # must be served identity (no Content-Encoding: zstd) yet STILL carry
 # Vary: X-No-Compression so a shared cache keys the bypassed variant separately
 # from the compressed one. This is the cache-poisoning arm TEST 66 omitted.
+# G5: the bypassed identity response must ALSO carry Accept-Encoding. The
+# same URI serves zstd to a request that does not trip the predicate, so
+# an identity body cached without Accept-Encoding in the key is served to
+# clients that should have been compressed (and vice versa on the reverse
+# fill order). This location has no "gzip_vary on"; the module emits the
+# field itself.
 --- config
     location /filter {
         zstd on;
@@ -1786,7 +1850,7 @@ Accept-Encoding: zstd
 X-No-Compression: 1
 --- response_headers
 Content-Encoding:
-Vary: X-No-Compression
+Vary: X-No-Compression, Accept-Encoding
 --- no_error_log
 [error]
 
@@ -2316,15 +2380,50 @@ Content-Encoding: zstd
 
 
 
+=== TEST 90b: a HEAD advertises the same zstd_bypass_vary Vary field as GET
+# This PR moved the r->header_only short-circuit ABOVE the
+# zstd_bypass_vary Vary-append block in ngx_http_zstd_header_filter()
+# (it used to run after the content-type check, now runs right after the
+# encoding/status/length gates and before it). TEST 90 already proves
+# header_only is not what handles a real HEAD here (see its comment); this
+# arm proves the reorder did not change what a real HEAD emits for the
+# OTHER header the filter appends unconditionally on this code path --
+# zstd_bypass_vary's Vary field -- by checking it is present and identical
+# on both HEAD and the equivalent GET.
+--- config
+    location /filter {
+        zstd on;
+        zstd_min_length 1;
+        zstd_types text/plain;
+        zstd_bypass $http_x_no_compression;
+        zstd_bypass_vary X-No-Compression;
+        proxy_pass http://127.0.0.1:$TEST_NGINX_SERVER_PORT/test;
+    }
+    location /test {
+        root $TEST_NGINX_PERL_PATH/suite/;
+    }
+--- request
+HEAD /filter
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 200
+--- response_headers
+Content-Encoding: zstd
+Vary: X-No-Compression, Accept-Encoding
+--- response_body
+--- no_error_log
+[error]
+
+
+
 === TEST 91: an SSI subrequest is not separately zstd-compressed
-# ngx_http_zstd_accepts() declines when r != r->main, so only the main request
-# negotiates a content coding. A subrequest inherits the parent's
-# headers_in (including "Accept-Encoding: zstd"), so without that guard the
-# include is compressed on its own and its zstd frame is spliced into the
-# parent's body as opaque bytes.
+# The header filter checks r != r->main early and declines for subrequests,
+# so only the main request negotiates a content coding. Without that guard
+# the subrequest would be compressed on its own and its zstd frame would be
+# spliced into the parent's body as opaque bytes.
 #
-# The assertion is the error-log line the filter emits when it commits to
-# compressing, counted over the whole request: the parent here is text/html
+# The assertion is the error-log line the filter emits when declining the
+# subrequest, counted over the whole request: the parent here is text/html
 # with zstd off, so a correctly guarded run reaches "zstd: compressing
 # response" zero times. Asserting only on the assembled body would not work —
 # with the guard removed the page still reads correctly, because the parent's
@@ -2354,7 +2453,7 @@ Accept-Encoding: zstd
 --- response_body
 BEGININCLUDED-PAYLOAD-INCLUDED-PAYLOAD-INCLUDED-PAYLOADEND
 --- error_log
-zstd: skip, client did not accept zstd encoding
+zstd: skip, subrequest
 --- no_error_log
 zstd: compressing response
 [error]
@@ -2629,5 +2728,71 @@ GET /filter
 Accept-Encoding: gzip , zstd ;q=1
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 100: multi-chunk streamed body across several body-filter callbacks
+# Regression for the O(1)-tail append bug: ctx->last_in is retracked to
+# &ctx->in whenever add_data drains the last retained link (ctx->in becomes
+# NULL), because ngx_free_chain() overwrites that consumed link's ->next
+# with the pool's free-chain head immediately afterward. Without the
+# retrack, the NEXT body-filter callback's append splices its copied chain
+# into ngx_pool_t.chain instead of onto ctx->in -- every callback after the
+# first is silently dropped, the compressor never receives the rest of the
+# body, and the response hangs waiting for a last_buf that never arrives.
+# Multiple real (non-special, proxy_buffering off) chunks with pauses in
+# between exercise several separate ngx_http_zstd_body_filter() callbacks
+# against the same request, each one draining ctx->in completely before the
+# next chunk arrives -- the exact interleaving the bug needs.
+--- config
+    location /filter {
+        zstd on;
+        zstd_min_length 1;
+        zstd_types text/plain;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_pass http://127.0.0.1:$TEST_NGINX_SERVER_PORT/up;
+    }
+    location /up {
+        proxy_http_version 1.1;
+        proxy_pass http://127.0.0.1:$TEST_NGINX_RAND_PORT_1/;
+    }
+--- tcp_listen: $TEST_NGINX_RAND_PORT_1
+--- tcp_no_close
+--- tcp_reply_delay: 100ms
+--- tcp_reply eval
+my $hdr  = "HTTP/1.1 200 OK\r\n"
+         . "Content-Type: text/plain\r\n"
+         . "Transfer-Encoding: chunked\r\n"
+         . "Connection: close\r\n\r\n";
+my $chunk = sub { sprintf("%x\r\n%s\r\n", length($_[0]), $_[0]) };
+[
+    $hdr . $chunk->("first-chunk-"),
+    $chunk->("second-chunk-"),
+    $chunk->("third-chunk-"),
+    $chunk->("fourth-chunk-tail\n") . "0\r\n\r\n",
+]
+--- request
+GET /filter
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- response_body_filters eval
+sub {
+    my $zstd = $_[0];
+    require File::Temp;
+    my ($tfh, $tmp) = File::Temp::tempfile("zstd_t100_XXXXXX",
+                                           TMPDIR => 1, UNLINK => 1);
+    binmode($tfh); print $tfh $zstd; close($tfh);
+    open(my $r, "-|", "zstd", "-dqc", $tmp) or do { unlink $tmp; return "ERR" };
+    local $/; my $d = <$r>; close($r); my $rc = $?; unlink $tmp;
+    return "ERR-DECODE rc=$rc" if $rc != 0;
+    return $d;
+}
+--- response_body
+first-chunk-second-chunk-third-chunk-fourth-chunk-tail
 --- no_error_log
 [error]

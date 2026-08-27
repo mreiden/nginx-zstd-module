@@ -1,5 +1,6 @@
 /*
  * Copyright (C) Alex Zhang
+ * Copyright (C) 2026 Thijs Eilander
  *
  * Shared helpers used by both the filter module and the static module.
  * Included as a static inline header to avoid a separate compilation unit
@@ -478,50 +479,214 @@ ngx_http_zstd_ok(ngx_http_request_t *r)
 
 
 /*
- * ngx_http_zstd_vary_handled_externally()
+ * Push a response header with the given key and value. Handles the
+ * nginx_version >= 1023000 guard that sets next=NULL to prevent linked-list
+ * corruption on HTTP/1.1 responses. Both key and value are NUL-terminated
+ * C string literals supplied by the caller.
  *
- * True when a module named "ngx_http_compression_vary_filter_module"
- * (HanadaLee's Vary-flattening filter) is loaded, statically or via
- * load_module. When its "compression_vary" directive is on, that
- * module emits Vary: Accept-Encoding keyed on r->gzip_vary alone,
- * regardless of clcf->gzip_vary — replacing the "gzip_vary" directive
- * (verified empirically against all four gzip_vary x compression_vary
- * quadrants; its author explicitly recommends "gzip_vary off" when
- * "compression_vary on" is used). With it loaded, "gzip_vary off" is
- * plausibly deliberate rather than a caching hazard.
+ * key/value are `const char *` PARAMETERS, not literals in this scope, so
+ * ngx_str_set() must not be used here: that macro computes its length via
+ * `sizeof(text) - 1`, which is only the string length when `text` is a
+ * literal token at the macro's own call site. Applied to a `const char *`
+ * parameter it instead yields sizeof(pointer) - 1 (7 on a 64-bit build) --
+ * every pushed header key/value here was truncated/overrun to 7 bytes
+ * regardless of the real string length, which silently broke every caller
+ * of this helper. Use ngx_strlen() on the parameter instead.
  *
- * PRESENCE IS NOT PROOF, though: "compression_vary" itself defaults
- * to off, and this module cannot verify the effective value — the
- * conf struct is private to that module, and merge order between
- * unrelated modules follows their position in cycle->modules, so its
- * merged values may not even exist yet when ours merge. Callers
- * therefore must not silence the gzip_vary-off warning outright on
- * this check; they withhold the per-location lines and emit one
- * summary warning from postconfiguration that tells the operator
- * exactly what to verify.
- *
- * Called at merge_loc_conf time: every load_module directive has been
- * processed by then (core conf parses before the http block), so
- * cf->cycle->modules is complete for both linkage styles.
- *
- * ngx_inline for the same reason as ngx_http_zstd_ok() above: this
- * header is included by TUs that never call it (the fuzz harness),
- * and a plain `static` definition trips -Werror=unused-function there.
+ * Returns NGX_OK on success, NGX_ERROR on allocation failure.
  */
-static ngx_inline ngx_uint_t
-ngx_http_zstd_vary_handled_externally(ngx_conf_t *cf)
+static ngx_inline ngx_int_t
+ngx_http_zstd_push_header(ngx_http_request_t *r, const char *key,
+    const char *value)
 {
-    ngx_uint_t  i;
+    ngx_table_elt_t  *h;
 
-    for (i = 0; cf->cycle->modules[i]; i++) {
-        if (ngx_strcmp(cf->cycle->modules[i]->name,
-                       "ngx_http_compression_vary_filter_module") == 0)
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    h->hash = 1;
+#if (nginx_version >= 1023000)
+    h->next = NULL;
+#endif
+    h->key.len = ngx_strlen(key);
+    h->key.data = (u_char *) key;
+    h->value.len = ngx_strlen(value);
+    h->value.data = (u_char *) value;
+
+    return NGX_OK;
+}
+
+
+/*
+ * ngx_http_zstd_vary_accept_encoding()
+ *
+ * Make "Vary: Accept-Encoding" safe BY CONSTRUCTION on any response
+ * whose representation depends on Accept-Encoding, instead of leaving
+ * it to the operator's "gzip_vary" directive.
+ *
+ * The hazard this closes: r->gzip_vary alone is only a REQUEST for the
+ * header. ngx_http_header_filter_module honours it solely when
+ * clcf->gzip_vary is on, and otherwise clears the flag outright
+ * (ngx_http_header_filter_module.c: "if (r->gzip_vary) { if
+ * (clcf->gzip_vary) ... else r->gzip_vary = 0; }"). So under the
+ * default "gzip_vary off" the module negotiated on Accept-Encoding and
+ * then shipped a response that did not say so — and a shared cache
+ * stored the zstd representation under a key a client sending no
+ * "Accept-Encoding: zstd" would hit, handing it a body it cannot
+ * decode. That correctness property used to belong to a directive this
+ * module does not own; now it does not.
+ *
+ * DUPLICATE-SAFE, which is the whole subtlety. We must not simply push
+ * a header line unconditionally: when clcf->gzip_vary IS on, nginx
+ * emits its own "Vary: Accept-Encoding" from r->gzip_vary and we would
+ * produce two identical field lines. Caches union all Vary fields so
+ * the result would still be semantically correct, but a doubled field
+ * is sloppy and strict intermediaries have been known to object. The
+ * two emitters are mutually exclusive by construction:
+ *
+ *   clcf->gzip_vary on  -> set r->gzip_vary, push nothing (nginx emits)
+ *   clcf->gzip_vary off -> push our own line (nginx emits nothing,
+ *                          having cleared r->gzip_vary)
+ *
+ * Exactly one "Vary: Accept-Encoding" line in both states, verified as
+ * a proxy-cache matrix in CI. r->gzip_vary is set in BOTH branches,
+ * because other modules read the flag — notably
+ * ngx_http_compression_vary_filter_module, which keys on it alone and
+ * flattens the Vary fields it finds, so our own line is folded rather
+ * than doubled. That is precisely why emitting a real header is
+ * compatible with that module where relying on its default-off
+ * directive was not.
+ *
+ * Callers must invoke this at most once per response, and only on a
+ * path that is genuinely Accept-Encoding-dependent. "zstd_static
+ * always" deliberately does NOT call it: it ignores Accept-Encoding,
+ * so its response is not a negotiated variant and must not claim to
+ * vary on one.
+ *
+ * Returns NGX_OK, or NGX_ERROR when the header-list allocation fails.
+ *
+ * ngx_inline for the same reason as the helpers above: this header is
+ * included by TUs that never call it (the fuzz harness), and a plain
+ * `static` definition trips -Werror=unused-function there.
+ */
+static ngx_inline ngx_int_t
+ngx_http_zstd_vary_accept_encoding(ngx_http_request_t *r)
+{
+    ngx_uint_t                 i;
+    ngx_table_elt_t           *h;
+    ngx_list_part_t           *part;
+    ngx_http_core_loc_conf_t  *clcf;
+
+    r->gzip_vary = 1;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+    if (clcf != NULL && clcf->gzip_vary) {
+        /* nginx's header filter emits the line from r->gzip_vary */
+        return NGX_OK;
+    }
+
+    /*
+     * Idempotence, and it is NOT theoretical: the filter and the static
+     * handler are separate modules that both reach this helper on one
+     * request. With "zstd_static on" + "zstd on" + "gzip_vary off", a
+     * non-accepting client makes the static handler emit the field and
+     * DECLINE, after which the filter emits it again on the identity
+     * response it then also declines to encode -- two identical Vary
+     * lines, breaking the exactly-one contract this function exists to
+     * keep. (Observed on PR #163 before this guard: `curl -H
+     * "Accept-Encoding: gzip"` returned two "Vary: Accept-Encoding"
+     * fields.)
+     *
+     * A request-local flag would need a ctx that the static handler
+     * does not own, so scan the response header list instead. It is
+     * short at this point (the modules run before most header-emitting
+     * filters) and this runs at most twice per response. Scanning also
+     * makes the helper safe against a Vary: Accept-Encoding pushed by
+     * any OTHER module, not just our own second call.
+     *
+     * The token compare is case-insensitive on both field name and
+     * value, per RFC 9110: field names are case-insensitive, and the
+     * field values here are header NAMES, which are too.
+     */
+    for (part = &r->headers_out.headers.part, h = part->elts, i = 0;
+         /* void */;
+         i++)
+    {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0) {
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("Vary") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Vary",
+                               sizeof("Vary") - 1) == 0)
         {
-            return 1;
+            /*
+             * Check if "Accept-Encoding" is among the comma-separated tokens
+             * in the Vary value. Parse as comma-separated tokens, trim
+             * whitespace, and compare case-insensitively.
+             */
+            u_char  *p = h[i].value.data;
+            u_char  *end = h[i].value.data + h[i].value.len;
+
+            while (p < end) {
+                u_char  *token_start, *token_end;
+
+                /* Skip leading whitespace */
+                while (p < end && (*p == ' ' || *p == '\t')) {
+                    p++;
+                }
+
+                if (p >= end) {
+                    break;
+                }
+
+                token_start = p;
+
+                /* Find end of token (comma or end of string) */
+                while (p < end && *p != ',') {
+                    p++;
+                }
+
+                token_end = p;
+
+                /* Trim trailing whitespace from token */
+                while (token_end > token_start
+                       && (*(token_end - 1) == ' '
+                           || *(token_end - 1) == '\t'))
+                {
+                    token_end--;
+                }
+
+                /* Check if this token is "Accept-Encoding" */
+                if (token_end - token_start == sizeof("Accept-Encoding") - 1
+                    && ngx_strncasecmp(token_start,
+                                       (u_char *) "Accept-Encoding",
+                                       sizeof("Accept-Encoding") - 1) == 0)
+                {
+                    return NGX_OK;
+                }
+
+                /* Skip past the comma */
+                if (p < end && *p == ',') {
+                    p++;
+                }
+            }
         }
     }
 
-    return 0;
+    return ngx_http_zstd_push_header(r, "Vary", "Accept-Encoding");
 }
 
 

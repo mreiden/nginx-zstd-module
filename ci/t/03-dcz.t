@@ -21,10 +21,25 @@ if (defined $ENV{'TEST_NGINX_BINARY'}) {
 
 add_block_preprocessor(sub {
     my $block = shift;
-    return if !@dynamic_modules;
 
-    my $main_config = join "\n", map { "load_module $_;" } @dynamic_modules;
-    $block->set_value("main_config", $main_config);
+    if (@dynamic_modules) {
+        my $main_config = join "\n", map { "load_module $_;" } @dynamic_modules;
+        $block->set_value("main_config", $main_config);
+    }
+
+    # RFC 9842 section 8 restricts dcz to secure contexts, and this
+    # harness speaks plain HTTP -- Test::Nginx::Socket has no TLS
+    # listener. Every block below therefore runs behind the explicit
+    # "TLS is terminated upstream" acknowledgement, which is exactly the
+    # deployment those tests model. Blocks named "secure-context:" are
+    # the tests OF that gate and are left alone so they see the
+    # compiled-in default (off) or set the flag themselves.
+    return if $block->name =~ /secure-context:/;
+
+    my $http_config = $block->http_config;
+    $http_config = '' if !defined $http_config;
+    $block->set_value("http_config",
+                      "$http_config\nzstd_dcz_assume_secure_transport on;\n");
 });
 
 # The negotiation key is the SHA-256 of the committed dictionary fixture,
@@ -42,12 +57,11 @@ our $dict_b64 = encode_base64(sha256($dict_raw), "");
 our $bad_b64  = encode_base64("\x01" x 32, "");
 
 # For the optional supplied-hash directive argument: the fixture's true
-# hash as hex, and a deliberately different well-formed hash. Supplying
-# the wrong one and negotiating against IT pins that the declared value
-# is the negotiation key. (It does NOT prove the hashing pass was
-# skipped — the branch overwrites dict->hash either way; the skip is
-# pinned by the $zstd_dcz_dicts_hashed asserts in TESTs 21-23, closing
-# issue #100's first item.)
+# hash as hex, and a deliberately different well-formed hash. The
+# supplied literal is VERIFIED against the loaded bytes, so the wrong
+# one must abort config load (TESTs 17-18) rather than become the
+# negotiation key. $zstd_dcz_dicts_hashed now counts every loaded
+# dictionary, literal or not (TESTs 21-23).
 our $dict_hex = unpack("H*", sha256($dict_raw));
 our $odd_hex  = "01" x 32;
 our $odd_b64  = encode_base64("\x01" x 32, "");
@@ -95,7 +109,7 @@ GET /t
 "Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:"
 --- response_headers
 Content-Encoding: dcz
-Vary: Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
 
@@ -120,7 +134,7 @@ GET /t
 Accept-Encoding: zstd, dcz
 --- response_headers
 Content-Encoding: zstd
-Vary: Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
 
@@ -213,9 +227,15 @@ Content-Encoding: zstd
 
 
 
-=== TEST 7: Sec-Fetch-Site cross-site is refused
+=== TEST 7: Sec-Fetch-Site cross-site is refused, and still varies on it
 # RFC 9842 §8: dictionaries are same-origin-partitioned; compressing a
 # cross-site response against one leaks it. Falls back to plain zstd.
+# The REFUSAL path must carry "Vary: ... Sec-Fetch-Site" too: it is the
+# variant a shared cache would otherwise hand to a same-origin client
+# (dcz silently suppressed), and its counterpart is the dcz body handed
+# to a cross-site client, bypassing this gate entirely. Proven end to
+# end against a real proxy_cache in
+# ci/tools/test_dcz_cache_partition.py.
 --- config
     location /t {
         zstd on;
@@ -230,6 +250,7 @@ GET /t
 "Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:\nSec-Fetch-Site: cross-site"
 --- response_headers
 Content-Encoding: zstd
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
 
@@ -358,7 +379,7 @@ GET /t
 "Accept-Encoding: dcz\nAvailable-Dictionary: :$::bad_b64:"
 --- response_headers
 !Content-Encoding
-Vary: Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
 
@@ -445,41 +466,44 @@ GET /t
 "Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:"
 --- response_headers
 Content-Encoding: dcz
-Vary: Available-Dictionary
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
 --- no_error_log
 [error]
 
 
 
-=== TEST 17: supplied hash is trusted verbatim as the negotiation key
-# The directive declares a hash that is NOT the file's: negotiation must
-# key on the declared value (client presenting it gets dcz). See the
-# preamble note for what this does and does not prove.
+=== TEST 17: a supplied hash that is not the file's aborts config load
+# THE regression test for the trusted-literal bug: "new.dict with the
+# old dict's hash" used to load happily and advertise a hash no client
+# could decode against. The dictionary path EXISTS and its contents are
+# fine — only the declared hash is wrong — so nothing but the
+# verification can reject this config.
 --- config eval
 "    location /t {
         zstd on;
-        zstd_min_length 16;
         zstd_dcz_dict_file \$TEST_NGINX_PERL_PATH/suite/dcz-dict $::odd_hex;
         default_type text/plain;
-        return 200 \"dcz negotiation body: shared-boilerplate compute render\n\";
+        return 200 \"unreachable\n\";
     }"
 --- request
 GET /t
---- more_headers eval
-"Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::odd_b64:"
---- response_headers
-Content-Encoding: dcz
+--- must_die
+--- error_log eval
+qr/does not match the supplied hash "0101010101010101010101010101010101010101010101010101010101010101": the file's SHA-256 is "$::dict_hex"/
 --- no_error_log
-[error]
+[alert]
 
 
 
-=== TEST 18: supplied hash trusted verbatim — the file's true hash no longer matches
+=== TEST 18: the file's own true hash as the literal still loads and negotiates
+# Positive control for TEST 17: verification accepts the matching pair,
+# and the negotiation key is the file's real hash. Without this, TEST 17
+# would also pass if the directive rejected EVERY supplied literal.
 --- config eval
 "    location /t {
         zstd on;
         zstd_min_length 16;
-        zstd_dcz_dict_file \$TEST_NGINX_PERL_PATH/suite/dcz-dict $::odd_hex;
+        zstd_dcz_dict_file \$TEST_NGINX_PERL_PATH/suite/dcz-dict $::dict_hex;
         default_type text/plain;
         return 200 \"dcz negotiation body: shared-boilerplate compute render\n\";
     }"
@@ -488,7 +512,7 @@ GET /t
 --- more_headers eval
 "Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:"
 --- response_headers
-Content-Encoding: zstd
+Content-Encoding: dcz
 --- no_error_log
 [error]
 
@@ -534,13 +558,14 @@ non-hex character
 
 
 
-=== TEST 21: supplied hash skips the load-time hashing pass entirely
-# THE instrumentation test (issue #100 item 1): $zstd_dcz_dicts_hashed
-# counts ngx_http_zstd_sha256() calls from the dictionary loader this
-# config cycle. With a supplied hash it must be ZERO — restoring the
-# unconditional hash call in front of the have_hash branch (the
-# regression the negotiation tests cannot see) makes this "1" and fails
-# here.
+=== TEST 21: a supplied hash does NOT skip the load-time hashing pass
+# $zstd_dcz_dicts_hashed counts ngx_http_zstd_sha256() calls from the
+# dictionary loader this config cycle. The literal is verified, not
+# trusted, so the file must be hashed even when one is supplied: this
+# is "1". Restoring the old "if (!have_hash)" skip makes it "0" and
+# fails here — the counter is what distinguishes verifying the literal
+# from substituting it, since both produce the same dict->hash on a
+# MATCHING pair.
 --- config eval
 "    location /t {
         zstd on;
@@ -551,7 +576,7 @@ non-hex character
 --- request
 GET /t
 --- response_body
-hashed=0
+hashed=1
 --- no_error_log
 [error]
 
@@ -575,7 +600,9 @@ hashed=1
 
 
 
-=== TEST 23: mixed supplied and computed entries count only the computed one
+=== TEST 23: mixed supplied and computed entries count BOTH
+# Every dictionary is hashed from its own bytes regardless of whether
+# a literal was declared, so two dictionaries are two hashes.
 --- config eval
 "    location /t {
         zstd on;
@@ -587,7 +614,7 @@ hashed=1
 --- request
 GET /t
 --- response_body
-hashed=1
+hashed=2
 --- no_error_log
 [error]
 
@@ -657,6 +684,166 @@ Content-Encoding: zstd
 GET /t
 --- more_headers eval
 "Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:\nAvailable-Dictionary: :$::dict_b64:\nSec-Fetch-Site: same-origin"
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 27: secure-context: plain HTTP falls back to zstd with no directive
+# RFC 9842 section 8: compression dictionary transport MUST only be used
+# in a secure context. This block is exempt from the suite's
+# assume-secure preprocessor, so it exercises the COMPILED-IN default
+# (zstd_dcz_assume_secure_transport off) with no directive anywhere in
+# the configuration -- a block that opted in explicitly would pass even
+# if the default were wrong. Every other dcz gate here is satisfied: the
+# only reason this is not dcz is the cleartext connection.
+--- config
+    location /t {
+        zstd on;
+        zstd_min_length 16;
+        zstd_dcz_dict_file $TEST_NGINX_PERL_PATH/suite/dcz-dict;
+        default_type text/plain;
+        return 200 "dcz negotiation body: shared-boilerplate compute render\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+"Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:\nSec-Fetch-Site: same-origin"
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 28: secure-context: explicit off is the same fail-closed answer
+# Pins the directive's off value rather than only its absence, so a
+# future default flip cannot silently make TEST 27 vacuous.
+--- config
+    location /t {
+        zstd on;
+        zstd_min_length 16;
+        zstd_dcz_assume_secure_transport off;
+        zstd_dcz_dict_file $TEST_NGINX_PERL_PATH/suite/dcz-dict;
+        default_type text/plain;
+        return 200 "dcz negotiation body: shared-boilerplate compute render\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+"Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:"
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 29: secure-context: the acknowledgement re-enables dcz over cleartext
+# The supported TLS-terminating-proxy deployment. Same request as TEST
+# 27, one directive different, opposite outcome -- so the pair isolates
+# the gate rather than some other difference.
+--- config
+    location /t {
+        zstd on;
+        zstd_min_length 16;
+        zstd_dcz_assume_secure_transport on;
+        zstd_dcz_dict_file $TEST_NGINX_PERL_PATH/suite/dcz-dict;
+        default_type text/plain;
+        return 200 "dcz negotiation body: shared-boilerplate compute render\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+"Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:\nSec-Fetch-Site: same-origin"
+--- response_headers
+Content-Encoding: dcz
+Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site
+--- no_error_log
+[error]
+
+
+
+=== TEST 30: secure-context: a client-supplied scheme header does not enable dcz
+# X-Forwarded-Proto (and every sibling spelling) is settable by anyone
+# who can reach a cleartext listener. If the module inferred "secure"
+# from one, the gate would be a suggestion. Nothing here is trusted:
+# all four requests stay plain zstd.
+--- config
+    location /t {
+        zstd on;
+        zstd_min_length 16;
+        zstd_dcz_dict_file $TEST_NGINX_PERL_PATH/suite/dcz-dict;
+        default_type text/plain;
+        return 200 "dcz negotiation body: shared-boilerplate compute render\n";
+    }
+--- request eval
+["GET /t", "GET /t", "GET /t", "GET /t"]
+--- more_headers eval
+[
+    "Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:\nX-Forwarded-Proto: https",
+    "Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:\nForwarded: proto=https",
+    "Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:\nX-Forwarded-Ssl: on",
+    "Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:\nFront-End-Https: on",
+]
+--- response_headers eval
+[
+    "Content-Encoding: zstd",
+    "Content-Encoding: zstd",
+    "Content-Encoding: zstd",
+    "Content-Encoding: zstd",
+]
+--- no_error_log
+[error]
+
+
+
+=== TEST 31: secure-context: the acknowledgement inherits into locations
+# http/server/location context: set once at server level, every location
+# under it is covered. Pins the merge, which a per-location-only test
+# would leave unproven.
+--- config
+    zstd on;
+    zstd_min_length 16;
+    zstd_dcz_assume_secure_transport on;
+    zstd_dcz_dict_file $TEST_NGINX_PERL_PATH/suite/dcz-dict;
+
+    location /child {
+        default_type text/plain;
+        return 200 "dcz negotiation body: shared-boilerplate compute render\n";
+    }
+--- request
+GET /child
+--- more_headers eval
+"Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:"
+--- response_headers
+Content-Encoding: dcz
+--- no_error_log
+[error]
+
+
+
+=== TEST 32: secure-context: a location can opt back out of an inherited on
+# The merge is a real inheritance, not a one-way latch: a location that
+# is reachable directly over cleartext can turn the acknowledgement off
+# again even when the server block set it.
+--- config
+    zstd on;
+    zstd_min_length 16;
+    zstd_dcz_assume_secure_transport on;
+    zstd_dcz_dict_file $TEST_NGINX_PERL_PATH/suite/dcz-dict;
+
+    location /direct {
+        zstd_dcz_assume_secure_transport off;
+        default_type text/plain;
+        return 200 "dcz negotiation body: shared-boilerplate compute render\n";
+    }
+--- request
+GET /direct
+--- more_headers eval
+"Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:"
 --- response_headers
 Content-Encoding: zstd
 --- no_error_log
