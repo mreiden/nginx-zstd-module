@@ -3348,6 +3348,192 @@ ngx_http_zstd_create_loc_conf(ngx_conf_t *cf)
 }
 
 
+#if !(NGX_WIN32)
+#include <fcntl.h>   /* openat(), O_DIRECTORY, O_NOFOLLOW, AT_FDCWD */
+/*
+ * AT_FDCWD is the portable signal that the POSIX.1-2008 *at() family is
+ * available. Where it is absent strict mode has no way to resolve a path
+ * component-by-component, and it fails CLOSED at config load rather than
+ * silently degrading to the leaf-only O_NOFOLLOW guarantee it used to
+ * give (see ngx_http_zstd_open_dict_file()).
+ */
+#ifdef AT_FDCWD
+#define NGX_HTTP_ZSTD_HAVE_STRICT_WALK  1
+#else
+#define NGX_HTTP_ZSTD_HAVE_STRICT_WALK  0
+#endif
+#else
+#define NGX_HTTP_ZSTD_HAVE_STRICT_WALK  0
+#endif
+
+
+#if (NGX_HTTP_ZSTD_HAVE_STRICT_WALK)
+
+/*
+ * Strict-mode component-by-component open (M3).
+ *
+ * O_NOFOLLOW on the full path guards ONLY the leaf: the kernel resolves
+ * every intermediate component normally, so /srv/current/dict.bin with
+ * "current" a symlink is followed silently and strict mode selects
+ * whatever bytes the symlink's owner points it at -- exactly the
+ * release-symlink swap the directive's README warning says strict mode
+ * defends against. Walking the path with openat(O_NOFOLLOW|O_DIRECTORY)
+ * one component at a time makes an intermediate symlink fail the walk
+ * (ELOOP) instead of being traversed, and the leaf is then opened
+ * relative to the verified parent fd -- so the whole resolution, not
+ * just its last step, is symlink-free and TOCTOU-safe against a
+ * component swap racing the walk.
+ *
+ * Absolute paths only. nginx has already run the config path through
+ * ngx_conf_full_name(), so a dictionary path reaching here is absolute;
+ * a relative one would have to be resolved against a cwd this function
+ * cannot pin, and strict mode fails CLOSED rather than fall back to a
+ * whole-path open.
+ *
+ * Returns the leaf fd, or NGX_INVALID_FILE having logged the reason.
+ */
+static ngx_fd_t
+ngx_http_zstd_open_dict_strict(ngx_conf_t *cf, ngx_str_t *path, int flags)
+{
+    u_char  *p, *start, *end;
+    int      fd, next, oflags;
+
+    if (path->len == 0 || path->data[0] != '/') {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"%V\" is not an absolute path; refused by "
+                           "\"zstd_dict_strict_path on\", which resolves "
+                           "the path one component at a time and cannot "
+                           "verify a relative prefix", path);
+        return NGX_INVALID_FILE;
+    }
+
+    fd = open("/", O_RDONLY | O_DIRECTORY
+#ifdef O_CLOEXEC
+              | O_CLOEXEC
+#endif
+              );
+    if (fd < 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           "open(\"/\") failed while resolving \"%V\" "
+                           "under \"zstd_dict_strict_path on\"", path);
+        return NGX_INVALID_FILE;
+    }
+
+    start = path->data + 1;
+    end = path->data + path->len;
+
+    for ( ;; ) {
+        /* skip any run of separators; a trailing one means no leaf */
+        while (start < end && *start == '/') {
+            start++;
+        }
+
+        if (start >= end) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"%V\" names a directory, not a "
+                               "dictionary file; refused by "
+                               "\"zstd_dict_strict_path on\"", path);
+            ngx_close_file(fd);
+            return NGX_INVALID_FILE;
+        }
+
+        for (p = start; p < end && *p != '/'; p++) { /* void */ }
+
+        /*
+         * openat() needs a NUL-terminated component. The component is
+         * COPIED into a local buffer rather than NUL-terminated in place:
+         * path->data is nginx's own config string, and writing into it --
+         * even a byte restored immediately afterwards -- would mutate
+         * shared config memory that other directives and the error log
+         * still read. A component longer than the buffer cannot name a
+         * file any filesystem will accept, so it is refused rather than
+         * silently truncated (truncation would open a DIFFERENT name).
+         */
+        {
+            u_char  comp[NGX_MAX_PATH];
+            size_t  complen = (size_t) (p - start);
+            int     last;
+            u_char  *q;
+
+            if (complen >= sizeof(comp)) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "\"%V\" has a path component longer "
+                                   "than %uz bytes; refused by "
+                                   "\"zstd_dict_strict_path on\"",
+                                   path, sizeof(comp) - 1);
+                ngx_close_file(fd);
+                return NGX_INVALID_FILE;
+            }
+
+            ngx_memcpy(comp, start, complen);
+            comp[complen] = '\0';
+
+            last = 1;
+            for (q = p; q < end; q++) {
+                if (*q != '/') {
+                    last = 0;
+                    break;
+                }
+            }
+
+            /*
+             * "." and ".." are refused rather than resolved: ".." would
+             * climb back above a component already verified, which
+             * makes the walk's guarantee unstatable, and neither has a
+             * legitimate place in a deployed dictionary path.
+             */
+            if (ngx_strcmp(comp, ".") == 0 || ngx_strcmp(comp, "..") == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "\"%V\" contains a \".\" or \"..\" "
+                                   "component; refused by "
+                                   "\"zstd_dict_strict_path on\"", path);
+                ngx_close_file(fd);
+                return NGX_INVALID_FILE;
+            }
+
+            /*
+             * O_CLOEXEC is applied to BOTH arms deliberately. Folding it
+             * into the ternary via a bare "#ifdef ... | O_CLOEXEC" would
+             * bind it to the else-branch alone by C's precedence rules,
+             * silently leaving the leaf fd inheritable across an exec.
+             */
+            oflags = last ? (flags | O_NOFOLLOW)
+                          : (O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+#ifdef O_CLOEXEC
+            oflags |= O_CLOEXEC;
+#endif
+
+            next = openat(fd, (char *) comp, oflags);
+
+            if (next < 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                                   "openat(\"%s\") failed while resolving "
+                                   "\"%V\" under "
+                                   "\"zstd_dict_strict_path on\" (a "
+                                   "symlink at any component is refused, "
+                                   "not followed; a release-symlink "
+                                   "deployment needs "
+                                   "\"zstd_dict_strict_path off;\", the "
+                                   "default)", comp, path);
+                ngx_close_file(fd);
+                return NGX_INVALID_FILE;
+            }
+
+            ngx_close_file(fd);
+            fd = next;
+
+            if (last) {
+                return fd;
+            }
+
+            start = p;
+        }
+    }
+}
+
+#endif /* NGX_HTTP_ZSTD_HAVE_STRICT_WALK */
+
+
 /*
  * Shared open+validate path for both dictionary loaders (zstd_dict_file
  * in ngx_http_zstd_merge_loc_conf() and zstd_dcz_dict_file() below).
@@ -3403,10 +3589,47 @@ ngx_http_zstd_open_dict_file(ngx_conf_t *cf, ngx_str_t *path,
 
 #else
 
-    fd = ngx_open_file(path->data,
-                       NGX_FILE_RDONLY | NGX_FILE_NONBLOCK
-                       | (strict ? NGX_FILE_NOFOLLOW : 0),
-                       NGX_FILE_OPEN, 0);
+    if (strict) {
+
+#if (NGX_HTTP_ZSTD_HAVE_STRICT_WALK)
+
+        /*
+         * M3: resolve every component, not just the leaf. See
+         * ngx_http_zstd_open_dict_strict().
+         */
+        fd = ngx_http_zstd_open_dict_strict(cf, path,
+                                            O_RDONLY | NGX_FILE_NONBLOCK);
+
+        if (fd == NGX_INVALID_FILE) {
+            /* the walk has already logged the precise component */
+            return NGX_INVALID_FILE;
+        }
+
+#else
+
+        /*
+         * Fail CLOSED. Without openat() strict mode can only offer the
+         * leaf-only O_NOFOLLOW guarantee, which an intermediate symlink
+         * defeats -- accepting the config here would let the directive
+         * claim a protection the platform cannot deliver.
+         */
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"zstd_dict_strict_path on\" is not supported "
+                           "on this platform (no openat(); the path cannot "
+                           "be resolved one component at a time, so an "
+                           "intermediate symlink could not be refused). "
+                           "Refusing \"%V\" rather than loading it with a "
+                           "weaker guarantee than the directive states",
+                           path);
+        return NGX_INVALID_FILE;
+
+#endif
+
+    } else {
+        fd = ngx_open_file(path->data,
+                           NGX_FILE_RDONLY | NGX_FILE_NONBLOCK,
+                           NGX_FILE_OPEN, 0);
+    }
 
 #endif
 
@@ -3435,13 +3658,13 @@ ngx_http_zstd_open_dict_file(ngx_conf_t *cf, ngx_str_t *path,
     if (strict) {
 
         /*
-         * O_NOFOLLOW above already refused a symlink at the leaf; this
-         * is the fstat()-side confirmation (ngx_is_link() on the fd's
-         * own info is always false for a fd that reached here purely
-         * because O_NOFOLLOW would have refused the open first -- kept
-         * as an explicit, self-documenting assertion of the property
-         * this function guarantees under strict mode rather than a
-         * live code path).
+         * The component walk above refused a symlink at EVERY component,
+         * leaf included; this is the fstat()-side confirmation
+         * (ngx_is_link() on the fd's own info is always false for a fd
+         * that reached here, because O_NOFOLLOW on the leaf openat()
+         * would have refused the open first -- kept as an explicit,
+         * self-documenting assertion of the property this function
+         * guarantees under strict mode rather than a live code path).
          */
         if (ngx_is_link(info)) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -3450,6 +3673,38 @@ ngx_http_zstd_open_dict_file(ngx_conf_t *cf, ngx_str_t *path,
                                "symlink deployment needs "
                                "\"zstd_dict_strict_path off;\", the "
                                "default)", path);
+            ngx_close_file(fd);
+            return NGX_INVALID_FILE;
+        }
+
+        /*
+         * M4: ownership, not just the group/other bits.
+         *
+         * A dictionary owned by an unprivileged account with a perfectly
+         * ordinary mode 0644 passes a group/other-writability test while
+         * a root master reads it -- and that owner can rewrite the file
+         * at will, so the next privileged reload snapshots whatever bytes
+         * they chose. The directive's stated goal is to exclude a
+         * less-privileged local writer, which the mode bits alone do not
+         * achieve. Strict mode therefore requires the file to be owned by
+         * the principal doing the loading (the effective uid of the
+         * config-parsing master), and root-owned files are additionally
+         * accepted because root is not "less privileged" than the loader
+         * in any configuration that reaches here.
+         */
+        if ((info)->st_uid != geteuid() && (info)->st_uid != 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"%V\" is owned by uid %uD, neither the "
+                               "loading principal (uid %uD) nor root; "
+                               "refused by \"zstd_dict_strict_path on\", "
+                               "because that owner can rewrite the file "
+                               "and steer what a later privileged reload "
+                               "loads. Deploy dictionaries via an "
+                               "immutable, content-addressed path owned "
+                               "and writable only by the deploying "
+                               "principal",
+                               path, (uint32_t) (info)->st_uid,
+                               (uint32_t) geteuid());
             ngx_close_file(fd);
             return NGX_INVALID_FILE;
         }
