@@ -80,6 +80,18 @@ ngx_http_compression_eval_qvalue(ngx_str_t *ae, u_char *p)
             p++;
         }
         nend = p;
+
+        /*
+         * RFC 9110 has no empty-parameter production, so "zstd;;q=1"
+         * is malformed rather than "a skipped parameter followed by
+         * q=1". Reject it instead of silently resolving the element
+         * to q=1. (Parent #142; core gzip refuses the gzip twin, so
+         * accepting it here would split the defer decision.)
+         */
+        if (nend == nstart) {
+            return -1;
+        }
+
         is_q = (nend - nstart == 1
                 && (nstart[0] == 'q' || nstart[0] == 'Q'));
 
@@ -213,8 +225,32 @@ ngx_http_compression_coding_weight(ngx_str_t *ae, ngx_str_t *coding,
                                         coding->len) == 0);
         is_star = (name_end - tok == 1 && tok[0] == '*');
 
+        /* Step over any OWS between the name and its ';' or ','. */
         while (p < end && (*p == ' ' || *p == '\t')) {
             p++;
+        }
+
+        /*
+         * Only ';' (parameters), ',' (next element) or end of field
+         * may follow a coding name. RFC 9110 12.5.3 makes `codings` a
+         * token, so anything else means this element is not the
+         * coding it looked like: `zstd"x` and `zstd "x` advertise
+         * nothing, and neither does `zstd x`. (Parent #142.) Core
+         * gzip's ngx_http_gzip_accept_encoding() applies the same
+         * rule, so accepting these here splits the defer decision:
+         * "gzip x, zstd" would defer to core gzip on the malformed
+         * gzip element, core gzip declines it, and a client that
+         * validly offered zstd gets identity.
+         *
+         * The check must sit AFTER the OWS skip: the name scan stops
+         * on OWS as well as on '"', so testing the stopping byte
+         * alone catches `zstd"x` and misses everything hiding behind
+         * a space. The quote-aware element-skip below still swallows
+         * the rest of the element.
+         */
+        if (p < end && *p != ';' && *p != ',') {
+            is_coding = 0;
+            is_star = 0;
         }
 
         q = 1000;

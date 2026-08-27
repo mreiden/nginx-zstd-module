@@ -132,6 +132,20 @@ static ngx_conf_enum_t  ngx_http_compression_http_version_enum[] = {
 };
 
 
+/*
+ * The levels[] slots cannot use NGX_CONF_UNSET as their "not
+ * configured" marker: NGX_CONF_UNSET is -1, and -1 is itself a valid
+ * level for the zstd backend (its vtable declares negative fast
+ * levels). With the shared sentinel, "compression_level zstd -1;" was
+ * indistinguishable from an absent directive: the merge silently
+ * replaced it with the inherited or default level, and the duplicate
+ * guard in the level parser could never fire for it. Same trap the
+ * parent closed for zstd_comp_level; the value is out of band for
+ * every backend's declared range.
+ */
+#define NGX_HTTP_COMPRESSION_LEVEL_UNSET  (-NGX_MAX_INT_T_VALUE - 1)
+
+
 static ngx_command_t  ngx_http_compression_commands[] = {
 
     { ngx_string("compression"),
@@ -637,6 +651,34 @@ ngx_http_compression_init_main_conf(ngx_conf_t *cf, void *conf)
     ngx_conf_init_value(cmcf->dict_strict_path, 0);   /* off by default */
 
     /*
+     * Reject the ordering rather than silently accept an unchecked
+     * load: ngx_http_compression_dict_file() records the first time
+     * it loads a dictionary while dict_strict_path did not yet read
+     * as the explicit "on". If the flag's FINAL value is "on", every
+     * such recorded load ran without the O_NOFOLLOW / writable-target
+     * checks this directive exists to apply — fail the config rather
+     * than start with a dictionary the operator asked to have vetted
+     * but that never was. nginx directives are conventionally
+     * order-independent, so this is a real operator trap, not
+     * pedantry. (Parent's init_main_conf carries the same check.)
+     */
+    if (cmcf->dict_strict_path == 1
+        && cmcf->dict_loaded_before_strict_on)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"compression_dict_strict_path on\" was "
+                           "declared AFTER \"compression_dict_file %V\", "
+                           "which had already loaded unchecked by that "
+                           "point. nginx directives are order-independent "
+                           "by convention, but this one is not: move "
+                           "\"compression_dict_strict_path on;\" before "
+                           "every \"compression_dict_file\" directive it "
+                           "must apply to",
+                           &cmcf->dict_loaded_before_strict_on_file);
+        return NGX_CONF_ERROR;
+    }
+
+    /*
      * Preformat $compression_dicts_hashed once (parent #154): every
      * compression_dict_file has been parsed and hashed by now — all
      * increments live in that directive handler, which runs before
@@ -818,7 +860,7 @@ ngx_http_compression_level_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
         return NGX_CONF_ERROR;
     }
 
-    if (ccf->levels[i] != NGX_CONF_UNSET) {
+    if (ccf->levels[i] != NGX_HTTP_COMPRESSION_LEVEL_UNSET) {
         return "is duplicate";
     }
 
@@ -1185,7 +1227,7 @@ ngx_http_compression_create_conf(ngx_conf_t *cf)
     conf->bufs_unsafe = NGX_CONF_UNSET;
 
     for (i = 0; i < NGX_HTTP_COMPRESSION_CONF_SLOTS; i++) {
-        conf->levels[i] = NGX_CONF_UNSET;
+        conf->levels[i] = NGX_HTTP_COMPRESSION_LEVEL_UNSET;
         conf->window_bits[i] = NGX_CONF_UNSET;
     }
 
@@ -1464,8 +1506,18 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
      * filled the registry.
      */
     for (i = 0; ngx_http_compression_backends[i] != NULL; i++) {
-        ngx_conf_merge_value(conf->levels[i], prev->levels[i],
-                             ngx_http_compression_backends[i]->level_default);
+        /*
+         * Hand-rolled rather than ngx_conf_merge_value(): that macro
+         * tests against NGX_CONF_UNSET, which is a legal zstd level
+         * here. See NGX_HTTP_COMPRESSION_LEVEL_UNSET above.
+         */
+        if (conf->levels[i] == NGX_HTTP_COMPRESSION_LEVEL_UNSET) {
+            conf->levels[i] =
+                (prev->levels[i] == NGX_HTTP_COMPRESSION_LEVEL_UNSET)
+                ? ngx_http_compression_backends[i]->level_default
+                : prev->levels[i];
+        }
+
         ngx_conf_merge_value(conf->window_bits[i], prev->window_bits[i],
                              ngx_http_compression_backends[i]
                                  ->window_bits_default);
@@ -2088,6 +2140,19 @@ ngx_http_compression_get_buf(ngx_http_request_t *r,
             return NGX_ERROR;
         }
         ctx->ob->tag = (ngx_buf_tag_t) &ngx_http_compression_filter_module;
+
+        /*
+         * Recycled bufs bypass ngx_http_write_filter()'s
+         * postpone_output hold: without the flag a sub-1460-byte ship
+         * from a tight cap sits postponed, the busy chain never
+         * drains, and the cap pause above becomes a deadlock (brotli)
+         * or a truncated 200 (zstd) — reproduced with
+         * "compression_buffers 2 64" and incompressible input. Set at
+         * creation; ngx_chain_update_chains() never clears it, so
+         * every reuse inherits it.
+         */
+        ctx->ob->recycled = 1;
+
         ctx->allocated++;
         return NGX_OK;
     }
@@ -2446,15 +2511,19 @@ ship:
      * is held data too, and it only fully drains at FINISH. PHASE0:
      * reuses the core gzip bit — defined in every build, and the
      * elected path latches core gzip off so the owners can never
-     * overlap; a dedicated bit ships with productization.
+     * overlap; a dedicated bit ships with productization. The bit
+     * lives on r->connection->buffered, where core gzip and the
+     * parent keep it: r->buffered is a four-bit field holding only
+     * the low-nibble filter bits, so OR-ing 0x20 into it truncates
+     * to nothing and the whole publication silently never happened.
      */
     if (ctx->done) {
-        r->buffered &= ~NGX_HTTP_GZIP_BUFFERED;
+        r->connection->buffered &= ~NGX_HTTP_GZIP_BUFFERED;
 
     } else if (ctx->started
                || (ctx->ob != NULL && ctx->ob->last != ctx->ob->pos))
     {
-        r->buffered |= NGX_HTTP_GZIP_BUFFERED;
+        r->connection->buffered |= NGX_HTTP_GZIP_BUFFERED;
     }
 
     if (out == NULL) {

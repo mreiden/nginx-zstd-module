@@ -246,3 +246,68 @@ GET /t
 output-chain memory PER RESPONSE
 --- no_error_log
 [emerg]
+
+=== TEST 11: a tight SIZE ships sub-postpone writes -- zstd completes intact
+# The buffered-bit/recycled pair (review round 3): without recycled=1
+# on fresh bufs, every 64-byte ship sat under postpone_output's hold,
+# the busy chain never drained, and this exact config truncated the
+# zstd response to the first caps' worth of bytes under a 200 -- the
+# decode check is what catches a short-but-valid-looking body. And
+# without the connection-level buffered bit (r->buffered is a four-bit
+# field; 0x20 truncates to nothing), held encoder state was invisible
+# to the writer. Incompressible input keeps every buffer full-width.
+--- log_level: debug
+--- timeout: 10
+--- user_files eval
+[ [ "b/big.txt" => $::big ] ]
+--- config
+    location /b/ {
+        compression on;
+        compression_buffers 2 64;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /b/big.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- decode_with
+zstd
+--- no_error_log
+[error]
+
+
+=== TEST 12: a tight SIZE ships sub-postpone writes -- brotli completes intact
+# Same config, brotli coding: pre-fix this one did not truncate, it
+# never answered at all (the busy chain deadlock), so the block's
+# timeout is the fail-first witness.
+--- log_level: debug
+--- timeout: 10
+--- user_files eval
+[ [ "b/big.txt" => $::big ] ]
+--- config
+    location /b/ {
+        compression on;
+        compression_order br;
+        compression_buffers 2 64;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /b/big.txt
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+--- decode_with
+br
+--- no_error_log
+[error]

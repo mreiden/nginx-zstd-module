@@ -412,3 +412,43 @@ is not a regular file
 directive is not allowed here
 --- no_error_log
 [alert]
+
+=== TEST 23: strict_path declared AFTER a dict_file is a config error
+# Order-dependent fail-open (review round 3): the flag is read at
+# parse time, so a load above the "on" line ran without O_NOFOLLOW or
+# the writable-target check. Directives are conventionally
+# order-independent -- rejecting the ordering outright beats silently
+# skipping the vetting the operator asked for, and beats re-opening
+# every dictionary in init_main_conf (which would reintroduce the
+# TOCTOU window the fstat-after-open checks close). Parent shape.
+--- user_files eval
+[ [ "a.dict" => $::dict_a ] ]
+--- http_config
+    compression_dict_file html/a.dict;
+    compression_dict_strict_path on;
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+"compression_dict_strict_path on" was declared AFTER
+--- no_error_log
+[alert]
+
+
+=== TEST 24: strict_path declared BEFORE the dict_file loads and serves
+# Positive control for TEST 23: same directives, sanctioned order --
+# the load runs under the strict checks and the server starts.
+--- user_files eval
+[ [ "a.dict" => $::dict_a ] ]
+--- http_config
+    compression_dict_strict_path on;
+    compression_dict_file html/a.dict;
+--- config
+    location /t { return 200 "ok\n"; }
+--- request
+GET /t
+--- error_code: 200
+--- response_body
+ok
+--- no_error_log
+[error]

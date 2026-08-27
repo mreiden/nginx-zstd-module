@@ -321,6 +321,22 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         /* ── first sight of this path: load it ─────────────────────── */
 
         /*
+         * This load is about to run under whatever dict_strict_path
+         * reads RIGHT NOW. If that is anything but the explicit "on",
+         * the O_NOFOLLOW open and the writable-target check below are
+         * skipped — record it, so init_main_conf() can reject the
+         * config if a later "compression_dict_strict_path on;" line
+         * turns out to have been meant to cover this load. See the
+         * field's comment in ngx_http_compression_dict.h.
+         */
+        if (cmcf->dict_strict_path != 1
+            && !cmcf->dict_loaded_before_strict_on)
+        {
+            cmcf->dict_loaded_before_strict_on = 1;
+            cmcf->dict_loaded_before_strict_on_file = path;
+        }
+
+        /*
          * O_NONBLOCK always (parent #165): a FIFO at the dictionary path
          * would otherwise block the config-parsing master in open()
          * until a writer appeared — nginx -t or a reload would just

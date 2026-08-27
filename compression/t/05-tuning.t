@@ -492,3 +492,50 @@ Content-Encoding: zstd
 zstd
 --- no_error_log
 [error]
+
+=== TEST 23: level -1 survives the merge against a differently-tuned parent
+# NGX_CONF_UNSET is -1, and -1 is a valid zstd level: with the shared
+# sentinel the merge read "compression_level zstd -1" as absent and
+# handed back the inherited level -- the parent tuned to 19 here is
+# the control that makes the theft visible. The applied-parameter
+# debug line pins what actually reached the encoder.
+--- log_level: debug
+--- user_files eval
+[ [ "t/body.txt" => $::src ] ]
+--- http_config
+    compression_level zstd 19;
+--- config
+    location /t/ {
+        compression on;
+        compression_level zstd -1;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /t/body.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- decode_with
+zstd
+--- error_log eval
+qr/compression: create zstd level -1 window_bits 0/
+--- no_error_log eval
+[qr/compression: create zstd level 19 /, qr/\[error\]/]
+
+
+=== TEST 24: duplicate compression_level with -1 first is still a config error
+# The other half of the sentinel collision: the duplicate guard tested
+# against NGX_CONF_UNSET, so "-1; 9" sailed through with 9 winning.
+--- config
+    location / {
+        compression_level zstd -1;
+        compression_level zstd 9;
+    }
+--- must_die
+--- error_log
+is duplicate

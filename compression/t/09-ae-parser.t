@@ -372,3 +372,91 @@ Accept-Encoding: *;q=0.5, zstd;q=0
 Content-Encoding: br
 --- no_error_log
 [error]
+
+=== TEST 19: junk after the coding name (zstd x) advertises nothing
+# RFC 9110 12.5.3 makes `codings` a token: only ';', ',' or end may
+# follow the name. Core gzip's parser applies the same rule, so
+# accepting this diverged from the sibling filter (parent #142).
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd x
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+=== TEST 20: a quote glued to the coding name (zstd"x) advertises nothing
+# The name scan stops on '"' as well as OWS, so the boundary check has
+# to look at what follows the OWS skip, not the stopping byte alone.
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd"x
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+=== TEST 21: an empty parameter (zstd;;q=1) is malformed
+# RFC 9110 has no empty-parameter production; the element must not
+# silently resolve to q=1 (parent #142).
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd;;q=1
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+=== TEST 22: a malformed gzip element must not hijack the defer decision
+# The divergence this drift caused: core gzip refuses "gzip x", so
+# deferring on it hands the request to a filter that declines, and a
+# client that validly offered zstd got identity. The malformed element
+# advertises nothing; election falls through to zstd.
+--- config
+    location /t {
+        compression on;
+        compression_order gzip zstd;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: gzip x, zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]

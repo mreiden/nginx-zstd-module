@@ -117,6 +117,27 @@ typedef struct {
     ngx_flag_t    dict_strict_path;
 
     /*
+     * Set by ngx_http_compression_dict_file() the first time it LOADS
+     * a dictionary while dict_strict_path still reads as anything
+     * other than the explicit "on" (1) at that moment in the parse —
+     * i.e. every load that ran BEFORE a LATER
+     * "compression_dict_strict_path on;" line could apply to it.
+     * ngx_conf_parse() runs top-to-bottom, and directives are
+     * conventionally order-independent, so the operator gets no cue
+     * that this one must come first; silently treating such a load as
+     * "strict passed" would fail OPEN (the O_NOFOLLOW open and the
+     * writable-target check both already happened without it). Rather
+     * than defer the strict checks to init_main_conf() — which would
+     * mean re-opening every dictionary by path a second time,
+     * reintroducing exactly the TOCTOU window the fstat-after-open
+     * checks exist to close — init_main_conf() rejects the ordering
+     * outright when the flag's final value is "on": see the check
+     * there. (Parent's dcz_dict_loaded_before_strict_on, same shape.)
+     */
+    ngx_flag_t    dict_loaded_before_strict_on;
+    ngx_str_t     dict_loaded_before_strict_on_file;
+
+    /*
      * "Could this cycle ever compress a response" latch (parent #182),
      * set at directive PARSE time by ngx_http_compression_set_enable_slot()
      * whenever a "compression on;" is parsed ANYWHERE — main, srv, loc, or
