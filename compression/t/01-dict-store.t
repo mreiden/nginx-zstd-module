@@ -1,5 +1,6 @@
 use Test::Nginx::Socket;
 use Digest::SHA qw(sha256_hex);
+use File::Temp qw(tempdir);
 
 # Phase-1a store rules as a regression suite: every config-load rule
 # from the shell matrix, plus the $compression_dicts_hashed witness
@@ -8,6 +9,20 @@ use Digest::SHA qw(sha256_hex);
 # computed here, never hardcoded.
 
 our $dict_a  = "const shared = 'store fixture material, dictionary A';\n" x 40;
+
+# strict-walk fixtures (parent #199): an out-of-servroot tempdir whose
+# ABSOLUTE path goes into the config verbatim, with a real directory
+# and a symlinked alias to it — the walk must refuse the alias at the
+# intermediate component and accept the real chain.
+our $walkdir = tempdir(CLEANUP => 1);
+mkdir "$walkdir/real" or die "mkdir: $!";
+{
+    open my $h, '>', "$walkdir/real/w.dict" or die "spew: $!";
+    print $h "strict walk fixture dictionary contents\n" x 20;
+    close $h;
+}
+symlink("$walkdir/real", "$walkdir/link")
+    or die "symlink: $!";
 our $dict_b  = "let other = 'store fixture material, dictionary B';\n" x 40;
 our $hex_a   = sha256_hex($dict_a);
 our $badhex  = '0' x 64;
@@ -443,6 +458,59 @@ directive is not allowed here
 --- http_config
     compression_dict_strict_path on;
     compression_dict_file html/a.dict;
+--- config
+    location /t { return 200 "ok\n"; }
+--- request
+GET /t
+--- error_code: 200
+--- response_body
+ok
+--- no_error_log
+[error]
+
+=== TEST 25: strict mode refuses a ".." path component
+# parent #199 (M3): ".." would climb back above a component the walk
+# already verified, making its guarantee unstatable — refused rather
+# than resolved. The same file loads through its plain path (TEST 26's
+# positive control), so nothing but the component check rejects this.
+--- user_files eval
+[ [ "a.dict" => $::dict_a ] ]
+--- http_config
+    compression_dict_strict_path on;
+    compression_dict_file html/../html/a.dict;
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+contains a "." or ".." component
+--- no_error_log
+[alert]
+
+
+=== TEST 26: strict mode refuses a symlinked INTERMEDIATE component
+# parent #199 (M3): O_NOFOLLOW on a whole-path open guards only the
+# leaf, so the classic "current -> releases/7" layout walked straight
+# through the old check. The component walk refuses the symlink where
+# it sits. The real chain (positive control below) is byte-identical.
+--- http_config eval
+"compression_dict_strict_path on;
+ compression_dict_file $::walkdir/link/w.dict;"
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+a symlink at any component is refused
+--- no_error_log
+[alert]
+
+
+=== TEST 27: the same dictionary loads through its real component chain
+# Positive control for TESTs 25/26: identical file, symlink-free
+# absolute path, strict on — the walk verifies every component and the
+# server starts.
+--- http_config eval
+"compression_dict_strict_path on;
+ compression_dict_file $::walkdir/real/w.dict;"
 --- config
     location /t { return 200 "ok\n"; }
 --- request

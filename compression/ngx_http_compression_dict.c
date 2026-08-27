@@ -35,6 +35,201 @@ static ngx_int_t ngx_http_compression_dicts_hashed_variable(
     ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 
 
+#if !(NGX_WIN32)
+#include <fcntl.h>   /* openat(), O_DIRECTORY, O_NOFOLLOW, AT_FDCWD */
+/*
+ * AT_FDCWD is the portable signal that the POSIX.1-2008 *at() family is
+ * available (parent #199). Where it is absent strict mode has no way to
+ * resolve a path component-by-component, and it fails CLOSED at config
+ * load rather than silently degrading to the leaf-only O_NOFOLLOW
+ * guarantee it used to give.
+ */
+#ifdef AT_FDCWD
+#define NGX_HTTP_COMPRESSION_HAVE_STRICT_WALK  1
+#else
+#define NGX_HTTP_COMPRESSION_HAVE_STRICT_WALK  0
+#endif
+#else
+#define NGX_HTTP_COMPRESSION_HAVE_STRICT_WALK  0
+#endif
+
+
+#if (NGX_HTTP_COMPRESSION_HAVE_STRICT_WALK)
+
+/*
+ * Strict-mode component-by-component open (parent #199, M3).
+ *
+ * O_NOFOLLOW on the full path guards ONLY the leaf: the kernel resolves
+ * every intermediate component normally, so /srv/current/dict.bin with
+ * "current" a symlink is followed silently and strict mode selects
+ * whatever bytes the symlink's owner points it at — exactly the
+ * release-symlink swap the directive defends against. Walking the path
+ * with openat(O_NOFOLLOW|O_DIRECTORY) one component at a time makes an
+ * intermediate symlink fail the walk (ELOOP) instead of being
+ * traversed, and the leaf is then opened relative to the verified
+ * parent fd — so the whole resolution, not just its last step, is
+ * symlink-free and TOCTOU-safe against a component swap racing the
+ * walk.
+ *
+ * Absolute paths only. The directive handler has already run the path
+ * through ngx_conf_full_name(), so a dictionary path reaching here is
+ * absolute; a relative one would have to be resolved against a cwd
+ * this function cannot pin, and strict mode fails CLOSED rather than
+ * fall back to a whole-path open.
+ *
+ * Returns the leaf fd, or NGX_INVALID_FILE having logged the reason.
+ */
+static ngx_fd_t
+ngx_http_compression_open_dict_strict(ngx_conf_t *cf, ngx_str_t *path,
+    int flags)
+{
+    u_char  *p, *start, *end;
+    int      fd, next, oflags;
+
+    if (path->len == 0 || path->data[0] != '/') {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"%V\" is not an absolute path; refused by "
+                           "\"compression_dict_strict_path on\", which "
+                           "resolves the path one component at a time and "
+                           "cannot verify a relative prefix", path);
+        return NGX_INVALID_FILE;
+    }
+
+    fd = open("/", O_RDONLY | O_DIRECTORY
+#ifdef O_CLOEXEC
+              | O_CLOEXEC
+#endif
+              );
+    if (fd < 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           "open(\"/\") failed while resolving \"%V\" "
+                           "under \"compression_dict_strict_path on\"",
+                           path);
+        return NGX_INVALID_FILE;
+    }
+
+    start = path->data + 1;
+    end = path->data + path->len;
+
+    for ( ;; ) {
+        /* skip any run of separators; a trailing one means no leaf */
+        while (start < end && *start == '/') {
+            start++;
+        }
+
+        if (start >= end) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"%V\" names a directory, not a "
+                               "dictionary file; refused by "
+                               "\"compression_dict_strict_path on\"",
+                               path);
+            ngx_close_file(fd);
+            return NGX_INVALID_FILE;
+        }
+
+        for (p = start; p < end && *p != '/'; p++) { /* void */ }
+
+        /*
+         * openat() needs a NUL-terminated component. The component is
+         * COPIED into a local buffer rather than NUL-terminated in
+         * place: path->data is nginx's own config string, and writing
+         * into it — even a byte restored immediately afterwards —
+         * would mutate shared config memory that other directives and
+         * the error log still read. A component longer than the buffer
+         * cannot name a file any filesystem will accept, so it is
+         * refused rather than silently truncated (truncation would
+         * open a DIFFERENT name).
+         */
+        {
+            u_char   comp[NGX_MAX_PATH];
+            size_t   complen = (size_t) (p - start);
+            int      last;
+            u_char  *q;
+
+            if (complen >= sizeof(comp)) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "\"%V\" has a path component longer "
+                                   "than %uz bytes; refused by "
+                                   "\"compression_dict_strict_path on\"",
+                                   path, sizeof(comp) - 1);
+                ngx_close_file(fd);
+                return NGX_INVALID_FILE;
+            }
+
+            ngx_memcpy(comp, start, complen);
+            comp[complen] = '\0';
+
+            last = 1;
+            for (q = p; q < end; q++) {
+                if (*q != '/') {
+                    last = 0;
+                    break;
+                }
+            }
+
+            /*
+             * "." and ".." are refused rather than resolved: ".."
+             * would climb back above a component already verified,
+             * which makes the walk's guarantee unstatable, and
+             * neither has a legitimate place in a deployed
+             * dictionary path.
+             */
+            if (ngx_strcmp(comp, ".") == 0
+                || ngx_strcmp(comp, "..") == 0)
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "\"%V\" contains a \".\" or \"..\" "
+                                   "component; refused by "
+                                   "\"compression_dict_strict_path on\"",
+                                   path);
+                ngx_close_file(fd);
+                return NGX_INVALID_FILE;
+            }
+
+            /*
+             * O_CLOEXEC is applied to BOTH arms deliberately. Folding
+             * it into the ternary via a bare "#ifdef ... | O_CLOEXEC"
+             * would bind it to the else-branch alone by C's precedence
+             * rules, silently leaving the leaf fd inheritable across
+             * an exec.
+             */
+            oflags = last ? (flags | O_NOFOLLOW)
+                          : (O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+#ifdef O_CLOEXEC
+            oflags |= O_CLOEXEC;
+#endif
+
+            next = openat(fd, (char *) comp, oflags);
+
+            if (next < 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                                   "openat(\"%s\") failed while "
+                                   "resolving \"%V\" under "
+                                   "\"compression_dict_strict_path on\" "
+                                   "(a symlink at any component is "
+                                   "refused, not followed; a "
+                                   "release-symlink deployment needs "
+                                   "\"compression_dict_strict_path "
+                                   "off;\", the default)", comp, path);
+                ngx_close_file(fd);
+                return NGX_INVALID_FILE;
+            }
+
+            ngx_close_file(fd);
+            fd = next;
+
+            if (last) {
+                return fd;
+            }
+
+            start = p;
+        }
+    }
+}
+
+#endif /* NGX_HTTP_COMPRESSION_HAVE_STRICT_WALK */
+
+
 /*
  * Read exactly `size` bytes of a dictionary into `buf`, looping until the
  * request is satisfied. Mirrors the standalone module's #195
@@ -340,20 +535,50 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
          * O_NONBLOCK always (parent #165): a FIFO at the dictionary path
          * would otherwise block the config-parsing master in open()
          * until a writer appeared — nginx -t or a reload would just
-         * hang. Win32's NGX_FILE_NONBLOCK is 0, a no-op. Under
-         * compression_dict_strict_path, add O_NOFOLLOW so a symlinked
-         * dictionary is refused (ELOOP -> the open-fail path below).
+         * hang. Win32's NGX_FILE_NONBLOCK is 0, a no-op.
+         *
+         * Under compression_dict_strict_path the path is resolved one
+         * component at a time (parent #199, M3): O_NOFOLLOW on a
+         * whole-path open guards only the LEAF, so a symlinked
+         * intermediate directory — the classic current -> releases/7
+         * layout — walked straight through the old leaf-only check.
+         * A strict refusal is fatal even with "optional": like the
+         * writable-target check below, strict mode is a trust decision
+         * to fix, not a deploy race to ride out.
          */
-        {
-            ngx_uint_t  open_mode = NGX_FILE_RDONLY | NGX_FILE_NONBLOCK;
+        if (cmcf->dict_strict_path == 1) {
 
-#if !(NGX_WIN32)
-            if (cmcf->dict_strict_path == 1) {
-                open_mode |= O_NOFOLLOW;
+#if (NGX_HTTP_COMPRESSION_HAVE_STRICT_WALK)
+            fd = ngx_http_compression_open_dict_strict(cf, &path,
+                                        O_RDONLY | NGX_FILE_NONBLOCK);
+            if (fd == NGX_INVALID_FILE) {
+                /* the walk has already logged the precise component */
+                return NGX_CONF_ERROR;
             }
+#else
+            /*
+             * Fail CLOSED (parent #199): without openat() strict mode
+             * can only offer the leaf-only O_NOFOLLOW guarantee, which
+             * an intermediate symlink defeats — accepting the config
+             * here would let the directive claim a protection the
+             * platform cannot deliver.
+             */
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "\"compression_dict_strict_path on\" is "
+                               "not supported on this platform (no "
+                               "openat(); the path cannot be resolved "
+                               "one component at a time, so an "
+                               "intermediate symlink could not be "
+                               "refused). Refusing \"%V\" rather than "
+                               "loading it with a weaker guarantee than "
+                               "the directive states", &path);
+            return NGX_CONF_ERROR;
 #endif
 
-            fd = ngx_open_file(path.data, open_mode, NGX_FILE_OPEN, 0);
+        } else {
+            fd = ngx_open_file(path.data,
+                               NGX_FILE_RDONLY | NGX_FILE_NONBLOCK,
+                               NGX_FILE_OPEN, 0);
         }
         if (fd == NGX_INVALID_FILE) {
             if (optional) {
@@ -404,6 +629,35 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
 
 #if !(NGX_WIN32)
+        /*
+         * Ownership, not just the group/other bits (parent #199, M4):
+         * a dictionary owned by an unprivileged account with a
+         * perfectly ordinary mode 0644 passes a group/other-writability
+         * test while a root master reads it — and that owner can
+         * rewrite the file at will, so the next privileged reload
+         * snapshots whatever bytes they chose. Strict mode therefore
+         * requires the file to be owned by the loading principal (the
+         * effective uid of the config-parsing master) or by root,
+         * which is not "less privileged" than any loader that reaches
+         * here.
+         */
+        if (cmcf->dict_strict_path == 1
+            && info.st_uid != geteuid() && info.st_uid != 0)
+        {
+            ngx_close_file(fd);
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "dictionary \"%V\" is owned by uid %uD, "
+                               "neither the loading principal (uid %uD) "
+                               "nor root; refused by "
+                               "\"compression_dict_strict_path on\", "
+                               "because that owner can rewrite the file "
+                               "and steer what a later privileged reload "
+                               "loads", &path,
+                               (uint32_t) info.st_uid,
+                               (uint32_t) geteuid());
+            return NGX_CONF_ERROR;
+        }
+
         /*
          * Strict trust (parent #165): reject a dictionary writable by
          * group or other — a lower-privileged local writer must not be
