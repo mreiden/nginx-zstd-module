@@ -460,3 +460,52 @@ Accept-Encoding: gzip x, zstd
 Content-Encoding: zstd
 --- no_error_log
 [error]
+
+=== TEST 23: a skipped foreign parameter still honours its element's q=0
+# The other half of TEST 15, pinned upstream as the deliberate
+# divergence from core (parent #201/m5): skipping "foo=bar" instead of
+# rejecting the element preserves the trailing q the client actually
+# sent. Core gzip drops the whole element and never sees the q.
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd;foo=bar;q=0
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+=== TEST 24: an origin Vary listing Accept-Encoding among tokens is not doubled
+# parent #200 row n11: the dedup scan must tokenize the existing Vary
+# value on commas — an exact-value compare misses "Accept-Encoding,
+# Cookie" and pushes a second Vary: Accept-Encoding line. gzip_vary
+# stays off so the module's own push path (the one with the scan) runs.
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        add_header Vary "Accept-Encoding, Cookie";
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+Vary: Accept-Encoding, Cookie
+--- raw_response_headers_unlike eval
+qr/Vary: Accept-Encoding\r/
+--- no_error_log
+[error]

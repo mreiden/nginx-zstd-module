@@ -345,13 +345,53 @@ ngx_http_compression_vary(ngx_http_request_t *r)
 
         if (h[i].key.len == sizeof("Vary") - 1
             && ngx_strncasecmp(h[i].key.data, (u_char *) "Vary",
-                               sizeof("Vary") - 1) == 0
-            && h[i].value.len == sizeof("Accept-Encoding") - 1
-            && ngx_strncasecmp(h[i].value.data,
-                               (u_char *) "Accept-Encoding",
-                               sizeof("Accept-Encoding") - 1) == 0)
+                               sizeof("Vary") - 1) == 0)
         {
-            return NGX_OK;
+            /*
+             * "Accept-Encoding" must be matched among the value's
+             * comma-separated tokens (parent #200 row n11): an
+             * exact-value compare misses an origin's
+             * "Vary: Accept-Encoding, Cookie" and doubles the token
+             * on a second line. Trim OWS per token, compare
+             * case-insensitively (the values are header names).
+             */
+            u_char  *p = h[i].value.data;
+            u_char  *end = h[i].value.data + h[i].value.len;
+
+            while (p < end) {
+                u_char  *tstart, *tend;
+
+                while (p < end && (*p == ' ' || *p == '\t')) {
+                    p++;
+                }
+                if (p >= end) {
+                    break;
+                }
+
+                tstart = p;
+                while (p < end && *p != ',') {
+                    p++;
+                }
+                tend = p;
+
+                while (tend > tstart
+                       && (*(tend - 1) == ' ' || *(tend - 1) == '\t'))
+                {
+                    tend--;
+                }
+
+                if (tend - tstart == sizeof("Accept-Encoding") - 1
+                    && ngx_strncasecmp(tstart,
+                                       (u_char *) "Accept-Encoding",
+                                       sizeof("Accept-Encoding") - 1) == 0)
+                {
+                    return NGX_OK;
+                }
+
+                if (p < end && *p == ',') {
+                    p++;
+                }
+            }
         }
     }
 

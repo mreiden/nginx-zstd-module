@@ -72,8 +72,13 @@ typedef struct {
      * the ADVERTISED length; a chunked or lying upstream can stream
      * unbounded input past it (worker CPU/memory exhaustion).
      */
-    size_t                           bytes_in;
-    size_t                           bytes_out;
+    /*
+     * uint64_t, not size_t (parent #200 row m7): on ILP32 a size_t
+     * wraps at 4 GiB, silently corrupting $compression_bytes_* and
+     * $compression_ratio for larger streamed responses.
+     */
+    uint64_t                         bytes_in;
+    uint64_t                         bytes_out;
     ssize_t                          max_length;
 
     /*
@@ -1177,7 +1182,7 @@ static ngx_int_t
 ngx_http_compression_bytes_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *vv, uintptr_t data)
 {
-    size_t                       val;
+    uint64_t                     val;
     ngx_http_compression_ctx_t  *ctx;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_compression_filter_module);
@@ -1189,14 +1194,14 @@ ngx_http_compression_bytes_variable(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    val = *(size_t *) ((char *) ctx + data);
+    val = *(uint64_t *) ((char *) ctx + data);
 
-    vv->data = ngx_pnalloc(r->pool, NGX_SIZE_T_LEN);
+    vv->data = ngx_pnalloc(r->pool, NGX_INT64_LEN);
     if (vv->data == NULL) {
         return NGX_ERROR;
     }
 
-    vv->len = ngx_sprintf(vv->data, "%uz", val) - vv->data;
+    vv->len = ngx_sprintf(vv->data, "%uL", val) - vv->data;
     vv->valid = 1;
     vv->no_cacheable = 0;   /* final value: cache and reuse within request */
     vv->not_found = 0;
