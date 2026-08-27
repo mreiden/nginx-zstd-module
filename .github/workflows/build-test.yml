@@ -127,8 +127,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt profile the bare apt-get lines below rely on: loose
-          # timeouts — shared box, never the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -386,8 +387,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt profile the bare apt-get lines below rely on: loose
-          # timeouts — shared box, never the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -587,8 +589,9 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          # apt profile the bare apt-get lines below rely on: loose
-          # timeouts — shared box, never the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -775,8 +778,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt profile the bare apt-get lines below rely on: loose
-          # timeouts — shared box, never the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1180,8 +1184,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt profile the bare apt-get lines below rely on: loose
-          # timeouts — shared box, never the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1293,8 +1298,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt profile the bare apt-get lines below rely on: loose
-          # timeouts — shared box, never the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1692,8 +1698,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt profile the bare apt-get lines below rely on: loose
-          # timeouts — shared box, never the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1924,8 +1931,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # apt profile the bare apt-get lines below rely on: loose
-          # timeouts — shared box, never the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
