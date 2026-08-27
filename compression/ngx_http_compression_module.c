@@ -2205,6 +2205,19 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             *ctx->last_in = cl;
             ctx->last_in = &cl->next;
         }
+
+        /*
+         * Input is now queued here or inside the encoder (parent's
+         * set site): publish it so the writer keeps re-poking. The
+         * ONLY clear sites are a completed flush and the finish —
+         * the two moments the encoder is genuinely drained. The bit
+         * must not simply track ctx->started: it sits inside
+         * NGX_HTTP_LOWLEVEL_BUFFERED, and holding it across an
+         * unbuffered proxy's flush cycles reads as permanent
+         * congestion upstream — which truncated exactly the
+         * flush-path streams (tools/test_flush_paths.py).
+         */
+        r->connection->buffered |= NGX_HTTP_GZIP_BUFFERED;
     }
 
     if (ctx->nomem) {
@@ -2411,6 +2424,15 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                     ctx->done = 1;
                 }
 
+                /*
+                 * A completed flush or finish means the encoder is
+                 * fully drained — the parent's two clear sites,
+                 * ported: drop the held bit mid-stream at every flush
+                 * completion, not just at the end of the response.
+                 * The matching set is at the input append above.
+                 */
+                r->connection->buffered &= ~NGX_HTTP_GZIP_BUFFERED;
+
                 ob = ctx->ob;
                 ctx->ob = NULL;
 
@@ -2501,30 +2523,24 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 ship:
 
     /*
-     * Publish held state (review round 2): after a PROCESS-only
-     * invocation the response's bytes live in ctx->ob AND inside the
-     * encoder — both libraries buffer internally — while this filter
-     * returns without sending anything downstream. Without a buffered
-     * bit, ngx_http_writer and finalization can treat the response as
-     * idle and stall it until the send timeout. `started` (not just
-     * ctx->ob content) drives the bit because encoder-internal state
-     * is held data too, and it only fully drains at FINISH. PHASE0:
-     * reuses the core gzip bit — defined in every build, and the
-     * elected path latches core gzip off so the owners can never
-     * overlap; a dedicated bit ships with productization. The bit
-     * lives on r->connection->buffered, where core gzip and the
-     * parent keep it: r->buffered is a four-bit field holding only
-     * the low-nibble filter bits, so OR-ing 0x20 into it truncates
-     * to nothing and the whole publication silently never happened.
+     * Held-state publication (review round 2, rounds 3/4 refined):
+     * after a PROCESS-only invocation the response's bytes live in
+     * ctx->ob AND inside the encoder — both libraries buffer
+     * internally — while this filter returns without sending
+     * anything downstream. Without a buffered bit, ngx_http_writer
+     * and finalization can treat the response as idle and stall it
+     * until the send timeout. The bit lives on
+     * r->connection->buffered, where core gzip and the parent keep
+     * it (r->buffered is a four-bit field; OR-ing 0x20 into it
+     * truncates to nothing), and follows the parent's set/clear
+     * discipline — set at the input append above, cleared only at a
+     * completed flush or finish — NOT latched for the stream's
+     * lifetime, which upstream's unbuffered path reads as permanent
+     * NGX_HTTP_LOWLEVEL_BUFFERED congestion. PHASE0: reuses the core
+     * gzip bit — defined in every build, and the elected path
+     * latches core gzip off so the owners can never overlap; a
+     * dedicated bit ships with productization.
      */
-    if (ctx->done) {
-        r->connection->buffered &= ~NGX_HTTP_GZIP_BUFFERED;
-
-    } else if (ctx->started
-               || (ctx->ob != NULL && ctx->ob->last != ctx->ob->pos))
-    {
-        r->connection->buffered |= NGX_HTTP_GZIP_BUFFERED;
-    }
 
     if (out == NULL) {
         if (in == NULL && !ctx->nomem) {
