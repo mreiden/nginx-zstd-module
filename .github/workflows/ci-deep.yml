@@ -130,8 +130,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -257,8 +258,9 @@ jobs:
 
       - name: Install clang + libFuzzer
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -392,8 +394,9 @@ jobs:
           echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -662,8 +665,9 @@ jobs:
           echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -726,8 +730,9 @@ jobs:
           persist-credentials: false
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
