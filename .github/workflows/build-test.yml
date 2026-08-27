@@ -1020,7 +1020,8 @@ jobs:
           # ubuntu-latest resolves apt through azure.archive.ubuntu.com,
           # whose outage shape is ~2 minutes of default Acquire timeout
           # per index file before the runner's mirror list falls back
-          # (#117); the bare apt-get lines below rely on this file.
+          # (the #117 cancellations); the bare apt-get lines below
+          # rely on this file.
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "1";' \
