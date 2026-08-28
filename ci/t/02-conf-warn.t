@@ -16,17 +16,30 @@ our $suite_dir = File::Spec->rel2abs("$dirname/suite");
 local $ENV{'TEST_NGINX_PERL_PATH'} = "$ENV{'PWD'}/$dirname";
 
 my @dynamic_modules;
+our $static_so;    # the static .so alone, for the filterless block
 if (defined $ENV{'TEST_NGINX_BINARY'}) {
     my $nginx_dir = dirname($ENV{'TEST_NGINX_BINARY'});
     for my $module_name (qw(ngx_http_zstd_filter_module.so ngx_http_zstd_static_module.so)) {
         my $module_path = "$nginx_dir/$module_name";
         push @dynamic_modules, $module_path if -f $module_path;
+        $static_so = $module_path
+            if $module_name eq 'ngx_http_zstd_static_module.so'
+               && -f $module_path;
     }
 }
 
 add_block_preprocessor(sub {
     my $block = shift;
     return if !@dynamic_modules;
+
+    # Blocks named "filterless" model the static-only deployment: load
+    # ONLY the static .so, so ngx_http_zstd_filter_module is genuinely
+    # absent from the cycle. Possible on dynamic builds alone — those
+    # blocks skip_eval themselves away when the .so is not there.
+    if (defined($block->name) && $block->name =~ /filterless/ && $static_so) {
+        $block->set_value("main_config", "load_module $static_so;");
+        return;
+    }
 
     my $main_config = join "\n", map { "load_module $_;" } @dynamic_modules;
     $block->set_value("main_config", $main_config);
@@ -687,3 +700,50 @@ Accept-Encoding: zstd
 Content-Encoding: zstd
 --- no_error_log
 [error]
+
+
+
+=== TEST 24: filterless dict bypass warns at config load (identity trap)
+# The static-only deployment (this module's own reason for the split)
+# with zstd_static_dict_bypass on: every matching HTTPS client that
+# acquired an advertised dictionary bypasses its .zst sidecar into a
+# filter that does not exist, and is served identity permanently. The
+# module cannot see per-location filter state across the split, but
+# module-absent IS detectable (the #110 cycle->modules name scan) — one
+# warning at startup. Only expressible on dynamic builds, where the
+# filter .so can genuinely be left unloaded: skip_eval otherwise.
+--- skip_eval: 3: !$::static_so
+--- config
+    location /t {
+        zstd_static on;
+        zstd_static_dict_bypass on;
+        root html;
+    }
+    location /ok { return 200 "up\n"; }
+--- request
+GET /ok
+--- error_code: 200
+--- error_log
+"zstd_static_dict_bypass on" but ngx_http_zstd_filter_module is not loaded
+--- no_error_log
+[emerg]
+
+
+
+=== TEST 25: with the filter module loaded, the bypass warning is silent
+# Control for TEST 24 in both build shapes: dynamic builds load both
+# .so files here (the default preprocessor path), static-linked builds
+# have the filter compiled in — either way the module is present and
+# the warning must not fire.
+--- config
+    location /t {
+        zstd_static on;
+        zstd_static_dict_bypass on;
+        root html;
+    }
+    location /ok { return 200 "up\n"; }
+--- request
+GET /ok
+--- error_code: 200
+--- no_error_log eval
+[qr/zstd_static_dict_bypass on. but ngx_http_zstd_filter_module/, qr/\[emerg\]/]

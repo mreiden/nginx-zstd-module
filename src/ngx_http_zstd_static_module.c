@@ -184,6 +184,17 @@ typedef struct {
      * bit — the two modules latch separately.
      */
     ngx_flag_t  any_enabled;
+
+    /*
+     * "zstd_static_dict_bypass on" parsed anywhere in the config,
+     * latched at directive parse time by
+     * ngx_http_zstd_static_set_dict_bypass_slot() — same conservative
+     * shape as any_enabled above. Read once by
+     * ngx_http_zstd_static_init() to decide whether the
+     * bypass-without-filter warning below applies to this cycle at
+     * all.
+     */
+    ngx_flag_t  dict_bypass_enabled;
 } ngx_http_zstd_static_main_conf_t;
 
 
@@ -196,6 +207,8 @@ static ngx_conf_enum_t  ngx_http_zstd_static[] = {
 
 
 static char * ngx_http_zstd_static_set_enable_slot(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char * ngx_http_zstd_static_set_dict_bypass_slot(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 
 
@@ -210,7 +223,7 @@ static ngx_command_t  ngx_http_zstd_static_commands[] = {
 
     { ngx_string("zstd_static_dict_bypass"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
-      ngx_conf_set_flag_slot,
+      ngx_http_zstd_static_set_dict_bypass_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_zstd_static_conf_t, dict_bypass),
       NULL },
@@ -1733,6 +1746,41 @@ ngx_http_zstd_static_set_enable_slot(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
+/*
+ * Wraps the stock ngx_conf_set_flag_slot() for "zstd_static_dict_bypass"
+ * so every literal "on" parsed anywhere latches
+ * ngx_http_zstd_static_main_conf_t.dict_bypass_enabled — the same
+ * parse-time shape as ngx_http_zstd_static_set_enable_slot() above, and
+ * for the same reason: postconfiguration needs one conservative "does
+ * this cycle use the feature at all" bit without walking the merge tree.
+ */
+static char *
+ngx_http_zstd_static_set_dict_bypass_slot(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_str_t                         *value;
+    char                              *rc;
+    ngx_http_zstd_static_main_conf_t  *zsmcf;
+
+    rc = ngx_conf_set_flag_slot(cf, cmd, conf);
+    if (rc != NGX_CONF_OK) {
+        return rc;
+    }
+
+    value = cf->args->elts;
+
+    if (value[1].len == 2 && ngx_strncasecmp(value[1].data,
+                                             (u_char *) "on", 2) == 0)
+    {
+        zsmcf = ngx_http_conf_get_module_main_conf(cf,
+                                                ngx_http_zstd_static_module);
+        zsmcf->dict_bypass_enabled = 1;
+    }
+
+    return NGX_CONF_OK;
+}
+
+
 static ngx_int_t
 ngx_http_zstd_static_init(ngx_conf_t *cf)
 {
@@ -1754,6 +1802,52 @@ ngx_http_zstd_static_init(ngx_conf_t *cf)
      */
     if (!zsmcf->any_enabled) {
         return NGX_OK;
+    }
+
+    /*
+     * zstd_static_dict_bypass hands matching requests to the FILTER
+     * module's dcz negotiation — a module this one deliberately never
+     * links (the routing predicate cannot read its conf, its store, or
+     * whether it exists). With the filter module absent that handoff
+     * goes nowhere: an HTTPS client that acquired an advertised
+     * dictionary sends Available-Dictionary + dcz on every matching
+     * request from then on, the static handler stands aside every
+     * time, and the response is IDENTITY, permanently, with a usable
+     * .zst sidecar on disk. "A later rejection does not revisit the
+     * skipped sidecar" covers a filter that declines; here there is no
+     * filter to decline. Per-location filter state is unknowable
+     * across the module split, but the catastrophic shape — the
+     * module not present in the cycle at all — is detectable right
+     * here, the same cycle->modules name scan the compression_vary
+     * detection used (#110). A warning rather than an error: the
+     * operator may be mid-migration, and the identity responses are
+     * wrong-but-served, not corrupt.
+     */
+    if (zsmcf->dict_bypass_enabled) {
+        ngx_uint_t  i, filter_present;
+
+        filter_present = 0;
+
+        for (i = 0; cf->cycle->modules[i]; i++) {
+            if (ngx_strcmp(cf->cycle->modules[i]->name,
+                           "ngx_http_zstd_filter_module") == 0)
+            {
+                filter_present = 1;
+                break;
+            }
+        }
+
+        if (!filter_present) {
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "\"zstd_static_dict_bypass on\" but "
+                               "ngx_http_zstd_filter_module is not loaded: "
+                               "dcz can never be negotiated, so requests "
+                               "carrying Available-Dictionary with an "
+                               "explicit dcz will bypass their .zst "
+                               "sidecar and be served identity. Load the "
+                               "filter module or remove "
+                               "zstd_static_dict_bypass");
+        }
     }
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
