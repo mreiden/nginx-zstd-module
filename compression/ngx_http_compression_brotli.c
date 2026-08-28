@@ -219,7 +219,15 @@ ngx_http_compression_brotli_process(void *bctx,
      */
     switch (op) {
     case NGX_HTTP_COMPRESSION_OP_FINISH:
-        io->done = BrotliEncoderIsFinished(b->enc) ? 1 : 0;
+        /*
+         * IsFinished() alone is correct against current libbrotli but
+         * rests on the undocumented invariant that a finished encoder
+         * never holds output; the HasMoreOutput() conjunct costs
+         * nothing and makes all three branches read the same
+         * (round-4 review).
+         */
+        io->done = (BrotliEncoderIsFinished(b->enc)
+                    && !BrotliEncoderHasMoreOutput(b->enc)) ? 1 : 0;
         break;
     case NGX_HTTP_COMPRESSION_OP_FLUSH:
         io->done = (avail_in == 0

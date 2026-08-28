@@ -2053,7 +2053,16 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
                                      r->headers_out.content_length_n)
             != NGX_OK)
         {
-            return NGX_ERROR;
+            /*
+             * A refused hint is a lost optimization, not a lost
+             * response (round-4 review; the parent logs and continues
+             * the same way). Turning it into NGX_ERROR made the
+             * header filter 500 a request the encoder would have
+             * served fine unpledged.
+             */
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                          "compression: %V input-size hint refused; "
+                          "continuing unpledged", &elected->coding);
         }
     }
 
@@ -2410,6 +2419,23 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 ctx->bytes_in += io.in_consumed;
 
                 /*
+                 * Re-assert the held bit on EVERY consuming op, not
+                 * only at the invocation's input append (round-4
+                 * review, on bc36f47): the completed-flush clear below
+                 * runs per op inside this loop, so a chain shaped
+                 * [flush][data] — the postpone filter's product —
+                 * cleared the bit at the flush link and then encoded
+                 * the data link with the bit off and bytes held in the
+                 * encoder. If downstream had drained by then, the
+                 * writer saw an idle connection and the response sat
+                 * until send_timeout. Symmetric per-op tracking
+                 * (consume sets, completed flush/finish clears, in
+                 * loop order) keeps the bit truthful at every exit
+                 * path, ship: included.
+                 */
+                r->connection->buffered |= NGX_HTTP_GZIP_BUFFERED;
+
+                /*
                  * Length-independent input cap (parent parity): the
                  * header gate only sees the DECLARED length; a chunked
                  * or misdeclaring upstream can stream more. Compression
@@ -2486,12 +2512,15 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                      * The op's bytes all left in earlier full-buffer
                      * shipments; the flags must not ride a zero-size
                      * temp buf (ngx_output_chain alerts on those) —
-                     * use a special buf. An empty flush also keeps
-                     * the drained buf for reuse.
+                     * use a special buf. The drained buf goes back to
+                     * ctx->ob unconditionally (round-4 review): on a
+                     * content-less FINISH it used to be abandoned —
+                     * neither reusable nor counted out of
+                     * ctx->allocated. Harmless with the request over,
+                     * but the recycling accounting should stay true
+                     * on every path.
                      */
-                    if (!ctx->done) {
-                        ctx->ob = ob;
-                    }
+                    ctx->ob = ob;
                     ob = ngx_calloc_buf(r->pool);
                     if (ob == NULL) {
                         return NGX_ERROR;
