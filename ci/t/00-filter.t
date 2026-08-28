@@ -3102,3 +3102,82 @@ Accept-Encoding: zstd
 Content-Encoding: zstd
 --- no_error_log
 [error]
+
+
+
+=== TEST 111: streaming zstd_max_length cap — body exactly AT the cap still compresses
+# Boundary coverage for the ctx->bytes_in (uint64_t) vs zlcf->max_length
+# (ssize_t) cap comparison, using the same mock chunked/no-Content-Length
+# upstream fixture as TEST 42. bytes_in accumulates per received chunk and
+# the check only fires once bytes_in EXCEEDS the cap, so a body whose
+# size equals the cap exactly must still pass through and compress
+# normally. The 32-bit-off_t cast defect this cap's comparison guards
+# against is not reachable on this (64-bit off_t) harness -- see
+# ci/tools/test_max_length_cap_unit.sh for the fixture that drives it
+# under a genuine 32-bit off_t build.
+--- config
+    location /filter {
+        zstd on;
+        zstd_min_length 1;
+        zstd_max_length 5000;
+        zstd_types text/plain;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_pass http://127.0.0.1:$TEST_NGINX_SERVER_PORT/up;
+    }
+    location /up {
+        proxy_http_version 1.1;
+        proxy_pass http://127.0.0.1:$TEST_NGINX_RAND_PORT_1/;
+    }
+--- tcp_listen: $TEST_NGINX_RAND_PORT_1
+--- tcp_no_close
+--- tcp_reply eval
+"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+. sprintf("%x\r\n", 5000) . ("A" x 5000) . "\r\n0\r\n\r\n"
+--- request
+GET /filter
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 112: streaming zstd_max_length cap — body one byte OVER the cap aborts
+# Companion to TEST 111, same mock upstream fixture as TEST 42 (which
+# covers a body grossly over the cap; this is the boundary case). One
+# byte past the cap must still trip the abort path -- confirms the >
+# (not >=) comparison at the boundary. As with TEST 42, the aborted
+# connection has no clean chunked terminator, so this only asserts the
+# error_log line under --- ignore_response; Test::Nginx::Socket's
+# response-body checks are skipped together with the parse they depend
+# on, so no additional "body never completed" assertion is available
+# through this harness for a deliberately truncated response.
+--- config
+    location /filter {
+        zstd on;
+        zstd_min_length 1;
+        zstd_max_length 4999;
+        zstd_types text/plain;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_pass http://127.0.0.1:$TEST_NGINX_SERVER_PORT/up;
+    }
+    location /up {
+        proxy_http_version 1.1;
+        proxy_pass http://127.0.0.1:$TEST_NGINX_RAND_PORT_1/;
+    }
+--- tcp_listen: $TEST_NGINX_RAND_PORT_1
+--- tcp_no_close
+--- tcp_reply eval
+"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+. sprintf("%x\r\n", 5000) . ("A" x 5000) . "\r\n0\r\n\r\n"
+--- request
+GET /filter
+--- more_headers
+Accept-Encoding: zstd
+--- ignore_response
+--- error_log
+input exceeded zstd_max_length (4999) on a response with no Content-Length
