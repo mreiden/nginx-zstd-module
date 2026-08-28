@@ -962,3 +962,100 @@ $::skip_dio
 aligned probe on directio file
 --- no_error_log
 [error]
+
+=== TEST 36: a directory named .zst earns no Vary (#202 mirror)
+# The #202 contract: Vary is earned by a USABLE sidecar, not by the
+# probe's attempt. Every listed coding here resolves to nothing usable
+# — the .zst path is a directory — so the identity response carries no
+# Vary and shared caches keep one unfragmented entry for a URI that
+# has no variant.
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst/placeholder" => "x" ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Vary
+--- response_body eval
+$::src
+--- no_error_log
+[emerg]
+
+
+=== TEST 37: a non-zstd .zst earns no Vary (#202 mirror)
+# The frame probe declines it (wrong magic), and a declined sidecar is
+# not a variant: identity, no Vary. The probe's own decline log line is
+# expected — the block asserts no [emerg] rather than a silent log.
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => "definitely not zstd" ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Vary
+--- response_body eval
+$::src
+--- no_error_log
+[emerg]
+
+
+=== TEST 38: an empty .zst earns no Vary (#202 mirror)
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => "" ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Vary
+--- response_body eval
+$::src
+--- no_error_log
+[emerg]
+
+
+=== TEST 39: broken .zst + usable .br + non-accepting client -> Vary, identity
+# The condition eilandert attached to the port: the probe runs
+# INDEPENDENTLY of the client's weights. This client accepts nothing,
+# but the walk still probes past the broken .zst, finds the usable
+# .br, and emits Vary before declining — without that, this identity
+# response would enter shared caches unpartitioned and poison the URI
+# for every .br-accepting client behind the same cache.
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => "definitely not zstd" ],
+  [ "st/hello.js.br" => $::br ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd br;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- raw_response_headers_like: Vary: Accept-Encoding
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- no_error_log
+[emerg]

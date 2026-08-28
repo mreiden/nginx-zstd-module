@@ -708,7 +708,7 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
     ngx_str_t                               path;
     ngx_buf_t                              *b;
     ngx_log_t                              *log;
-    ngx_uint_t                              i, level;
+    ngx_uint_t                              i, level, vary_emitted;
     ngx_chain_t                             out;
     ngx_list_part_t                        *part;
     ngx_table_elt_t                        *h, *ae;
@@ -814,23 +814,27 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
     }
 
     ae = NULL;
+    vary_emitted = 0;
 
+    /*
+     * Negotiated-mode Vary moved INTO the probe loop (parent #202,
+     * eilandert's port ruling on round 4): the header is emitted on
+     * the first sidecar that proves USABLE — after is_dir/is_file and
+     * the frame probe — not before any existence check. A URI whose
+     * every sidecar is missing, a directory, truncated or
+     * window-oversized is not a negotiated variant, and stamping Vary
+     * on its identity response fragmented shared caches for nothing.
+     * The flip side is the condition the ruling attached: the probe
+     * must run INDEPENDENTLY of the client's weights, or a
+     * non-accepting client would never open a sidecar, never learn
+     * one is usable, and its identity response would enter shared
+     * caches with no Vary at all — the poisoning case. So: probe
+     * first, Vary on the first pass, and the weight decides
+     * serve-vs-decline rather than probe-vs-skip. "always" still
+     * never varies (it ignores Accept-Encoding; gzip_static parity).
+     */
     if (conf->enable == NGX_HTTP_COMPRESSION_STATIC_ON) {
-        /*
-         * Negotiated mode varies on Accept-Encoding — requested before
-         * any existence probe so identity fallbacks vary too. "always"
-         * deliberately does NOT: it ignores Accept-Encoding, so the
-         * response genuinely does not vary (gzip_static always
-         * parity).
-         */
-        if (ngx_http_compression_vary(r) != NGX_OK) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-
         ae = ngx_http_compression_ae_header(r);
-        if (ae == NULL || ae->value.len == 0) {
-            return NGX_DECLINED;
-        }
     }
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
@@ -841,16 +845,6 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
     for (i = 0; i < conf->order->nelts; i++) {
 
         c = order[i];
-
-        if (conf->enable == NGX_HTTP_COMPRESSION_STATIC_ON) {
-            /* base codings accept the "*" wildcard, same as the
-             * filter election */
-            w = ngx_http_compression_coding_weight(&ae->value,
-                                                   &c->coding, 1);
-            if (w <= 0) {
-                continue;
-            }
-        }
 
         p = ngx_http_map_uri_to_path(r, &path, &root, c->ext.len + 2);
         if (p == NULL) {
@@ -928,6 +922,41 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
              * unified probe loop is what makes decline-and-log land on
              * a BETTER answer than identity when one exists */
             continue;
+        }
+
+        /*
+         * A USABLE sidecar exists: this URI genuinely varies on
+         * Accept-Encoding, so the header goes out now (#202 contract)
+         * — on the serve path AND on every decline below it, the
+         * non-accepting client included.
+         */
+        if (conf->enable == NGX_HTTP_COMPRESSION_STATIC_ON) {
+
+            if (!vary_emitted) {
+                if (ngx_http_compression_vary(r) != NGX_OK) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+                vary_emitted = 1;
+            }
+
+            if (ae == NULL || ae->value.len == 0) {
+                /*
+                 * Accepts nothing: no coding can serve, and the Vary
+                 * this usable sidecar earned is already out — further
+                 * probes could only confirm what one usable file
+                 * already proved. Identity, correctly partitioned.
+                 */
+                return NGX_DECLINED;
+            }
+
+            /* base codings accept the "*" wildcard, same as the
+             * filter election; a usable-but-unaccepted sidecar keeps
+             * probing — the next coding may be both */
+            w = ngx_http_compression_coding_weight(&ae->value,
+                                                   &c->coding, 1);
+            if (w <= 0) {
+                continue;
+            }
         }
 
         /* ── serve this sidecar ─────────────────────────────────── */
