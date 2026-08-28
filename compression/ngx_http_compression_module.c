@@ -252,6 +252,19 @@ static ngx_command_t  ngx_http_compression_commands[] = {
       offsetof(ngx_http_compression_main_conf_t, dict_strict_path),
       NULL },
 
+    /*
+     * MAIN_CONF like strict_path, same reason: what a supplied hash
+     * literal MEANS is a property of the whole load's trust model,
+     * not of one location. Must precede every compression_dict_file
+     * carrying a literal (enforced in init_main_conf).
+     */
+    { ngx_string("compression_dict_trust_hashes"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_compression_main_conf_t, dict_trust_hashes),
+      NULL },
+
     { ngx_string("compression_dict_assume_secure_transport"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -640,9 +653,11 @@ ngx_http_compression_create_main_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    /* pcalloc zeroes dicts_hashed — cycle-owned, no reset hook */
+    /* pcalloc zeroes dicts_hashed and the ordering records —
+     * cycle-owned, no reset hook */
 
     cmcf->dict_strict_path = NGX_CONF_UNSET;
+    cmcf->dict_trust_hashes = NGX_CONF_UNSET;
 
     return cmcf;
 }
@@ -654,6 +669,31 @@ ngx_http_compression_init_main_conf(ngx_conf_t *cf, void *conf)
     ngx_http_compression_main_conf_t  *cmcf = conf;
 
     ngx_conf_init_value(cmcf->dict_strict_path, 0);   /* off by default */
+    ngx_conf_init_value(cmcf->dict_trust_hashes, 0);  /* verify default */
+
+    /*
+     * Same ordering rejection as strict_path below, with the opposite
+     * polarity: a literal that loaded before a later
+     * "compression_dict_trust_hashes on;" was VERIFIED — correct
+     * bytes, but the hashing pass the directive exists to skip was
+     * silently paid, which at hundreds of dictionaries is the entire
+     * cost. Reject rather than be quietly position-dependent.
+     */
+    if (cmcf->dict_trust_hashes == 1
+        && cmcf->dict_verified_before_trust_on)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"compression_dict_trust_hashes on\" was "
+                           "declared AFTER \"compression_dict_file %V\", "
+                           "whose hash literal had already been verified "
+                           "(hashed) by that point. nginx directives are "
+                           "order-independent by convention, but this one "
+                           "is not: move \"compression_dict_trust_hashes "
+                           "on;\" before every \"compression_dict_file\" "
+                           "directive it must apply to",
+                           &cmcf->dict_verified_before_trust_on_file);
+        return NGX_CONF_ERROR;
+    }
 
     /*
      * Reject the ordering rather than silently accept an unchecked

@@ -20,17 +20,25 @@
  *    store. A level that declares its own compression_dict_file list
  *    replaces the inherited one wholesale (standard array-directive
  *    semantics; the RFC's alias-merge rule).
- *  - An optional second argument supplies the SHA-256 (64 hex chars),
- *    trusted VERBATIM — the deploy-system fast path that takes
- *    config-load hashing to zero. Validated before the file is even
- *    opened (the parent repo's ordering pin).
+ *  - An optional second argument supplies the SHA-256 (64 hex chars).
+ *    By DEFAULT it is VERIFIED against the bytes read (parent #198):
+ *    a mismatch fails the load — or, with "optional", warns and
+ *    re-keys on the computed truth. Under
+ *    "compression_dict_trust_hashes on" (parent #220) the literal is
+ *    trusted VERBATIM instead — the deploy-system fast path that
+ *    takes config-load hashing to zero for that line. Either way the
+ *    literal's syntax is validated before the file is even opened
+ *    (the parent repo's ordering pin).
  *  - "A supplied hash never satisfies a directive that didn't supply
  *    one": when an unsupplied directive references a path whose store
- *    entry knows only a supplied hash, the hash IS computed for that
- *    directive — and since the computation was already paid for, it
- *    doubles as a free cross-check: a mismatch is a config error
- *    (catching exactly the stale-supplied-hash hazard the parent
- *    documents), a match marks the entry verified.
+ *    entry knows only an UNVERIFIED (trusted-verbatim) hash, the hash
+ *    IS computed for that directive — and since the computation was
+ *    already paid for, it doubles as a free cross-check: a mismatch
+ *    is a config error (catching exactly the stale-supplied-hash
+ *    hazard verbatim trust cannot see), a match marks the entry
+ *    verified. Under the verify default every supplied entry is
+ *    verified at first load, so this audit only has work to do under
+ *    trust_hashes — where it remains the safety net.
  *  - Two DIFFERENT paths with the same hash are a config error:
  *    RFC 9842 negotiation keys on the hash, so duplicates would be
  *    ambiguous (parent behavior, kept).
@@ -136,6 +144,32 @@ typedef struct {
      */
     ngx_flag_t    dict_loaded_before_strict_on;
     ngx_str_t     dict_loaded_before_strict_on_file;
+
+    /*
+     * compression_dict_trust_hashes (parent #198 + #220): default off
+     * VERIFIES a supplied hash literal against the bytes read — a
+     * mismatch fails the load (or warns and re-keys under
+     * "optional"), protecting a pipeline whose config generation and
+     * file placement are decoupled. "on" restores the trusted-verbatim
+     * fast path: the literal IS the negotiation key and the load-time
+     * SHA-256 is skipped, which at hundreds of dictionaries is
+     * essentially all of the config-load CPU (parent measured 737
+     * lines: nginx -t 5.1s -> 0.9s, user CPU 4.3s -> 0.03s). Lines
+     * without a literal are hashed under either policy — the per-line
+     * escape hatch under trust — and the unsupplied-reference audit
+     * below stays live under trust as the safety net.
+     */
+    ngx_flag_t    dict_trust_hashes;
+
+    /*
+     * Ordering record, same trap and remedy as the strict_path pair
+     * above: a literal VERIFIED (hashed) because trust did not yet
+     * read "on" at that point in the parse is correct but silently
+     * paid the pass the directive exists to skip; init_main_conf
+     * rejects the ordering when the final value is "on".
+     */
+    ngx_flag_t    dict_verified_before_trust_on;
+    ngx_str_t     dict_verified_before_trust_on_file;
 
     /*
      * "Could this cycle ever compress a response" latch (parent #182),

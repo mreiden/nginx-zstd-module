@@ -61,7 +61,11 @@ GET /w
 
 
 
-=== TEST 2: a supplied hash is the zero-hashing fast path
+=== TEST 2: a supplied hash is verified by default
+# parent #198/#220: the literal declares what the operator believes
+# the file to be, and the default computes the truth to check it — the
+# counter reads 1 where the old trust-verbatim contract read 0. That
+# contract lives on behind compression_dict_trust_hashes (TEST 28).
 --- user_files eval
 [ [ "a.dict" => $::dict_a ] ]
 --- http_config eval
@@ -73,17 +77,20 @@ qq{    compression_dict_file html/a.dict $::hex_a;\n}
     }
 --- request
 GET /w
---- response_body: hashed=0
+--- response_body: hashed=1
 --- no_error_log
 [error]
 
 
 
-=== TEST 3: store dedup + the mandated audit compute, witnessed exactly
-# a.dict supplied at http (0 computes) + b.dict computed (1) + a.dict
-# re-referenced UNSUPPLIED in a location (1 audit compute — "a supplied
-# hash never satisfies a directive that didn't supply one") = 2. The
-# same files referenced from two levels load once each.
+=== TEST 3: store dedup + verified-entry reuse, witnessed exactly
+# a.dict supplied at http (1 verify compute — the #198 default) +
+# b.dict computed (1) + a.dict re-referenced UNSUPPLIED in a location
+# (0 — the entry was verified at load, so the mandated-audit rule has
+# nothing left to check) = 2. Same total as the old trust-verbatim
+# arithmetic (0+1+1), but the passes moved to load time; the audit's
+# own compute is pinned under trust_hashes in TEST 30. The same files
+# referenced from two levels load once each.
 --- user_files eval
 [ [ "a.dict" => $::dict_a ], [ "b.dict" => $::dict_b ] ]
 --- http_config eval
@@ -167,10 +174,11 @@ duplicate dictionary
 
 
 
-=== TEST 8: a stale supplied hash is caught by the mandated audit
-# http supplies a WRONG hash (trusted verbatim, deliberately); the
-# location's unsupplied reference mandates a computation, and the
-# computation doubles as the audit that catches the stale hash
+=== TEST 8: a stale supplied hash is caught at FIRST load (verify default)
+# parent #198: the wrong literal dies at its own line now, naming both
+# values — no unsupplied reference needed to force the audit. The
+# audit-catches-it contract this block used to pin survives under
+# trust_hashes as TEST 30, where the audit is the only net left.
 --- user_files eval
 [ [ "a.dict" => $::dict_a ] ]
 --- http_config eval
@@ -181,8 +189,8 @@ qq{    compression_dict_file html/a.dict $::badhex;\n}
         return 200 "x";
     }
 --- must_die
---- error_log
-does not match the file
+--- error_log eval
+qr/does not match the supplied hash "$::badhex": the file's SHA-256 is "$::hex_a"/
 --- no_error_log
 [alert]
 
@@ -518,5 +526,128 @@ GET /t
 --- error_code: 200
 --- response_body
 ok
+--- no_error_log
+[error]
+
+=== TEST 28: trust_hashes on — the zero-hashing fast path, restored
+# The old TEST 2 contract, now behind the flag (parent #220): a
+# trusted literal contributes ZERO to the counter. Substituting the
+# literal after hashing anyway (trust as a no-op) reads 1 here.
+--- user_files eval
+[ [ "a.dict" => $::dict_a ] ]
+--- http_config eval
+qq{    compression_dict_trust_hashes on;
+    compression_dict_file html/a.dict $::hex_a;\n}
+--- config
+    location /w {
+        default_type text/plain;
+        return 200 "hashed=$compression_dicts_hashed";
+    }
+--- request
+GET /w
+--- response_body: hashed=0
+--- no_error_log
+[error]
+
+
+=== TEST 29: trust_hashes on — a wrong literal LOADS (the operator owns it)
+# The exact config TEST 8 must_die's under the default. The
+# negotiation-level proof that the declared value is the live key is
+# 02-dict-negotiation TEST 28; here the config-load contract: server
+# starts, zero hashing.
+--- user_files eval
+[ [ "a.dict" => $::dict_a ] ]
+--- http_config eval
+qq{    compression_dict_trust_hashes on;
+    compression_dict_file html/a.dict $::badhex;\n}
+--- config
+    location /w {
+        default_type text/plain;
+        return 200 "hashed=$compression_dicts_hashed";
+    }
+--- request
+GET /w
+--- response_body: hashed=0
+--- no_error_log
+[error]
+
+
+=== TEST 30: trust_hashes on — the unsupplied-reference audit is the net
+# "A supplied hash never satisfies a directive that didn't supply one"
+# has real work again under trust: the location's unsupplied reference
+# mandates a computation, and that computation catches the stale
+# trusted literal — TEST 8's old contract, preserved where it is the
+# only check left.
+--- user_files eval
+[ [ "a.dict" => $::dict_a ] ]
+--- http_config eval
+qq{    compression_dict_trust_hashes on;
+    compression_dict_file html/a.dict $::badhex;\n}
+--- config
+    location /t {
+        compression_dict_file html/a.dict;
+        return 200 "x";
+    }
+--- must_die
+--- error_log
+does not match the file
+--- no_error_log
+[alert]
+
+
+=== TEST 31: trust_hashes declared AFTER a literal line is a config error
+# Same ordering trap and remedy as compression_dict_strict_path: the
+# flag is read at parse time, so a literal above the "on" line was
+# verified — correct bytes, but the pass the directive exists to skip
+# was silently paid. Reject rather than be quietly position-dependent.
+--- user_files eval
+[ [ "a.dict" => $::dict_a ] ]
+--- http_config eval
+qq{    compression_dict_file html/a.dict $::hex_a;
+    compression_dict_trust_hashes on;\n}
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+"compression_dict_trust_hashes on" was declared AFTER
+--- no_error_log
+[alert]
+
+
+=== TEST 32: trust_hashes on does not excuse a malformed literal
+# Trust changes what a well-formed literal means, not what a malformed
+# one does: syntax is validated before the file is opened under either
+# policy (and stays FATAL even with "optional", as always).
+--- http_config
+    compression_dict_trust_hashes on;
+    compression_dict_file html/does-not-exist.dict zz11;
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+invalid dictionary hash
+--- no_error_log
+[alert]
+
+
+=== TEST 33: verify default + "optional" — a stale literal warns, computed wins
+# The optional demotion composes with #198's verify exactly like the
+# audit path always did: warn, and the computed truth keys the entry
+# so clients holding the REAL file still negotiate. The counter proves
+# the verify pass ran.
+--- user_files eval
+[ [ "a.dict" => $::dict_a ] ]
+--- http_config eval
+qq{    compression_dict_file html/a.dict $::badhex optional;\n}
+--- config
+    location /w {
+        default_type text/plain;
+        return 200 "hashed=$compression_dicts_hashed";
+    }
+--- request
+GET /w
+--- response_body: hashed=1
+--- error_log
+stale supplied sha256; the file's computed hash wins
 --- no_error_log
 [error]

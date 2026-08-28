@@ -70,7 +70,17 @@ Vary is delegated via `r->gzip_vary` — which the core emits only under
 cycle-global store regardless of how many levels reference them), the
 RFC's provenance rules enforced at config load, and
 `$compression_dicts_hashed` as the observable witness for the dedup
-and the supplied-hash fast path. The branch also carries the full
+and the hash-policy in force. A supplied `sha256hex` is **verified**
+against the bytes read by default (parent #198: a mismatch fails the
+load, naming both values); `compression_dict_trust_hashes on;` (http
+only, default off, parent #220) restores the trusted-verbatim fast
+path — the literal is the negotiation key and the load-time SHA-256
+is skipped for that line, the config-load cost at scale — for
+deployments whose pipeline derives each literal from the exact file
+it ships. It must precede every literal-carrying `compression_dict_file`
+(a later declaration is a config-load error), lines without a literal
+are hashed under either policy, and the "supplied never satisfies
+unsupplied" audit stays live under trust as the safety net. The branch also carries the full
 ngx_brotli hardened-fork history under `brotli/` (subtree merge; the
 fork point is the merge's second parent).
 

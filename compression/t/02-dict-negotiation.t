@@ -35,6 +35,13 @@ our $raw     = sha256($dict);
 our $b64     = encode_base64($raw, "");
 our $bad_b64 = encode_base64("\x00" x 32, "");
 
+# for the trust_hashes-verbatim proof: a well-formed literal that is
+# deliberately NOT the fixture's hash, in every encoding the proof
+# needs (config hex, client base64, prologue raw)
+our $odd_raw = "\x01" x 32;
+our $odd_hex = "01" x 32;
+our $odd_b64 = encode_base64($odd_raw, "");
+
 # dcz: 40-byte skippable frame (magic 0x184D2A5E LE, size 0x20 LE,
 # SHA-256), then the zstd magic of the checksummed stream
 our $dcz_re = qr/^\x5E\x2A\x4D\x18\x20\x00\x00\x00\Q$raw\E\x28\xB5\x2F\xFD/s;
@@ -920,3 +927,38 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
 --- response_headers
 Content-Encoding: zstd
+
+=== TEST 28: trust_hashes on — the DECLARED literal is the live negotiation key
+# The trust-verbatim proof (parent #220), the only observable way: the
+# literal is deliberately not the file's hash, and the client
+# advertising the DECLARED value elects dcz — with the dcz skippable
+# frame embedding the declared bytes, not the computed ones. The
+# file's true hash correspondingly no longer matches (second request
+# degrades to plain zstd). Under the default this config refuses to
+# load (01-dict-store TEST 8).
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config eval
+qq{    compression_dict_trust_hashes on;
+    compression_dict_file html/app.dict $::odd_hex;\n}
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "negotiation fixture body, long enough to compress meaningfully\n";
+    }
+--- request eval
+["GET /t", "GET /t"]
+--- more_headers eval
+[qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::odd_b64:},
+ qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}]
+--- response_headers eval
+["Content-Encoding: dcz",
+ "Content-Encoding: zstd"]
+--- response_body_like eval
+[qr/^\x5E\x2A\x4D\x18\x20\x00\x00\x00\Q$::odd_raw\E\x28\xB5\x2F\xFD/s,
+ qr/^\x28\xB5\x2F\xFD/s]
+--- no_error_log
+[error]

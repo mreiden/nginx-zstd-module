@@ -16,10 +16,10 @@
  * keeps the parent's name because this header keys on it;
  * compression/auto/detect defines it (probe, or nginx's own OpenSSL
  * for static addons), and NGX_HTTP_COMPRESSION_NO_LIBCRYPTO=1 keeps
- * the portable path. EVP matters MORE here than in the parent: the
- * store computes every dictionary's hash at config load — supplied
- * hashes included, the mandated compute doubling as the free audit —
- * so there is no verbatim fast path to hide slow hashing behind.
+ * the portable path. EVP matters here on both policies: the verify
+ * default hashes every dictionary at config load — supplied literals
+ * included — and even under compression_dict_trust_hashes the
+ * unsupplied lines and the reference audit still hash.
  */
 #include "../src/ngx_http_zstd_sha256.h"
 
@@ -330,6 +330,7 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_str_t                          *value, path, hex;
     ngx_fd_t                            fd;
     ssize_t                             n;
+    ngx_flag_t                          trust;
     ngx_uint_t                          i, supplied, optional;
     ngx_file_info_t                     info;
     ngx_http_compression_dict_t       **d, *entry, **dp, **list;
@@ -407,6 +408,22 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
      */
     if (ngx_conf_full_name(cf->cycle, &path, 0) != NGX_OK) {
         return NGX_CONF_ERROR;
+    }
+
+    /*
+     * Raw read, same reasoning as dict_strict_path below: a later
+     * "compression_dict_trust_hashes on;" has not been parsed yet
+     * when this line loads, so a literal verified here silently pays
+     * the pass the operator asked to skip. Record the possibility;
+     * init_main_conf() rejects the ordering if the flag's final value
+     * is "on". Only literal-carrying first loads are affected — the
+     * dedup and audit paths hash under their own rules either way.
+     */
+    trust = (cmcf->dict_trust_hashes == 1);
+
+    if (supplied && !trust && !cmcf->dict_verified_before_trust_on) {
+        cmcf->dict_verified_before_trust_on = 1;
+        cmcf->dict_verified_before_trust_on_file = path;
     }
 
     /* ── store lookup by path: the dedup that makes it ONE copy ──────
@@ -748,18 +765,64 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                                entry->bytes.len);
         }
 
-        if (supplied) {
+        if (supplied && trust) {
+            /*
+             * compression_dict_trust_hashes on: verbatim, zero
+             * hashing — the operator's pipeline is the authority on
+             * the bytes, and the skipped pass (with its
+             * $compression_dicts_hashed increment, the observable
+             * witness) is the whole point. The unsupplied-reference
+             * audit below remains the safety net under trust.
+             */
             ngx_memcpy(entry->sha256, want,
                        NGX_HTTP_COMPRESSION_SHA256_LEN);
             entry->supplied = 1;
-            /* verbatim by design: zero hashing is the whole point of
-             * the deploy-system fast path */
 
         } else {
             ngx_http_zstd_sha256(entry->bytes.data, entry->bytes.len,
                                  entry->sha256);
             cmcf->dicts_hashed++;
             entry->verified = 1;
+
+            /*
+             * Verify default (parent #198): the literal declares what
+             * the operator believes the file to be, and the computed
+             * hash is the truth. "optional" demotes a mismatch to the
+             * audit path's exact remedy — warn, and the computed
+             * truth keys the entry so clients holding the REAL file
+             * still negotiate.
+             */
+            if (supplied
+                && ngx_memcmp(entry->sha256, want,
+                              NGX_HTTP_COMPRESSION_SHA256_LEN) != 0)
+            {
+                if (!optional) {
+                    u_char     chex[NGX_HTTP_COMPRESSION_SHA256_HEX_LEN];
+                    ngx_str_t  chexs;
+
+                    ngx_http_compression_hex_encode(entry->sha256,
+                        NGX_HTTP_COMPRESSION_SHA256_LEN, chex);
+                    chexs.data = chex;
+                    chexs.len = NGX_HTTP_COMPRESSION_SHA256_HEX_LEN;
+
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "dictionary \"%V\" does not match "
+                                       "the supplied hash \"%V\": the "
+                                       "file's SHA-256 is \"%V\" (use "
+                                       "\"compression_dict_trust_hashes "
+                                       "on\" only if your deploy pipeline "
+                                       "owns hash correctness)",
+                                       &path, &hex, &chexs);
+                    return NGX_CONF_ERROR;
+                }
+
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "optional dictionary \"%V\": stale "
+                                   "supplied sha256; the file's computed "
+                                   "hash wins", &path);
+            }
+
+            entry->supplied = supplied ? 1 : 0;
         }
 
         entry->sha256_hex.len = NGX_HTTP_COMPRESSION_SHA256_HEX_LEN;
