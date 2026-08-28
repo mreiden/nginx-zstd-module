@@ -17,6 +17,20 @@ permissions:
   contents: read
 
 on:
+  # push is scoped to the LIVING BRANCH, not removed (round-4 follow-up
+  # with data): the base repo creates no workflow runs for an outside
+  # collaborator's pull_request synchronizes on #117 — its last
+  # compression run there predates this branch's entire catch-up — so
+  # the fork-side push run is the only CI these pushes actually get.
+  # The branch filter keeps the round-3 concern satisfied: a push to
+  # master (base repo included) fires nothing, so there is no
+  # double-run anywhere.
+  push:
+    branches:
+      - phase0
+    paths:
+      - 'compression/**'
+      - '.github/workflows/compression.yml'
   pull_request:
     paths:
       - 'compression/**'
