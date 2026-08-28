@@ -962,3 +962,41 @@ qq{    compression_dict_trust_hashes on;
  qr/^\x28\xB5\x2F\xFD/s]
 --- no_error_log
 [error]
+
+=== TEST 29: dict bypass is main-request-only — a subrequest keeps its sidecar
+# parent #222's gate, back-ported: a subrequest inherits the main
+# request's Available-Dictionary + dcz headers, but the filter never
+# negotiates dictionary codings for subrequests — standing aside would
+# hand the include to a filter that cannot dcz it, losing the sidecar
+# for nothing. The .gz sidecar carries marker bytes (unvalidated by
+# design, WRINKLES 21), so the composed page proves which path served
+# the include: sidecar bytes = the gate held, source bytes = the
+# subrequest wrongly stood aside.
+--- user_files eval
+[ [ "page.shtml" => qq{top[<!--#include virtual="/f/inc.txt" -->]bottom\n} ],
+  [ "f/inc.txt" => "PLAIN-SOURCE-BYTES\n" ],
+  [ "f/inc.txt.gz" => "GZ-SIDECAR-MARKER\n" ],
+  [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /page.shtml {
+        ssi on;
+        default_type text/html;
+        root html;
+    }
+    location /f/ {
+        compression_static on;
+        compression_static_dict_bypass on;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /page.shtml
+--- more_headers eval
+qq{Accept-Encoding: gzip, zstd, dcz\nAvailable-Dictionary: :$::b64:}
+--- response_body_like
+GZ-SIDECAR-MARKER
+--- no_error_log
+[error]

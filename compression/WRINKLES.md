@@ -619,6 +619,22 @@ precompressed delta sidecars (.dcz/.dcb per dictionary x asset),
 which would need negotiation IN the static module and a sidecar per
 pair — post-merge material at best.
 
+Two boundaries settled reviewing the parent's #222 (their port of
+this mechanism): the bypass is MAIN-REQUEST-ONLY — a subrequest
+inherits the main request's headers but the filter never negotiates
+dictionary codings for subrequests, so standing aside would lose the
+include's sidecar with zero upside (their gate, back-ported with a
+fail-first SSI proof). And the bypass deliberately does NOT check
+the secure-context precondition: the honest check is
+"ssl || assume_secure" and the ack lives in the FILTER's conf,
+unreadable across the module split — while a bare-ssl shortcut would
+misfire in exactly the TLS-terminating-proxy topology assume_secure
+exists for, robbing real browsers behind the proxy of the delta path.
+The population that pays for not checking is hand-built clients only:
+browsers gate dictionary storage and advertisement on secure contexts
+CLIENT-side, so over genuine cleartext no browser ever sends
+Available-Dictionary and the bypass never triggers.
+
 Also attributed during the same soak session, for the record: core
 gzip's legacy Accept-Encoding scanner tolerates a space BEFORE
 "gzip" but not after — on (malformed, comma-less) input like

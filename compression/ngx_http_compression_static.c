@@ -751,8 +751,24 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
      * store pays runtime compression instead of the sidecar — rare
      * by construction, since clients only advertise dictionaries
      * whose match pattern covers the URL.
+     *
+     * Main requests only (parent #222's gate, which this port
+     * originally lacked): a subrequest inherits the main request's
+     * headers_in, but the filter never negotiates a dictionary
+     * coding for subrequests — standing aside would hand the
+     * subrequest to a filter that cannot dcz/dcb it, losing the
+     * sidecar with zero upside.
+     *
+     * NO secure-context precheck, deliberately: the honest check is
+     * "ssl || assume_secure" and the ack lives in the filter's conf,
+     * unreadable across the module split — while a bare-ssl shortcut
+     * would misfire in exactly the TLS-terminating-proxy topology the
+     * ack exists for. The cost of not checking lands only on
+     * hand-built clients: browsers gate dictionary advertisement on
+     * secure contexts CLIENT-side, so over genuine cleartext no
+     * browser sends Available-Dictionary and the bypass never fires.
      */
-    if (conf->dict_bypass) {
+    if (conf->dict_bypass && r == r->main) {
 
         part = &r->headers_in.headers.part;
         h = part->elts;
