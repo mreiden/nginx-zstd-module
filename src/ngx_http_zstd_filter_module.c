@@ -1104,7 +1104,15 @@ ngx_http_zstd_profile_pack(ngx_int_t level, ngx_flag_t long_mode,
  * Inverse of ngx_http_zstd_profile_pack() for diagnostics and tests. Kept
  * adjacent to the packer on purpose: the two encode one layout, and splitting
  * them is how a pack/unpack pair drifts.
+ *
+ * Its only in-tree caller is the cctx-reuse debug log in
+ * ngx_http_zstd_acquire_cctx(), which is itself #if (NGX_DEBUG); without the
+ * same guard here a release build trips -Werror=unused-function. The
+ * standalone unit in ci/tools/test_cctx_profile_pack.sh extracts the
+ * "static void" line through the closing brace, so this #if stays outside
+ * that range on purpose -- do not fold it into the signature.
  */
+#if (NGX_DEBUG)
 static void
 ngx_http_zstd_profile_unpack(uint64_t key, ngx_int_t *level,
     ngx_flag_t *long_mode, ngx_int_t *window_log)
@@ -1115,6 +1123,7 @@ ngx_http_zstd_profile_unpack(uint64_t key, ngx_int_t *level,
                                & NGX_HTTP_ZSTD_PROFILE_WLOG_MAX);
     *long_mode = (ngx_flag_t) ((key >> NGX_HTTP_ZSTD_PROFILE_LONG_SHIFT) & 1);
 }
+#endif
 
 
 /*
@@ -3264,24 +3273,29 @@ ngx_http_zstd_acquire_cctx(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx,
             lender = slot;
             borrowed = 1;
 
-            {
-            ngx_int_t   dbg_level, dbg_wlog;
-            ngx_flag_t  dbg_long;
+#if (NGX_DEBUG)
+            if (r->connection->log->log_level & NGX_LOG_DEBUG_HTTP) {
+                ngx_int_t   dbg_level, dbg_wlog;
+                ngx_flag_t  dbg_long;
 
-            /*
-             * Unpack rather than read zlcf: this prints what the SLOT was
-             * built for, which is the thing a reuse decision turns on, and
-             * it exercises the key's reversibility on the hot debug path.
-             */
-            ngx_http_zstd_profile_unpack(slot->profile.key, &dbg_level,
-                                         &dbg_long, &dbg_wlog);
+                /*
+                 * Unpack rather than read zlcf: this prints what the SLOT
+                 * was built for, which is the thing a reuse decision turns
+                 * on, and it exercises the key's reversibility on the hot
+                 * debug path -- gated on NGX_DEBUG and the runtime log
+                 * level so the unpack only runs when the line below will
+                 * actually be emitted.
+                 */
+                ngx_http_zstd_profile_unpack(slot->profile.key, &dbg_level,
+                                             &dbg_long, &dbg_wlog);
 
-            ngx_log_debug5(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "zstd: reusing worker cctx %p (slot:%ui) "
-                           "level:%i long:%i window_log:%i",
-                           ctx->cctx, i, dbg_level, (ngx_int_t) dbg_long,
-                           dbg_wlog);
+                ngx_log_debug5(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                               "zstd: reusing worker cctx %p (slot:%ui) "
+                               "level:%i long:%i window_log:%i",
+                               ctx->cctx, i, dbg_level, (ngx_int_t) dbg_long,
+                               dbg_wlog);
             }
+#endif
             break;
         }
     }
