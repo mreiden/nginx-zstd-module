@@ -52,6 +52,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--nginx-binary", required=True)
     p.add_argument("--port", type=int, default=18193)
+    # The sanitizer mode, same contract as test_slow_drain's: at debug
+    # log level, stock nginx's OWN logging traps UBSan's
+    # nonnull-attribute check on every query-less request
+    # (ngx_http_output_filter's "%V?%V" hands ngx_sprintf_str a NULL
+    # r->args.data — upstream-nginx work in flight, PRs #1671/#1672
+    # and #1679-#1682). At warn the boundary is still FORCED by the
+    # measured buffer sizing and the byte-exact decode oracles still
+    # gate; only the witness-count assertion is skipped, and the
+    # non-sanitized suites job still asserts it.
+    p.add_argument("--log-level", choices=("debug", "warn"),
+                   default="debug")
     return p.parse_args()
 
 
@@ -108,7 +119,8 @@ def decode(coding: str, blob: bytes) -> bytes:
 
 
 def write_conf(root: pathlib.Path, port: int,
-               locations: dict[str, tuple[str, int]]) -> pathlib.Path:
+               locations: dict[str, tuple[str, int]],
+               log_level: str = "debug") -> pathlib.Path:
     """locations: name -> (coding, buffer_size); size 0 = generous."""
     locs = ""
     for name, (coding, bsize) in locations.items():
@@ -127,7 +139,7 @@ def write_conf(root: pathlib.Path, port: int,
 """
     conf = root / "nginx.conf"
     conf.write_text(f"""worker_processes 1;
-error_log {root}/logs/error.log debug;
+error_log {root}/logs/error.log {log_level};
 pid {root}/nginx.pid;
 events {{ worker_connections 64; }}
 http {{
@@ -167,9 +179,10 @@ def main() -> int:
     v = subprocess.run([str(nginx), "-V"], capture_output=True, text=True)
     if "compression" not in v.stderr:
         raise RuntimeError("nginx -V shows no compression module")
-    if "--with-debug" not in v.stderr:
+    if args.log_level == "debug" and "--with-debug" not in v.stderr:
         raise RuntimeError("the witness is an ngx_log_debug line: this "
-                           "tool needs an nginx built --with-debug")
+                           "tool needs an nginx built --with-debug "
+                           "(or --log-level warn to skip the witness)")
 
     os.umask(0o022)
     with tempfile.TemporaryDirectory(prefix="compression-exact-") as td:
@@ -182,7 +195,8 @@ def main() -> int:
 
         # ── phase 1: measure C per coding with a generous buffer ────
         conf = write_conf(root, args.port,
-                          {name: (name, 0) for name in CODINGS})
+                          {name: (name, 0) for name in CODINGS},
+                          args.log_level)
         proc = run_nginx(nginx, root, conf)
         c_of: dict[str, int] = {}
         try:
@@ -211,7 +225,7 @@ def main() -> int:
                 locations[loc] = (name, b)
 
         (root / "logs" / "error.log").unlink()
-        conf = write_conf(root, args.port, locations)
+        conf = write_conf(root, args.port, locations, args.log_level)
         proc = run_nginx(nginx, root, conf)
         failures: list[str] = []
         try:
@@ -230,19 +244,25 @@ def main() -> int:
         finally:
             stop_nginx(proc)
 
-        elog = (root / "logs" / "error.log").read_text("utf-8", "replace")
-        n = elog.count(WITNESS)
-        # every exact-case FINISH plus, for the half cases, nothing
-        # extra (the mid-op exact fill ships WITHOUT done, by design
-        # — only completion-at-boundary logs)
-        if n < len(exact):
-            failures.append(
-                f"witness {WITNESS!r} logged {n} times, expected >= "
-                f"{len(exact)} ({', '.join(exact)}) — the exact-boundary "
-                f"case did not execute (did PROCESS emit early? fixture "
-                f"too large?)")
+        if args.log_level == "debug":
+            elog = (root / "logs" / "error.log").read_text(
+                "utf-8", "replace")
+            n = elog.count(WITNESS)
+            # every exact-case FINISH plus, for the half cases, nothing
+            # extra (the mid-op exact fill ships WITHOUT done, by design
+            # — only completion-at-boundary logs)
+            if n < len(exact):
+                failures.append(
+                    f"witness {WITNESS!r} logged {n} times, expected >= "
+                    f"{len(exact)} ({', '.join(exact)}) — the "
+                    f"exact-boundary case did not execute (did PROCESS "
+                    f"emit early? fixture too large?)")
+            else:
+                print(f"  witness: {WITNESS!r} x{n} across {exact}")
         else:
-            print(f"  witness: {WITNESS!r} x{n} across {exact}")
+            print(f"  witnesses skipped (--log-level {args.log_level}); "
+                  f"boundary still forced by measured sizing, decode "
+                  f"oracles gated above")
 
         if failures:
             sys.stderr.write(f"exact-boundary FAILED ({len(failures)}):\n")

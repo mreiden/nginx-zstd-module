@@ -537,11 +537,28 @@ jobs:
             --nginx-binary "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx"
 
       - name: Slow-drain backpressure + data-less flush (sanitized)
+        # --log-level warn: the tool's own sanitizer mode, built for
+        # exactly this job. At debug log level, stock nginx's OWN
+        # logging traps UBSan on every query-less request
+        # (ngx_http_output_filter's "%V?%V" hands ngx_sprintf_str a
+        # NULL r->args.data — the site family nginx PRs #1671/#1672
+        # and #1679-#1682 address upstream, not yet in the pinned
+        # version; caught by this job's first run). At warn the forced
+        # backpressure paths still run and the byte-exact oracles
+        # still gate; only the debug-line witness assertions are
+        # skipped, and the non-sanitized suites job still asserts
+        # those. Full UB coverage stays on for the module's own code.
         run: |
           python3 compression/tools/test_slow_drain.py \
-            --nginx-binary "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx"
+            --nginx-binary "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx" \
+            --log-level warn
 
       - name: Exact FINISH-on-buffer-end boundary (sanitized)
+        # Same sanitizer mode as slow-drain above, same reason: the
+        # tool's witness needs debug logging, debug logging trips
+        # core's nonnull UB. The boundary is still forced by the
+        # measured sizing and the decode oracles still gate.
         run: |
           python3 compression/tools/test_exact_boundary.py \
-            --nginx-binary "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx"
+            --nginx-binary "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}/objs/nginx" \
+            --log-level warn
