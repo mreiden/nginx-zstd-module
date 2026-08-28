@@ -4632,12 +4632,15 @@ ngx_http_zstd_estimate_cctx_memory(ngx_conf_t *cf,
  * would be a hot-path regression for a constant.
  *
  * Search is a downward walk from NGX_HTTP_ZSTD_DCZ_MAX_WINDOW_LOG to
- * ZSTD_WINDOWLOG_MIN: at most 14 estimate calls, once, and monotonicity of
- * workspace in the window is not assumed. The floor is ZSTD_WINDOWLOG_MIN --
- * returning less would push an invalid windowLog into libzstd. If not even
- * the minimum window fits, the cap is the minimum anyway: the existing
- * nginx -t gate is what refuses an impossible budget, and this function must
- * not invent a second, differently-worded rejection for the same config.
+ * NGX_HTTP_ZSTD_DCZ_MIN_WINDOW_LOG, inclusive: at most 14 estimate calls,
+ * once, and monotonicity of workspace in the window is not assumed. The
+ * floor is NGX_HTTP_ZSTD_DCZ_MIN_WINDOW_LOG -- returning less would push an
+ * invalid windowLog into libzstd. The floor is itself estimated and checked
+ * like every other candidate, rather than assumed to fit by falling out of
+ * the loop unevaluated. If not even the minimum window fits, the cap is the
+ * minimum anyway: the existing nginx -t gate is what refuses an impossible
+ * budget, and this function must not invent a second, differently-worded
+ * rejection for the same config.
  *
  * Writes 0 ("no cap") and succeeds when no budget is configured -- the
  * default, where dcz behaviour must be exactly what it was.
@@ -4658,7 +4661,7 @@ ngx_http_zstd_dcz_window_cap(ngx_conf_t *cf, ngx_http_zstd_loc_conf_t *conf,
     }
 
     for (wlog = NGX_HTTP_ZSTD_DCZ_MAX_WINDOW_LOG;
-         wlog > ZSTD_WINDOWLOG_MIN;
+         wlog >= NGX_HTTP_ZSTD_DCZ_MIN_WINDOW_LOG;
          wlog--)
     {
         if (ngx_http_zstd_estimate_cctx_memory(cf, conf, wlog, &est)
@@ -4670,6 +4673,28 @@ ngx_http_zstd_dcz_window_cap(ngx_conf_t *cf, ngx_http_zstd_loc_conf_t *conf,
         if (est <= (size_t) conf->max_cctx_memory) {
             break;
         }
+    }
+
+    /*
+     * If even NGX_HTTP_ZSTD_DCZ_MIN_WINDOW_LOG did not fit the budget, the
+     * loop above still evaluated it (unlike the old wlog > MIN loop, which
+     * exited with the floor unevaluated) and then decremented past it. Pin
+     * the cap back to the floor: this function must not return a windowLog
+     * below its documented floor.
+     *
+     * NOTE: pinning to the floor here is NOT budget enforcement. The hard
+     * gate in the caller estimates against conf->window_log only, so a
+     * location whose conf->window_log fits the budget while even the DCZ
+     * minimum window does not will load successfully and then apply this
+     * floor, exceeding "zstd_max_cctx_memory" on the dcz path. That
+     * enforcement hole predates this loop change (the old wlog > MIN form
+     * returned the same floor, merely unevaluated) and is preserved here
+     * deliberately: rejecting the config instead would turn "nginx -t" from
+     * pass to fail on configurations that load today. Tracked as its own
+     * row; do not "fix" it inside an unrelated change.
+     */
+    if (wlog < NGX_HTTP_ZSTD_DCZ_MIN_WINDOW_LOG) {
+        wlog = NGX_HTTP_ZSTD_DCZ_MIN_WINDOW_LOG;
     }
 
     *cap = wlog;
