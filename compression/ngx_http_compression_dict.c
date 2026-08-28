@@ -722,6 +722,32 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         entry->path = path;
 
+        /*
+         * off_t bound BEFORE the size_t narrowing (round-4 review,
+         * R3-9; the parent rejects first for the same reason): on
+         * ILP32 a 4 GiB file cast to size_t loads as its low 32 bits,
+         * hashes clean, and serves. The cap itself is the parent's
+         * 10 MB — comfortably above the 8 MB useful-window warning
+         * below, far below anything that can wrap. Demoted to
+         * skip-with-warning under "optional", like the other
+         * size-class load failures.
+         */
+        if (ngx_file_size(&info) > (off_t) (10 * 1024 * 1024)) {
+            ngx_close_file(fd);
+            if (optional) {
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "skipping optional dictionary \"%V\": "
+                                   "%O bytes exceeds the 10 MB limit",
+                                   &path, ngx_file_size(&info));
+                return NGX_CONF_OK;
+            }
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "dictionary \"%V\" too large: %O bytes "
+                               "(limit: 10 MB)",
+                               &path, ngx_file_size(&info));
+            return NGX_CONF_ERROR;
+        }
+
         entry->bytes.len = (size_t) ngx_file_size(&info);
         entry->bytes.data = ngx_palloc(cf->pool, entry->bytes.len);
         if (entry->bytes.data == NULL) {

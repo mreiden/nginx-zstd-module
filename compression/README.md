@@ -95,6 +95,25 @@ negotiate. Malformed hex stays fatal either way. Deploy tooling
 should emit `optional` on generated lines; hand-written critical
 entries stay strict by omitting it.
 
+Two more dict-side policies:
+`compression_dict_strict_path on;` (`http` only, default off, parent
+#165/#199) opts every
+dictionary load into a stricter trust model — the path is resolved
+one component at a time with `openat(O_NOFOLLOW)`, so a symlink
+anywhere in it (a `current -> releases/N` deploy layout included,
+which is why the default stays off) is refused rather than followed,
+`.`/`..` components are rejected, and the file must be owned by the
+loading principal or root and not be group/other-writable. It must
+precede every `compression_dict_file` it applies to; declaring it
+after one is a config-load error rather than a silently unvetted
+load. And `compression_dict_assume_secure_transport on;`
+(`http`/`server`/`location`, default off, parent #158) is the
+TLS-terminating-proxy acknowledgement: dictionary codings are only
+negotiated on a secure context, and when nginx itself sees cleartext
+because a proxy in front terminates TLS, this directive asserts —
+as an operator statement, never inferred from client-settable
+headers — that the hop the client spoke was secure.
+
 **Phase 2** adds unified static sidecar serving: `compression_static
 off|on|always` and `compression_static_order` (tokens `zstd`/`br`/
 `gzip`; the list is the enable set AND the probe order; default
@@ -141,6 +160,12 @@ backend's recommended step size — an explicit size overrides it, and
 the dict-prologue clamp applies either way). At the cap, production
 pauses until the client drains — the backstop that keeps a slow
 client behind a fast upstream from pinning unbounded output memory.
+The num-times-size product is bounded at config load (the parent's
+#167): totals above a hard per-request cap are refused, and
+`compression_buffers_unsafe on` is the explicit acknowledgement that
+accepts a larger total anyway — for the operator who has done the
+arithmetic against their worker memory and wants the cap lifted, with
+the refusal message naming the product it computed.
 The backend roster is also build-conditional
 (`NGX_HTTP_COMPRESSION_HAVE_ZSTD`/`_BROTLI`): a build without one or
 both libraries compiles, elects what remains, rejects absent codings
