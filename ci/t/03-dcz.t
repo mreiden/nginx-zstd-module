@@ -1255,3 +1255,50 @@ Content-Encoding: dcz
 Vary: Available-Dictionary, Accept-Encoding, Sec-Fetch-Site
 --- no_error_log
 [error]
+
+
+
+=== TEST 49: dcz window log is computed exactly once per request
+# ngx_http_zstd_dcz_window_log() used to run twice on a cold dcz request:
+# once in acquire_cctx() to key the CCtx ring slot, once again in
+# init_cctx() to set ZSTD_c_windowLog. Both calls take the same four
+# inputs and cannot observably differ, so a plain response-body test
+# cannot tell one computation from two -- exactly why TEST 46 above passes
+# either way. The debug line at the single memoisation site
+# (ctx->dcz_window_log_cache) is the witness that the value is computed
+# once, not read twice from a shared source that happens to agree: it is
+# logged ONLY on a cache miss, so it appears in the log exactly once per
+# request regardless of how many times the cached value is subsequently
+# read.
+#
+# Falsifiability: the witness is emitted at BOTH memoisation sites
+# (acquire_cctx() and init_cctx()), each inside its own cache-miss guard,
+# so it is logged once per ACTUAL computation rather than once per
+# request. Defeating the memoisation (forcing both guards true) makes the
+# line appear twice and this test goes red on grep_error_log_out, while
+# every byte-level assertion in this suite (TEST 46 included) stays green
+# -- verified by mutation, not assumed. Emitting the witness at only one
+# of the two sites would make this test pass whether the value is computed
+# once or twice; do not "simplify" it that way.
+--- config
+    error_log logs/error.log debug;
+    location /test {
+        zstd on;
+        zstd_types *;
+        zstd_min_length 1;
+        zstd_dcz_dict_file $TEST_NGINX_PERL_PATH/suite/dcz-dict;
+        default_type text/plain;
+        return 200 "dcz window-log single-compute witness body\n";
+    }
+--- request
+GET /test
+--- more_headers eval
+"Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::dict_b64:"
+--- response_headers
+Content-Encoding: dcz
+--- grep_error_log eval
+qr/zstd: dcz window log computed once: \d+/
+--- grep_error_log_out eval
+qr/^zstd: dcz window log computed once: \d+\n?$/
+--- no_error_log
+[error]
