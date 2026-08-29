@@ -211,4 +211,14 @@ still come back gzip-compressed by core gzip; here gzip is part of
 the stack, and "do not compress this endpoint" has to mean the whole
 stack.
 
+A response carrying a `Cache-Control: no-transform` directive is
+served identity with no directive needed (RFC 9110 §7.7; the parent
+repo's #251): every `Cache-Control` line in the response headers is
+checked, the match is per-directive (a quoted parameter value like
+`extension="no-transform"` does not trigger it), and the same
+whole-stack rule applies — the gzip election token is vetoed too.
+Only headers already present when the filter runs count, which in
+practice means proxied/upstream responses; an `add_header` in the
+same location runs after the compression decision.
+
 [myguard-labs/nginx-zstd-module#109]: https://github.com/myguard-labs/nginx-zstd-module/issues/109
