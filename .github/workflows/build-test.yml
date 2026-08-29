@@ -6,8 +6,8 @@ name: Build & Test
 # keep them consistent.
 # actions/checkout@v5.1.0      -> fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 # actions/cache@v5.1.0         -> caa296126883cff596d87d8935842f9db880ef25
-# actions/upload-artifact@v5   -> 330a01c490aca151604b8cf639adc76d48f6c5d4
-# actions/download-artifact@v5 -> 634f93cb2916e3fdff6788551b99b062d0335ce0
+# actions/upload-artifact@v6.0.0 -> b7c566a772e6b6bfb58ed0dc250532a479d7789f
+# actions/download-artifact@v7.0.0 -> 37930b1c2abaa49bbe596cd826c3c89aef350131
 # github/codeql-action/*@v4    -> 8aad20d150bbac5944a9f9d289da16a4b0d87c1e
 
 env:
@@ -457,7 +457,7 @@ jobs:
 
       - name: Upload lint reports
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: lint-reports
           path: |
@@ -687,7 +687,7 @@ jobs:
           "$MATRIX_DIR/objs/$MATRIX_FLAVOR" -V 2>&1
 
       - name: Upload server binary artifact
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: server-binary-${{ matrix.flavor }}-${{ matrix.version }}
           path: ${{ matrix.dir }}/objs/${{ matrix.flavor }}
@@ -1428,7 +1428,7 @@ jobs:
           echo "✓ ASAN+UBSAN nginx binary built (portable SHA-256 in use)"
 
       - name: Upload ASAN nginx binary
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: nginx-binary-asan
           path: nginx-${{ env.NGINX_VERSION }}/objs/nginx
@@ -1509,7 +1509,7 @@ jobs:
             zstd
 
       - name: Download nginx binary (mainline, from build matrix)
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           # The build matrix uploads server-binary-<flavor>-<version>; the
           # full Perl/Python suite runs against nginx mainline specifically.
@@ -1874,7 +1874,7 @@ jobs:
 
       - name: Upload test logs on failure
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: test-logs
           path: |
@@ -1915,7 +1915,7 @@ jobs:
             libperl-dev cpanminus
 
       - name: Download ASAN nginx binary
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: nginx-binary-asan
           path: nginx-bin
@@ -2398,11 +2398,11 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: coverage-report
           path: |
             ${{ github.workspace }}/zstd-coverage.info
             ${{ github.workspace }}/coverage-summary.txt
             ${{ github.workspace }}/coverage-html
-          retention-days: 14
+          retention-days: 7
