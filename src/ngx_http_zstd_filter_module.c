@@ -1404,8 +1404,16 @@ ngx_http_zstd_cache_control_value_no_transform(ngx_table_elt_t *cc)
             end++;
         }
 
+        /*
+         * Cut at '=' as well as ';': the compared token is then the
+         * directive NAME, so "no-transform=arg" -- malformed, since the
+         * directive defines no argument (RFC 9111 §5.2.2.6), but clear
+         * in intent -- is honored rather than transformed. The quoted
+         * parameter-value control is unaffected: extension="no-transform"
+         * cuts to "extension" and still does not match.
+         */
         semi = start;
-        while (semi < end && *semi != ';') {
+        while (semi < end && *semi != ';' && *semi != '=') {
             semi++;
         }
         end = semi;
