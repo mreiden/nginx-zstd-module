@@ -33,3 +33,7 @@ t/suite/* -text
 # Patches are applied with git apply against LF checkouts; CRLF
 # smudging would make every context line mismatch.
 tools/patches/** text eol=lf
+
+# The CPAN dependency lock is byte-compared against cpanm output on a
+# Linux runner: a CRLF smudge turns every line into a mismatch.
+*.cpan.lock text eol=lf
