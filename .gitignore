@@ -20,6 +20,10 @@ objs/
 # Test runner working directories (nginx test::nginx servroot)
 ci/t/servroot/
 ci/t/servroot-*/
+# the compression suites' own (the parent's #239, its analog here:
+# Test::Nginx also creates servroot_<port> variants under prove -j)
+compression/t/servroot/
+compression/t/servroot_*/
 
 # Python bytecode cache (test tooling under tools/)
 __pycache__/

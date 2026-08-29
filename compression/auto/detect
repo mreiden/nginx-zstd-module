@@ -121,7 +121,13 @@ END
         exit 1
     fi
 
-    CFLAGS="$CFLAGS -DZSTD_STATIC_LINKING_ONLY"
+    # NO -DZSTD_STATIC_LINKING_ONLY on CFLAGS (the parent's #237, taken
+    # one step further here): committing it unconditionally both leaked
+    # it into every nginx TU's compile and mislabeled the dynamic-retry
+    # build as a static one. This module needs the define in exactly one
+    # translation unit — ngx_http_compression_zstd.c self-defines it for
+    # its single, documented static-API import (ZSTD_getCParams; see the
+    # ABI note there) — so the flag context carries nothing.
     ngx_compression_incs="$ngx_compression_incs $ZSTD_INC"
     ngx_compression_libs="$ngx_compression_libs $ngx_compression_zstd_L"
     ngx_compression_zstd_found=yes

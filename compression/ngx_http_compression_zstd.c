@@ -14,10 +14,17 @@
 
 /*
  * ZSTD_getCParams (the level->parameters table read the browser
- * window cap needs) sits behind the static-linking-only gate. The
- * symbol is exported by every distribution libzstd and has been
- * shape-stable since 1.4; the parent repo already compiles with this
- * define on its explicit-path builds.
+ * window cap needs) sits behind the static-linking-only gate, and it
+ * is this module's ONE static-API import — accepted deliberately,
+ * with the parent's #237 caveat stated rather than hidden:
+ * ZSTDLIB_STATIC_API symbols carry no dynamic-ABI guarantee upstream,
+ * so a future libzstd.so is nominally free to remove or reshape them.
+ * In practice ZSTD_getCParams is exported by every distribution
+ * libzstd and has been shape-stable since 1.4. The define lives HERE,
+ * in the only TU that needs it, not on CFLAGS (see auto/detect) —
+ * every other libzstd call in this file is stable public API, and if
+ * a stable replacement for the cparams table ever lands, this import
+ * and this comment both go.
  */
 #ifndef ZSTD_STATIC_LINKING_ONLY
 #define ZSTD_STATIC_LINKING_ONLY  1
