@@ -94,18 +94,13 @@ jobs:
           rm -rf "$gnupghome"
 
       - name: Install Test::Nginx
-        # Pinned per upstream #214: an unpinned cpanm resolves to
-        # whatever CPAN serves at run time, so a cold runner can
-        # silently change suite behaviour with no repository diff.
-        # 0.32 is what this install already resolved to.
+        # Pinned per upstream #214 + #249: the @0.32 pin alone still
+        # trusts the CPAN index at run time, so the install script also
+        # asserts the version->dist resolution and diffs the resolver's
+        # dependency graph against the committed lock before installing.
         run: |
-          sudo cpanm --notest --quiet "Test::Nginx::Socket@0.32"
-          installed="$(perl -MTest::Nginx::Socket -e 'print $Test::Nginx::Socket::VERSION')"
-          echo "Test::Nginx::Socket installed version: $installed"
-          if [ "$installed" != "0.32" ]; then
-            echo "::error::Test::Nginx::Socket version mismatch: pinned 0.32, got $installed"
-            exit 1
-          fi
+          TEST_NGINX_SOCKET_VERSION=0.32 \
+            bash compression/tools/install_test_nginx_socket.sh --sudo
 
       - name: Configure and build (debug, both backends)
         run: |
