@@ -395,3 +395,164 @@ GET /b/a.txt
 --- must_die
 --- error_log
 is duplicate
+
+
+=== TEST 10: Cache-Control no-transform serves identity (upstream #251)
+# The gate only sees headers present BEFORE the filter chain runs, so
+# the fixture arrives via a proxied origin — an add_header in the outer
+# location would be added after our filter already decided.
+--- config
+    location /origin/ {
+        compression off;
+        add_header Cache-Control "no-transform";
+        default_type text/plain;
+        return 200 "no-transform fixture body: repeated compressible text\n";
+    }
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        proxy_pass http://127.0.0.1:$server_port/origin/;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+no-transform fixture body: repeated compressible text
+--- no_error_log
+[error]
+
+
+=== TEST 11: Cache-Control public still compresses (negative control)
+--- config
+    location /origin/ {
+        compression off;
+        add_header Cache-Control "public";
+        default_type text/plain;
+        return 200 "no-transform fixture body: repeated compressible text\n";
+    }
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        proxy_pass http://127.0.0.1:$server_port/origin/;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 12: a quoted parameter VALUE of no-transform is not a directive
+# extension="no-transform" names the string, not the directive — the
+# walker cuts each segment at '='/';' and whole-token-compares, so this
+# must keep compressing.
+--- config
+    location /origin/ {
+        compression off;
+        add_header Cache-Control "public, extension=\"no-transform\"";
+        default_type text/plain;
+        return 200 "no-transform fixture body: repeated compressible text\n";
+    }
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        proxy_pass http://127.0.0.1:$server_port/origin/;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 13: OWS, a semicolon parameter, and mixed case still match
+--- config
+    location /origin/ {
+        compression off;
+        add_header Cache-Control " public ; max-age=60 , No-Transform ";
+        default_type text/plain;
+        return 200 "no-transform fixture body: repeated compressible text\n";
+    }
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        proxy_pass http://127.0.0.1:$server_port/origin/;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+no-transform fixture body: repeated compressible text
+--- no_error_log
+[error]
+
+
+=== TEST 14: no-transform on a SECOND Cache-Control line is honored
+--- config
+    location /origin/ {
+        compression off;
+        add_header Cache-Control "public";
+        add_header Cache-Control "no-transform";
+        default_type text/plain;
+        return 200 "no-transform fixture body: repeated compressible text\n";
+    }
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        proxy_pass http://127.0.0.1:$server_port/origin/;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+no-transform fixture body: repeated compressible text
+--- no_error_log
+[error]
+
+
+=== TEST 15: no-transform vetoes the gzip token too (unified delta)
+# Same reasoning as the compression_bypass veto: gzip is part of THIS
+# stack, and a fall-through to core gzip (which ignores no-transform)
+# would defeat the origin's directive.
+--- config
+    location /origin/ {
+        compression off;
+        add_header Cache-Control "no-transform";
+        default_type text/plain;
+        return 200 "no-transform fixture body: repeated compressible text\n";
+    }
+    location /t {
+        compression on;
+        gzip on;
+        gzip_min_length 1;
+        gzip_types text/plain;
+        compression_min_length 1;
+        compression_types text/plain;
+        proxy_pass http://127.0.0.1:$server_port/origin/;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: gzip
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+no-transform fixture body: repeated compressible text
+--- no_error_log
+[error]

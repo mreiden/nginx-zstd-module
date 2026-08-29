@@ -125,6 +125,9 @@ static ngx_int_t ngx_http_compression_ratio_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *vv, uintptr_t data);
 static ngx_int_t ngx_http_compression_bytes_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *vv, uintptr_t data);
+static ngx_int_t ngx_http_compression_cc_value_no_transform(
+    ngx_table_elt_t *cc);
+static ngx_int_t ngx_http_compression_no_transform(ngx_http_request_t *r);
 static ngx_int_t ngx_http_compression_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_compression_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
@@ -1740,6 +1743,115 @@ ngx_http_compression_order(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+/*
+ * Does one Cache-Control value carry a no-transform DIRECTIVE (RFC 9111
+ * §5.2.2.6)? Directives are comma-separated; everything from the first
+ * ';' or '=' onward in a segment is parameter/argument text, so a
+ * quoted parameter VALUE like extension="no-transform" does not match.
+ * Cutting at '=' also keeps a directive named no-transform-something or
+ * no-transform=arg from matching, since the token compare is
+ * whole-segment (upstream #251's walker, with the '=' cut added — his
+ * cuts at ';' only, relying on the trailing quote to break the match
+ * for the quoted case; both reject the same fixtures).
+ */
+static ngx_int_t
+ngx_http_compression_cc_value_no_transform(ngx_table_elt_t *cc)
+{
+    u_char  *p, *last, *start, *end, *cut;
+
+    p = cc->value.data;
+    last = p + cc->value.len;
+
+    while (p < last) {
+        start = p;
+        while (start < last && (*start == ' ' || *start == '\t')) {
+            start++;
+        }
+
+        end = start;
+        while (end < last && *end != ',') {
+            end++;
+        }
+
+        cut = start;
+        while (cut < end && *cut != ';' && *cut != '=') {
+            cut++;
+        }
+        end = cut;
+
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
+            end--;
+        }
+
+        if ((size_t) (end - start) == sizeof("no-transform") - 1
+            && ngx_strncasecmp(start, (u_char *) "no-transform",
+                               sizeof("no-transform") - 1) == 0)
+        {
+            return 1;
+        }
+
+        p = cut;
+        while (p < last && *p != ',') {
+            p++;
+        }
+        if (p < last) {
+            p++;
+        }
+    }
+
+    return 0;
+}
+
+
+/*
+ * RFC 9110 §7.7: no-transform forbids changing the content coding.
+ * The walk covers the whole headers_out list rather than the
+ * headers_out.cache_control chain because only some producers (the
+ * upstream module) wire that chain — a Cache-Control pushed straight
+ * onto the list by a module or an add_header would be invisible there.
+ * Repeated Cache-Control lines are each checked (caches treat them as
+ * one combined list).
+ */
+static ngx_int_t
+ngx_http_compression_no_transform(ngx_http_request_t *r)
+{
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+
+    part = &r->headers_out.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0
+            || h[i].key.len != sizeof("Cache-Control") - 1
+            || h[i].value.len == 0)
+        {
+            continue;
+        }
+
+        if (ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
+                            sizeof("Cache-Control") - 1) == 0
+            && ngx_http_compression_cc_value_no_transform(&h[i]))
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 static ngx_int_t
 ngx_http_compression_header_filter(ngx_http_request_t *r)
 {
@@ -1815,6 +1927,28 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
                        "compression: skip, body %O > compression_max_length "
                        "%O", r->headers_out.content_length_n,
                        (off_t) conf->max_length);
+        return ngx_http_next_header_filter(r);
+    }
+
+    /*
+     * RFC 9110 §7.7 (upstream #251): a response carrying
+     * Cache-Control: no-transform must keep its content coding. Sits
+     * BEFORE any Vary emission — the skip is keyed on a response
+     * header, so the response does not vary on Accept-Encoding.
+     * UNIFIED-MODULE DELTA: the gzip token is part of THIS stack, so
+     * core gzip is vetoed too (same reasoning as compression_bypass
+     * below) — falling through to a core gzip that ignores
+     * no-transform would defeat the origin's directive.
+     */
+    if (ngx_http_compression_no_transform(r)) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "compression: skip, Cache-Control no-transform");
+
+#if (NGX_HTTP_GZIP)
+        r->gzip_tested = 1;
+        r->gzip_ok = 0;
+#endif
+
         return ngx_http_next_header_filter(r);
     }
 
