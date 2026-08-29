@@ -58,6 +58,10 @@ our $skip_ok     = $skip4 . $win8m_desc;    # skippable + 8 MB -> served (dcz sh
 # the skippable-frame walk moves the probe offset to 12 (unaligned), which
 # a raw O_DIRECT read rejects with EINVAL — the #197 regression
 our $skip_dio    = $skip_ok . ("\x5A" x 600);
+# FHD 0x08 = Reserved_bit (RFC 8878 §3.1.1.1, "must be zero") + an
+# otherwise-valid 8 MB window byte: the probe must reject on the bit
+# BEFORE trusting anything else in the header (upstream #252)
+our $reserved    = $magic . "\x08\x68";
 
 # 8 KB of randomness for the directio blocks (compressed output stays
 # ~8 KB, comfortably over the directio threshold)
@@ -1059,3 +1063,29 @@ GET /st/hello.js
 $::src
 --- no_error_log
 [emerg]
+
+
+=== TEST 40: reserved Frame_Header_Descriptor bit declines (upstream #252)
+# RFC 8878 §3.1.1.1: bit 0x08 must be zero and every compliant decoder
+# rejects the frame — serving it would suppress the usable identity
+# fallback with bytes no client can use.
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::reserved ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- error_log
+reserved Frame_Header_Descriptor bit 0x08
+--- no_error_log
+[alert]

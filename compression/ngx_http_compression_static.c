@@ -188,6 +188,7 @@ ngx_module_t  ngx_http_compression_static_module = {
 #define NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED   2
 #define NGX_HTTP_COMPRESSION_STATIC_FRAME_WINDOW_BIG  3
 #define NGX_HTTP_COMPRESSION_STATIC_FRAME_SKIP        4
+#define NGX_HTTP_COMPRESSION_STATIC_FRAME_RESERVED    5
 
 /*
  * How many leading skippable frames the handler follows before it
@@ -402,6 +403,17 @@ ngx_http_compression_static_probe_frame(const u_char *hdr, size_t n,
     }
 
     fhd = hdr[4];
+
+    /*
+     * Frame_Header_Descriptor bit 3 is Reserved_bit (RFC 8878 §3.1.1.1):
+     * "must be zero; a decoder compliant with this version of the
+     * specification must ensure it is not set" — so every decoder a
+     * client runs rejects the frame, and serving it would suppress the
+     * usable identity fallback (upstream #252).
+     */
+    if (fhd & 0x08) {
+        return NGX_HTTP_COMPRESSION_STATIC_FRAME_RESERVED;
+    }
 
     if (!(fhd & 0x20)) {
         /* Window_Descriptor follows */
@@ -648,6 +660,14 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                           "(RFC 8878) — declining so a fallback coding is "
                           "used; recompress with a window log <= 23", path,
                           window);
+            return NGX_DECLINED;
+
+        case NGX_HTTP_COMPRESSION_STATIC_FRAME_RESERVED:
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "compression static: \"%V\" frame header sets "
+                          "reserved Frame_Header_Descriptor bit 0x08 "
+                          "(RFC 8878) — declining so a fallback coding is "
+                          "used", path);
             return NGX_DECLINED;
 
         case NGX_HTTP_COMPRESSION_STATIC_FRAME_SKIP:
