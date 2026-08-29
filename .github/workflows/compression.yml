@@ -117,6 +117,10 @@ jobs:
             --add-module="$GITHUB_WORKSPACE/compression" > configure.log
           grep -q "ZStandard" configure.log
           make -j"$(nproc)"
+          # ZSTD_STATIC_LINKING_ONLY contract (parent #250 analog): the
+          # only ZSTDLIB_STATIC_API import is ZSTD_getCParams
+          bash "$GITHUB_WORKSPACE/compression/tools/check_zstd_linkage.sh" \
+            objs/nginx
 
       - name: Run the Test::Nginx suites
         run: |
