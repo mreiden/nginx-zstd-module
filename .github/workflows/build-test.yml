@@ -1867,6 +1867,16 @@ jobs:
           python3 ci/tools/test_dcz_cache_partition.py \
             --nginx-binary "$TEST_NGINX_BINARY" --port 18120 --origin-port 18121
           echo "✓ RFC 9842 dcz end-to-end test passed"
+          # dcz 40-byte prefix inlining: one compressor-buffer allocation
+          # per response, not a separate dedicated prefix buffer, and the
+          # wire body still decodes byte-exact. Needs --with-debug (same as
+          # the ring-key test above): the allocation-count oracle greps
+          # debug log lines ("zstd get_buf: allocated buffer" /
+          # "zstd dcz: 40-byte frame header queued"). This tool previously
+          # existed in ci/tools/ but was never wired into any CI job.
+          python3 ci/tools/test_dcz_prefix_alloc.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18311
+          echo "✓ dcz prefix single-allocation regression passed"
 
       - name: Test summary
         if: success()
@@ -1968,6 +1978,17 @@ jobs:
           export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static-${RUN_ID}-${JOB_NAME}"
           mkdir -p "$TEST_NGINX_SERVROOT"
           perl ci/t/01-static.t > ci/t/static-asan.log 2>&1 || true
+
+          # NOTE (A29-F7, deferred): this lane still cannot tell "no
+          # sanitizer report" from "the suite never ran". A TAP/executed-
+          # count gate was implemented and DID work -- and immediately
+          # went red here, because nginx under ASan stops accepting on
+          # 127.0.0.1:2024 partway through: 00-filter.t bails at TEST 39
+          # and 01-static.t executed 22 of its 774 assertions
+          # (run 33229149473). That is a real, PRE-EXISTING defect this
+          # lane has been masking via `|| true`, not a gate bug. Fixing
+          # the bind failure is a prerequisite for landing the gate, so
+          # the gate is held back rather than shipped red.
           # Gate strictly on sanitizer reports attributable to this module.
           if cat /tmp/asan-zstd.* ci/t/filter-asan.log ci/t/static-asan.log 2>/dev/null \
                | grep -nE 'ngx_http_zstd' \
