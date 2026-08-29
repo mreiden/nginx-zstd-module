@@ -1053,19 +1053,11 @@ jobs:
           # NOT carry -DZSTD_STATIC_LINKING_ONLY: those declarations
           # (ZSTDLIB_STATIC_API) have no stable ABI, so importing them
           # into a dynamically linked module is unsupported even when the
-          # symbols happen to resolve today. Confirm none of the four
-          # static-only entry points the module's estimator/params code
-          # can reference are undefined imports of this binary.
+          # symbols happen to resolve today. Keep the denied-symbol list
+          # shared with the dynamic-module artifact gate.
           ls "$HOME"/zstd14/lib/libzstd.a 2>/dev/null && \
             { echo "FAIL: static archive present, this leg no longer tests the dynamic-only fallback"; exit 1; }
-          for sym in ZSTD_createCCtxParams ZSTD_CCtxParams_setParameter \
-                     ZSTD_estimateCStreamSize_usingCCtxParams ZSTD_freeCCtxParams; do
-            if nm -D --undefined-only objs/nginx | awk '{print $NF}' | grep -qx "$sym"; then
-              echo "FAIL: dynamic-only build imports static-only symbol $sym"
-              exit 1
-            fi
-          done
-          echo "✓ dynamic-only libzstd build carries no ZSTDLIB_STATIC_API imports"
+          "$GITHUB_WORKSPACE/ci/tools/check-zstd-dynamic-linkage.sh" objs/nginx
 
       - name: Assert the private 1.4.x HEADERS were really compiled against
         run: |
