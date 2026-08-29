@@ -224,6 +224,16 @@ http {{
             zstd_types application/javascript;
             proxy_pass http://127.0.0.1:{backend_port}/cache-control-no-transform-ows.js;
         }}
+        location = /cache-control-no-transform-arg.js {{
+            types {{
+                application/javascript js;
+            }}
+            default_type application/javascript;
+            zstd on;
+            zstd_min_length 1;
+            zstd_types application/javascript;
+            proxy_pass http://127.0.0.1:{backend_port}/cache-control-no-transform-arg.js;
+        }}
         location = /cache-control-no-transform-repeat.js {{
             types {{
                 application/javascript js;
@@ -249,6 +259,7 @@ class CacheControlHandler(http.server.BaseHTTPRequestHandler):
         "/cache-control-no-transform-comma.js": ["public, no-transform"],
         "/cache-control-no-transform-ows.js": [" public ; max-age=60 , No-Transform "],
         "/cache-control-no-transform-repeat.js": ["public", "no-transform"],
+        "/cache-control-no-transform-arg.js": ["public, no-transform=1"],
     }
 
     def do_GET(self) -> None:
@@ -309,6 +320,11 @@ def validate_cache_control_no_transform(port: int, expected: bytes) -> None:
         "/cache-control-no-transform-comma.js",
         "/cache-control-no-transform-ows.js",
         "/cache-control-no-transform-repeat.js",
+        # Malformed but intent-clear: the directive defines no argument
+        # (RFC 9111 5.2.2.6), so an origin writing no-transform=1 gets
+        # honored, not transformed -- the walker compares the directive
+        # name, cut at '='.
+        "/cache-control-no-transform-arg.js",
     ):
         body, encoding, _ = fetch_path(port, path)
         if encoding:
