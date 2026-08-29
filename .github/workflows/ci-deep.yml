@@ -30,7 +30,7 @@ name: CI Deep
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v5.1.0      -> fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-# actions/upload-artifact@v5   -> 330a01c490aca151604b8cf639adc76d48f6c5d4
+# actions/upload-artifact@v6.0.0 -> b7c566a772e6b6bfb58ed0dc250532a479d7789f
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -350,23 +350,23 @@ jobs:
 
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: fuzz-deep-crashes
           path: |
             ${{ github.workspace }}/ci/fuzz/crash-*
             ${{ github.workspace }}/ci/fuzz/crash-dcz-*
-          retention-days: 30
+          retention-days: 7
 
       - name: Upload minimized corpus
         if: success()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: fuzz-corpus
           path: |
             ${{ github.workspace }}/ci/fuzz/corpus-min
             ${{ github.workspace }}/ci/fuzz/corpus-dcz-min
-          retention-days: 30
+          retention-days: 7
 
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
@@ -630,14 +630,14 @@ jobs:
           exit "$rc"
       - name: Upload memcheck TAP logs
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: harness-memcheck-tap-logs
           path: |
             vg-fault-arms.log
             vg-fault-palloc.log
             vg-alloc-neutral.log
-          retention-days: 14
+          retention-days: 7
           if-no-files-found: ignore
       - name: Notify Discord on failure
         if: failure() && github.event_name == 'schedule'
@@ -820,14 +820,14 @@ jobs:
             "$GITHUB_WORKSPACE/src/" 2>&1 | tee semgrep.log
       - name: Upload reports
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: security-reports
           path: |
             ${{ github.workspace }}/flawfinder.log
             ${{ github.workspace }}/clang-tidy.log
             ${{ github.workspace }}/semgrep.log
-          retention-days: 14
+          retention-days: 7
 
   # Coverage is a REPORT, never a gate (step 26) -- the cheapest way to move
   # the number is a test that touches a line and asserts nothing, so a floor
@@ -896,8 +896,8 @@ jobs:
         run: bash ci/tools/coverage.sh nginx
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: coverage-report
           path: .build/coverage-report/
-          retention-days: 14
+          retention-days: 7

@@ -6,7 +6,7 @@ name: Fuzzing
 #
 # Action pins (keep in sync with build-test.yml header):
 # actions/checkout@v5.1.0      -> fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-# actions/upload-artifact@v5   -> 330a01c490aca151604b8cf639adc76d48f6c5d4
+# actions/upload-artifact@v6.0.0 -> b7c566a772e6b6bfb58ed0dc250532a479d7789f
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -158,10 +158,10 @@ jobs:
 
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: fuzz-fast-crashes
           path: |
             ${{ github.workspace }}/ci/fuzz/crash-*
             ${{ github.workspace }}/ci/fuzz/crash-dcz-*
-          retention-days: 14
+          retention-days: 7
