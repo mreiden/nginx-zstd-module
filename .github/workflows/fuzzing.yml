@@ -84,7 +84,7 @@ jobs:
             fi
           done < "$case_list"
           if [ "${#cases[@]}" -eq 0 ]; then
-            echo "no recorded regressions yet (ci/fuzz/regressions/ is empty)"
+            echo "no crash-* regression inputs found in ci/fuzz/regressions/; inspected $total corpus entries"
           else
             echo "replaying ${#cases[@]} recorded crash(es); inspected $total corpus entries"
             ./fuzz_accept_encoding "${cases[@]}"
@@ -118,7 +118,7 @@ jobs:
             fi
           done < "$case_list"
           if [ "${#cases[@]}" -eq 0 ]; then
-            echo "no recorded dcz regressions yet (ci/fuzz/regressions_dcz/ is empty)"
+            echo "no crash-* dcz regression inputs found in ci/fuzz/regressions_dcz/; inspected $total corpus entries"
           else
             echo "replaying ${#cases[@]} recorded dcz crash(es); inspected $total corpus entries"
             ./fuzz_dcz "${cases[@]}"
