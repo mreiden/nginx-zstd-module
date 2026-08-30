@@ -150,6 +150,12 @@ jobs:
       - name: Dictionary read-completeness unit test (short reads / EINTR / EOF)
         run: bash compression/tools/test_read_dict_file_unit.sh
 
+      - name: Input-chain cursor unit oracle (ownership, ordering, alloc failure)
+        # The parent's test_input_chain_cursor_unit shape: the extracted
+        # production helpers against a pool shim -- the retained-before-
+        # cursor drain order is not wire-testable (round 5 blocker).
+        run: bash compression/tools/test_input_chain_cursor_unit.sh
+
   gzipless:
     name: Build without the gzip module (no compat)
     runs-on: ubuntu-latest

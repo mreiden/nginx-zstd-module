@@ -133,6 +133,10 @@ static ngx_int_t ngx_http_compression_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
 static ngx_int_t ngx_http_compression_retain_input(ngx_http_request_t *r,
     ngx_http_compression_ctx_t *ctx, ngx_chain_t *in);
+static ngx_buf_t *ngx_http_compression_next_in_buf(
+    ngx_http_compression_ctx_t *ctx, ngx_chain_t *in, ngx_uint_t *retained);
+static void ngx_http_compression_consume_in_link(ngx_http_request_t *r,
+    ngx_http_compression_ctx_t *ctx, ngx_chain_t **in, ngx_uint_t retained);
 
 
 static ngx_conf_enum_t  ngx_http_compression_http_version_enum[] = {
@@ -2450,6 +2454,68 @@ ngx_http_compression_retain_input(ngx_http_request_t *r,
 }
 
 
+/*
+ * Which link feeds the encoder next: retained links (an earlier
+ * callback's tail, pool-owned) drain before this callback's cursor —
+ * input order is byte order. Extracted (with consume below and
+ * retain_input above) so tools/test_input_chain_cursor_unit.sh can
+ * compile the ownership/ordering contract against a pool shim: the
+ * retained-vs-cursor overlap needs upstream data landing while a tail
+ * is retained, a timing window no wire test schedules reliably.
+ */
+static ngx_buf_t *
+ngx_http_compression_next_in_buf(ngx_http_compression_ctx_t *ctx,
+    ngx_chain_t *in, ngx_uint_t *retained)
+{
+    if (ctx->in != NULL) {
+        *retained = 1;
+        return ctx->in->buf;
+    }
+
+    if (in != NULL) {
+        *retained = 0;
+        return in->buf;
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Link consumed. A retained link is pool-owned: free it (review round
+ * 1 — these used to accumulate for the request's lifetime). A cursor
+ * link is CALLER-owned: never free it — ngx_free_chain() overwrites
+ * cl->next, which would corrupt the upstream filter's chain while its
+ * callback is active — just advance past it (parent #260).
+ */
+static void
+ngx_http_compression_consume_in_link(ngx_http_request_t *r,
+    ngx_http_compression_ctx_t *ctx, ngx_chain_t **in, ngx_uint_t retained)
+{
+    ngx_chain_t  *cl;
+
+    if (retained) {
+        cl = ctx->in;
+        ctx->in = cl->next;
+        ngx_free_chain(r->pool, cl);
+
+        /*
+         * Just freed the last retained link: ngx_free_chain() has
+         * overwritten cl->next, so ctx->last_in (which pointed at it)
+         * is now dangling into the pool free-list. Re-point it at the
+         * head slot, or the next tail retention would splice into the
+         * free list and hang the request (parent #157's regression).
+         */
+        if (ctx->in == NULL) {
+            ctx->last_in = &ctx->in;
+        }
+
+    } else {
+        *in = (*in)->next;
+    }
+}
+
+
 static ngx_int_t
 ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
@@ -2568,14 +2634,9 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     out = NULL;
     last_out = &out;
 
-    while (ctx->in != NULL || in != NULL) {
-
-        /*
-         * Retained links (an earlier callback's tail, pool-owned) drain
-         * before this callback's cursor — input order is byte order.
-         */
-        retained = (ctx->in != NULL);
-        b = retained ? ctx->in->buf : in->buf;
+    while ((b = ngx_http_compression_next_in_buf(ctx, in, &retained))
+           != NULL)
+    {
 
         /*
          * PHASE0: in-memory bufs only (wrinkle #9: chassis complexity,
@@ -2801,34 +2862,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
              * fresh output space */
         }
 
-        /*
-         * Link consumed. A retained link is pool-owned: free it
-         * (review round 1 — these used to accumulate for the request's
-         * lifetime). A cursor link is CALLER-owned: never free it —
-         * ngx_free_chain() overwrites cl->next, which would corrupt the
-         * upstream filter's chain while its callback is active — just
-         * advance past it (parent #260).
-         */
-        if (retained) {
-            cl = ctx->in;
-            ctx->in = cl->next;
-            ngx_free_chain(r->pool, cl);
-
-            /*
-             * Just freed the last retained link: ngx_free_chain() has
-             * overwritten cl->next, so ctx->last_in (which pointed at
-             * it) is now dangling into the pool free-list. Re-point it
-             * at the head slot, or the next tail retention would splice
-             * into the free list and hang the request (parent #157's
-             * regression).
-             */
-            if (ctx->in == NULL) {
-                ctx->last_in = &ctx->in;
-            }
-
-        } else {
-            in = in->next;
-        }
+        ngx_http_compression_consume_in_link(r, ctx, &in, retained);
     }
 
 ship:
