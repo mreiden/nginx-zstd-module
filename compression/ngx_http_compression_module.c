@@ -131,6 +131,8 @@ static ngx_int_t ngx_http_compression_no_transform(ngx_http_request_t *r);
 static ngx_int_t ngx_http_compression_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_compression_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
+static ngx_int_t ngx_http_compression_retain_input(ngx_http_request_t *r,
+    ngx_http_compression_ctx_t *ctx, ngx_chain_t *in);
 
 
 static ngx_conf_enum_t  ngx_http_compression_http_version_enum[] = {
@@ -2392,12 +2394,44 @@ ngx_http_compression_get_buf(ngx_http_request_t *r,
 }
 
 
+/*
+ * Copy the caller-owned cursor's remaining links onto ctx->in (parent
+ * #260): the O(1) tracked-tail append that used to run on EVERY
+ * incoming link (#157/#176) now runs only for input that survives its
+ * own callback. The buffers are shared, request-lifetime; only the
+ * link wrappers are pool-copied — the same split ngx_chain_add_copy()
+ * makes. Appends through last_in because an earlier callback's
+ * retained links may still queue under downstream backpressure.
+ */
+static ngx_int_t
+ngx_http_compression_retain_input(ngx_http_request_t *r,
+    ngx_http_compression_ctx_t *ctx, ngx_chain_t *in)
+{
+    ngx_chain_t  *cl;
+
+    for ( /* void */ ; in != NULL; in = in->next) {
+        cl = ngx_alloc_chain_link(r->pool);
+        if (cl == NULL) {
+            return NGX_ERROR;
+        }
+
+        cl->buf = in->buf;
+        cl->next = NULL;
+
+        *ctx->last_in = cl;
+        ctx->last_in = &cl->next;
+    }
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
     ngx_int_t                    rc;
     ngx_buf_t                   *b;
-    ngx_uint_t                   last_seen, flush_seen;
+    ngx_uint_t                   last_seen, flush_seen, retained, had_input;
     ngx_chain_t                 *out, **last_out, *cl;
     ngx_http_compression_op_e    op;
     ngx_http_compression_io_t    io;
@@ -2409,29 +2443,20 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         return ngx_http_next_body_filter(r, in);
     }
 
-    if (in != NULL) {
-        /*
-         * O(1) append (parent #157/#176): allocate one fresh link per
-         * incoming buffer and splice it onto the tracked tail, advancing
-         * the tail in the same pass — instead of ngx_chain_add_copy(),
-         * which re-walks ctx->in from the head to find its tail on every
-         * callback (O(n^2) as the retained backlog grows under
-         * backpressure). The consumer below only ever advances ctx->in
-         * link-by-link from the head and frees drained links, so the
-         * tracked tail cannot go stale mid-chain.
-         */
-        ngx_chain_t  *cl_in;
+    had_input = (in != NULL);
 
-        for (cl_in = in; cl_in != NULL; cl_in = cl_in->next) {
-            cl = ngx_alloc_chain_link(r->pool);
-            if (cl == NULL) {
-                return NGX_ERROR;
-            }
-            cl->buf = cl_in->buf;
-            cl->next = NULL;
-            *ctx->last_in = cl;
-            ctx->last_in = &cl->next;
-        }
+    if (had_input) {
+        /*
+         * Lazy retention (parent #260, superseding the #157/#176
+         * copy-all append): no link copies up front. The caller-owned
+         * chain is consumed through the local `in` cursor in the loop
+         * below — its links are safe to walk only while this callback
+         * is active, but the BUFFERS have request lifetime, so only
+         * link wrappers ever need pool-owned copies, and only for the
+         * unconsumed tail at ship: when backpressure makes input
+         * survive the callback. The fast path (everything consumed
+         * this invocation) allocates no links at all.
+         */
 
         /*
          * Input is now queued here or inside the encoder (parent's
@@ -2486,9 +2511,11 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
      * content-derived and can be as small as 7 bytes (review round
      * 2). Emitted on the first invocation that carries input — a
      * zero-body response still gets it, since the last_buf special
-     * buf arrives through ctx->in like any other link.
+     * buf arrives through the input cursor like any other link.
      */
-    if (ctx->prologue_len > 0 && !ctx->prologue_sent && ctx->in != NULL) {
+    if (ctx->prologue_len > 0 && !ctx->prologue_sent
+        && (ctx->in != NULL || in != NULL))
+    {
 
         /* first invocation with input: the cap cannot be reached yet */
         if (ngx_http_compression_get_buf(r, ctx) != NGX_OK) {
@@ -2517,9 +2544,14 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     out = NULL;
     last_out = &out;
 
-    while (ctx->in != NULL) {
+    while (ctx->in != NULL || in != NULL) {
 
-        b = ctx->in->buf;
+        /*
+         * Retained links (an earlier callback's tail, pool-owned) drain
+         * before this callback's cursor — input order is byte order.
+         */
+        retained = (ctx->in != NULL);
+        b = retained ? ctx->in->buf : in->buf;
 
         /*
          * PHASE0: in-memory bufs only (wrinkle #9: chassis complexity,
@@ -2746,28 +2778,54 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         }
 
         /*
-         * Link consumed: free it (review round 1 — these used to
-         * accumulate for the request's lifetime; core gzip frees them
-         * too, and this is separate from the declared no-recycling
-         * cut, which is about OUTPUT bufs).
+         * Link consumed. A retained link is pool-owned: free it
+         * (review round 1 — these used to accumulate for the request's
+         * lifetime). A cursor link is CALLER-owned: never free it —
+         * ngx_free_chain() overwrites cl->next, which would corrupt the
+         * upstream filter's chain while its callback is active — just
+         * advance past it (parent #260).
          */
-        cl = ctx->in;
-        ctx->in = cl->next;
-        ngx_free_chain(r->pool, cl);
+        if (retained) {
+            cl = ctx->in;
+            ctx->in = cl->next;
+            ngx_free_chain(r->pool, cl);
 
-        /*
-         * Just freed the last retained link: ngx_free_chain() has
-         * overwritten cl->next, so ctx->last_in (which pointed at it)
-         * is now dangling into the pool free-list. Re-point it at the
-         * head slot, or the next callback's append would splice into
-         * the free list and hang the request (parent #157's regression).
-         */
-        if (ctx->in == NULL) {
-            ctx->last_in = &ctx->in;
+            /*
+             * Just freed the last retained link: ngx_free_chain() has
+             * overwritten cl->next, so ctx->last_in (which pointed at
+             * it) is now dangling into the pool free-list. Re-point it
+             * at the head slot, or the next tail retention would splice
+             * into the free list and hang the request (parent #157's
+             * regression).
+             */
+            if (ctx->in == NULL) {
+                ctx->last_in = &ctx->in;
+            }
+
+        } else {
+            in = in->next;
         }
     }
 
 ship:
+
+    /*
+     * Retain the unconsumed tail (parent #260): every non-error path
+     * from here on can return to the caller, and the cursor's links die
+     * with its callback — move what survives onto pool-owned links now.
+     * One site covers all of them, and the outer cycle's resume path
+     * then consumes from ctx->in like any earlier callback's tail. On
+     * the fast path `in` is already NULL and this is free. A partial
+     * allocation failure deliberately leaves the links already copied
+     * on ctx->in: NGX_ERROR is terminal, they are never resumed.
+     */
+    if (in != NULL) {
+        if (ngx_http_compression_retain_input(r, ctx, in) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        in = NULL;
+    }
 
     /*
      * Held-state publication (review round 2, rounds 3/4 refined):
@@ -2790,7 +2848,7 @@ ship:
      */
 
     if (out == NULL) {
-        if (in == NULL && !ctx->nomem) {
+        if (!had_input && !ctx->nomem) {
             /*
              * Writer-driven pass (review round 2): nothing of ours to
              * emit, but the chain below may hold undelivered output —
