@@ -1,11 +1,11 @@
 name: Valgrind
 
-# Valgrind memcheck-lite soak on every PR/push — 60s soak against a debug
+# Targeted manual Valgrind memcheck-lite soak — 60s against a debug
 # nginx build so PR feedback stays quick. The full memcheck + helgrind soak
-# lives in ci-deep.yml (monthly cron + workflow_dispatch).
+# lives in ci-deep.yml (weekly cron + workflow_dispatch).
 #
 # Action pins (keep in sync with build-test.yml header):
-# actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/checkout@v5.1.0        -> fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
@@ -45,8 +45,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \

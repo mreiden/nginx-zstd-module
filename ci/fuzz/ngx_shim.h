@@ -38,6 +38,10 @@ typedef unsigned char u_char;
  * exceed NGX_HTTP_ZSTD_SHA256_DIGEST_LEN. */
 #define NGX_HTTP_ZSTD_DCZ_DECODE_BUF_LEN  48
 
+/* src/ngx_http_zstd_filter_module.c: padded base64 length of a 32-byte
+ * digest, the length ceiling dcz_decode_digest() rejects above. */
+#define NGX_HTTP_ZSTD_DCZ_DIGEST_B64_LEN  44
+
 typedef struct {
     size_t  len;
     u_char *data;
@@ -45,6 +49,52 @@ typedef struct {
 
 /* src/core/ngx_string.h: ngx_tolower(c) — ASCII-only, no locale. */
 #define ngx_tolower(c) (u_char) ((c >= 'A' && c <= 'Z') ? (c | 0x20) : c)
+
+/*
+ * src/core/ngx_config.h defines ngx_inline as the platform's inline
+ * keyword (`inline` on every compiler this suite builds with). The sliced
+ * parser uses it on ngx_http_zstd_accept_encoding(), which the module TUs
+ * no longer reference -- inline is what keeps a plain `static` from
+ * tripping -Werror=unused-function there. The extracted .inc carries the
+ * keyword verbatim, so this layer has to spell it too.
+ */
+#define ngx_inline  inline
+
+/*
+ * ngx_table_elt_t, reduced to the two fields the chained-Accept-Encoding
+ * walker touches: the field value and the ->next link nginx >= 1.23.0
+ * uses to chain duplicate occurrences of the same header. `hash`/`key`
+ * are omitted deliberately -- the walker never reads them, and a field
+ * this layer does not need is a field that can drift.
+ */
+typedef struct ngx_table_elt_s  ngx_table_elt_t;
+
+struct ngx_table_elt_s {
+    ngx_str_t         value;
+    ngx_table_elt_t  *next;
+};
+
+/*
+ * The production header selects between (ae)->next and a NULL stub on
+ * `nginx_version >= 1023000`, because ngx_table_elt_t.next does not
+ * exist before 1.23.0. This layer has no nginx tree and no
+ * nginx_version, so it pins the modern shape -- which is the one the
+ * chained-header behaviour exists for, and therefore the one worth
+ * testing. The pre-1.23 arm degrades to "no next line", i.e. the
+ * single-value behaviour these tests already cover through
+ * ngx_http_zstd_accept_encoding().
+ */
+#define nginx_version  1023000
+
+/*
+ * The chain step, mirrored from src/ngx_http_zstd_common.h. The macro is
+ * defined OUTSIDE any function body there, so extract_parser.sh -- which
+ * slices function bodies -- does not carry it into the .inc and this
+ * layer has to supply it. Kept byte-identical to the production
+ * nginx_version >= 1023000 arm; the pre-1.23 arm is the NULL stub, whose
+ * behaviour is the single-value path these tests already cover.
+ */
+#define NGX_HTTP_ZSTD_AE_NEXT(ae)  ((const ngx_table_elt_t *) (ae)->next)
 
 /*
  * src/core/ngx_string.c: ngx_strncasecmp() — faithful upstream copy.

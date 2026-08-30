@@ -49,6 +49,8 @@ typedef intptr_t       ngx_int_t;
 typedef uintptr_t      ngx_uint_t;
 typedef unsigned char  u_char;
 
+#define ngx_memcpy  memcpy
+
 /*
  * From <zstd.h>, stable since 0.8.0. Reproduced rather than included so
  * this layer needs no libzstd headers -- same reasoning as ngx_shim.h for
@@ -66,6 +68,8 @@ typedef unsigned char  u_char;
 #define NGX_HTTP_ZSTD_STATIC_FRAME_NOT_ZSTD    1
 #define NGX_HTTP_ZSTD_STATIC_FRAME_TRUNCATED   2
 #define NGX_HTTP_ZSTD_STATIC_FRAME_WINDOW_BIG  3
+#define NGX_HTTP_ZSTD_STATIC_FRAME_SKIP        4
+#define NGX_HTTP_ZSTD_STATIC_FRAME_RESERVED    5
 
 /*
  * Included by RELATIVE path, not via -I, for the same reason
@@ -95,17 +99,19 @@ check(int ok, const char *what)
 
 
 /*
- * Poisoned probe buffer: 18 usable bytes preceded and followed by a guard
- * region of 0xA5. A read past either end that happens to land on a guard
+ * Poisoned, deliberately unaligned probe buffer: 18 usable bytes preceded
+ * and followed by a guard region of 0xA5. The backing array is uint64_t-
+ * aligned and the one-byte leading guard offsets every probe address. A read
+ * past either end that happens to land on a guard
  * byte changes the verdict (0xA5A5A5A5 is neither magic), and the trailing
  * guard is what would absorb an off-by-one in the "enough bytes for this
  * layout" checks -- so a mutant that reads hdr[n] instead of stopping is
  * reading a defined, wrong value rather than heap garbage that might
  * happen to be correct.
  */
-#define GUARD  8
+#define GUARD  1
 
-static u_char  buf[GUARD + 18 + GUARD];
+static _Alignas(uint64_t) u_char  buf[GUARD + 18 + GUARD];
 
 
 static const u_char *
@@ -231,32 +237,90 @@ case_valid_zst_frame(void)
 
 
 /*
- * A skippable leading frame is a legal start to a zstd stream and is
- * exempt from the window check -- the real header sits after a
- * variable-length skip. All 16 skippable magics must be accepted, and none
- * of them may fall through into the regular-frame window parse (which
- * would read a Window_Descriptor out of what is actually a length field).
+ * Zstd reserves Frame_Header_Descriptor bit 0x08. A static sidecar with that
+ * bit set is not a valid frame; the handler must decline it and fall back to
+ * the uncompressed file rather than serving undecodable bytes.
  */
 static void
-case_skippable_frame_accepted_and_window_exempt(void)
+case_reserved_descriptor_bit(void)
+{
+    static const u_char  f[] = { MAGIC, 0x08, 0x00 };
+    uint64_t             w;
+
+    check(probe(f, sizeof(f), &w) == NGX_HTTP_ZSTD_STATIC_FRAME_RESERVED,
+          "a frame descriptor with reserved bit 0x08 is RESERVED");
+}
+
+
+/*
+ * A skippable leading frame is a legal start to a zstd stream, but the
+ * probe itself never certifies one OK: it returns SKIP with the declared
+ * skip length, and it is the CALLER's job (the handler's bounded walk,
+ * covered in ci/t/01-static.t, not here) to resolve the skip and probe
+ * whatever frame follows before deciding. All 16 skippable magics must
+ * take this path, and none of them may fall through into the
+ * regular-frame window parse (which would read a Window_Descriptor out of
+ * what is actually a length field) or -- the bug this replaces -- be
+ * certified OK on the magic alone.
+ */
+static void
+case_skippable_frame_reports_skip_not_ok(void)
 {
     uint64_t  w;
     int       i, ok = 1;
 
     for (i = 0; i < 16; i++) {
-        /* ZSTD_MAGIC_SKIPPABLE_START | i, little-endian, then a frame
-         * length field whose bytes would decode as a 128 MB window if the
-         * regular-frame path were wrongly taken. */
+        /* ZSTD_MAGIC_SKIPPABLE_START | i, little-endian, then a
+         * declared skip length of 0xFFFFFFFF -- the caller must reject
+         * this against of.size, not the probe. */
         u_char  f[] = { 0x50 + (u_char) i, 0x2A, 0x4D, 0x18,
                         0xFF, 0xFF, 0xFF, 0xFF };
 
-        if (probe(f, sizeof(f), &w) != NGX_HTTP_ZSTD_STATIC_FRAME_OK) {
+        w = 0;
+
+        if (probe(f, sizeof(f), &w) != NGX_HTTP_ZSTD_STATIC_FRAME_SKIP
+            || w != 0xFFFFFFFFU)
+        {
             ok = 0;
         }
     }
 
-    check(ok, "all 16 skippable-frame magics are OK and exempt from the "
-              "window check");
+    check(ok, "all 16 skippable-frame magics report SKIP with the declared "
+              "skip length, never OK on the magic alone");
+}
+
+
+/*
+ * A skippable frame's 8-byte header (magic + Frame_Size) is the outermost
+ * bound the probe can check without file-level knowledge: fewer than 8
+ * bytes and it cannot even read the length field. These fixtures mirror
+ * the "widest header, one byte short" boundary test above, but for the
+ * skip-header layout.
+ */
+static void
+case_skippable_frame_header_truncation(void)
+{
+    uint64_t  w;
+
+    static const u_char  magic_only[] = { 0x50, 0x2A, 0x4D, 0x18 };
+    check(probe(magic_only, sizeof(magic_only), &w)
+              == NGX_HTTP_ZSTD_STATIC_FRAME_TRUNCATED,
+          "a 4-byte skippable magic with no Frame_Size field is TRUNCATED");
+
+    static const u_char  seven[] = { 0x50, 0x2A, 0x4D, 0x18,
+                                     0x00, 0x00, 0x00 };
+    check(probe(seven, sizeof(seven), &w)
+              == NGX_HTTP_ZSTD_STATIC_FRAME_TRUNCATED,
+          "a 7-byte skippable header (Frame_Size one byte short) is "
+          "TRUNCATED");
+
+    static const u_char  eight[] = { 0x50, 0x2A, 0x4D, 0x18,
+                                     0x00, 0x00, 0x00, 0x00 };
+    w = 123;
+    check(probe(eight, sizeof(eight), &w) == NGX_HTTP_ZSTD_STATIC_FRAME_SKIP
+              && w == 0,
+          "an exact 8-byte skippable header with a zero-length payload "
+          "is SKIP with skip length 0");
 }
 
 
@@ -551,7 +615,9 @@ main(void)
     case_smallest_complete_streaming_header();
     case_exactly_probe_buffer_size();
     case_valid_zst_frame();
-    case_skippable_frame_accepted_and_window_exempt();
+    case_reserved_descriptor_bit();
+    case_skippable_frame_reports_skip_not_ok();
+    case_skippable_frame_header_truncation();
     case_magic_mismatch();
     case_zero_length_file_never_reaches_the_probe();
     case_single_segment_content_size_widths();

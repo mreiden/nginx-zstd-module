@@ -4,10 +4,10 @@ name: Build & Test
 # This pin table is the canonical reference for ALL workflow files
 # (build-test.yml, codeql.yml, security-scanners.yml, fuzzing.yml) —
 # keep them consistent.
-# actions/checkout@v5          -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
-# actions/cache@v4             -> 0057852bfaa89a56745cba8c7296529d2fc39830
-# actions/upload-artifact@v5   -> 330a01c490aca151604b8cf639adc76d48f6c5d4
-# actions/download-artifact@v5 -> 634f93cb2916e3fdff6788551b99b062d0335ce0
+# actions/checkout@v5.1.0      -> fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+# actions/cache@v5.1.0         -> caa296126883cff596d87d8935842f9db880ef25
+# actions/upload-artifact@v6.0.0 -> b7c566a772e6b6bfb58ed0dc250532a479d7789f
+# actions/download-artifact@v7.0.0 -> 37930b1c2abaa49bbe596cd826c3c89aef350131
 # github/codeql-action/*@v4    -> 8aad20d150bbac5944a9f9d289da16a4b0d87c1e
 
 env:
@@ -16,6 +16,19 @@ env:
   # the current mainline release and feeds it via needs.resolve.outputs.*; per-
   # job env: blocks below override this placeholder with the resolved value.
   NGINX_VERSION: ""
+  # Single source of truth for every `cpanm ... Test::Nginx::Socket` call
+  # site in this file (keep in sync with ci-deep.yml's own copy). An
+  # unpinned `cpanm Test::Nginx::Socket` resolves to whatever CPAN serves
+  # at run time -- a cold runner can silently change test behaviour with
+  # no repository diff, and a warm cache can retain a different historical
+  # release, so two runners can disagree with nothing in git explaining
+  # it. Pinned to 0.32 because that is what every install site already
+  # resolved to as of this pin (verified against a recent successful CI
+  # run's "Install Test::Nginx::Socket" log: "Test::Nginx::Socket is up to
+  # date. (0.32)"), which is also CPAN's current latest release -- this
+  # pin is a no-op in behaviour, not a dependency bump.
+  TEST_NGINX_SOCKET_VERSION: "0.32"
+  TEST_NGINX_SOCKET_DIST: "AGENT/Test-Nginx-0.32.tar.gz"
   # The `resolve` job scrapes nginx.org for the current mainline release at run
   # time and feeds it to every job via `needs.resolve.outputs.nginx_version`
   # (and the build matrix JSON). This makes the weekly cron actually test the
@@ -83,7 +96,7 @@ jobs:
 
     steps:
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
@@ -94,33 +107,64 @@ jobs:
       # so a broken workflow fails fast and obviously.
       - name: Lint workflows (actionlint)
         run: |
+          set -euo pipefail
           ACTIONLINT_VERSION=1.7.7
+          # Pinned sha256 for the linux_amd64 release asset, computed once
+          # from an HTTPS fetch and cross-checked against the checksums.txt
+          # rhysd publishes alongside each release -- same "reviewed pin,
+          # verify before use" shape as ci/tools/ci-build.sh's NGINX_SHA256 /
+          # ANGIE_SHA256 tables. A version bump is a reviewed PR that updates
+          # this hash, not a runtime fetch of a fresher one.
+          ACTIONLINT_SHA256=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
           curl -fsSL -o /tmp/actionlint.tgz \
             "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          actual="$(sha256sum /tmp/actionlint.tgz | awk '{print $1}')"
+          if [ "$actual" != "$ACTIONLINT_SHA256" ]; then
+            echo "✗ sha256 mismatch for actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" >&2
+            echo "  expected: $ACTIONLINT_SHA256" >&2
+            echo "  actual:   $actual" >&2
+            rm -f /tmp/actionlint.tgz
+            exit 1
+          fi
+          echo "✓ sha256 verified for actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
           tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
           /tmp/actionlint -color "$GITHUB_WORKSPACE"/.github/workflows/*.yml
           echo "✓ actionlint: workflows valid"
 
       - name: Cache apt packages
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          path: /var/cache/apt/archives
-          key: apt-validation-${{ runner.os }}-shellcheck-cppcheck-clang-tools-nginx-dev
+          # User-owned dir, not the system /var/cache/apt/archives: apt runs
+          # under sudo, so the post-step tar (unprivileged runner user) cannot
+          # read the root-owned archives/lock or archives/partial (c2).
+          #
+          # Glob the .deb files rather than the directory: apt recreates
+          # `partial/` (0700 _apt:root) and `lock` (root:root) INSIDE whatever
+          # Dir::Cache::archives points at, so caching the dir itself still
+          # gives tar two unreadable entries and it exits 2 -> "Failed to
+          # save" (a warning, so CI stays green while nothing is ever cached).
+          # Only the .deb files are worth caching anyway.
+          path: ${{ runner.temp }}/apt-archives/*.deb
+          key: apt-validation-${{ runner.os }}-shellcheck-cppcheck-clang-tools-nginx-dev-gcc-multilib
           restore-keys: apt-validation-${{ runner.os }}-
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
+          mkdir -p "$RUNNER_TEMP/apt-archives"
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
             'Acquire::http::Timeout "20";' \
             'Acquire::https::Timeout "20";' \
+            "Dir::Cache::archives \"$RUNNER_TEMP/apt-archives\";" \
             | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            gcc-multilib \
             libpcre2-dev \
             zlib1g-dev \
             shellcheck \
@@ -144,7 +188,10 @@ jobs:
       - name: Python unit tests (test harness self-checks)
         run: |
           cd "$GITHUB_WORKSPACE/ci/tools"
-          python3 -m unittest -v test_test_encoding test_test_package_artifact
+          python3 -m unittest -v \
+            test_test_encoding \
+            test_test_package_artifact \
+            test_perf_stat_recipe
 
       # Cheapest test layer over the real pure decision functions -- the
       # Accept-Encoding parser and the .zst frame-header probe: no nginx
@@ -172,6 +219,12 @@ jobs:
       - name: ci-build.sh clean-root + provenance regressions (F2/F3)
         run: bash "$GITHUB_WORKSPACE"/ci/tools/test_ci_build_provenance.sh
 
+      - name: nginx tarball PGP verifier controls
+        run: bash "$GITHUB_WORKSPACE"/ci/tools/test_verify_nginx_tarball.sh
+
+      - name: nginx-module-testkit scenario runner controls
+        run: bash "$GITHUB_WORKSPACE"/ci/tools/test_run_testkit_scenarios.sh
+
       - name: Shell script linting (shellcheck)
         run: |
           # Gate on error-severity findings (real bugs); style/info noise does
@@ -190,6 +243,180 @@ jobs:
           # compiler.
           bash "$GITHUB_WORKSPACE"/ci/tools/test_sha256_unit.sh
 
+      - name: ceil_log2 unit fixture (dcz window-log helper equivalence)
+        run: |
+          # grind-g6-nits: ngx_http_zstd_ceil_log2() (dcz window-log sizing)
+          # was shipped with an inverted power-of-two test and fixed in
+          # c264f4b. static inside the filter module, so this extracts the
+          # function verbatim by line range and checks it against a linear
+          # shift-and-count reference over 0..2^24 (every power of two
+          # through 2^23 included) — needs only a C compiler.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_ceil_log2_unit.sh
+
+      - name: CCtx profile key unit fixture (collision-free + reversible)
+        run: |
+          # The worker CCtx ring partitions slots on a packed 64-bit key
+          # built from (level, long_mode, window_log). The key must be
+          # collision-free and reversible, NOT a hash: two profiles sharing
+          # a key would share a CCtx and silently change bytes on the wire.
+          # Extracts the packer, unpacker and their layout defines verbatim
+          # from the module and sweeps the full in-domain tuple space,
+          # asserting reversibility (hence injectivity) plus fail-closed
+          # refusal of out-of-domain values — needs only a C compiler.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_cctx_profile_pack.sh
+
+      - name: dcz window-log unit fixture (clamps + range)
+        env:
+          # gcc-multilib is installed above, so a missing -m32 toolchain
+          # here means the runner image regressed, not that multilib is
+          # optionally absent -- fail loudly instead of silently losing
+          # the 32-bit off_t lens (see the scripts' own comments).
+          REQUIRE_M32: "1"
+        run: |
+          # ngx_http_zstd_dcz_window_log() is the single source of truth for
+          # a value derived in TWO places that must never disagree: the CCtx
+          # ring key and the windowLog pushed into libzstd. Extracts it (and
+          # ngx_http_zstd_ceil_log2(), its dependency) verbatim and sweeps
+          # every dictionary size across the power-of-two boundaries x both
+          # pledged-size branches x every value of both operator ceilings,
+          # asserting the default is unchanged when neither is set, that a
+          # ceiling only ever lowers the window, that the lower of the two
+          # wins, and that the result stays inside the 6-bit window_log
+          # field the profile packer refuses to mask. Needs only a C compiler.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_dcz_window_log_unit.sh
+
+          # ngx_http_zstd_read_dict_file(): the shared read-to-completion
+          # loop both dictionary loaders use. Extracts the helper verbatim
+          # and drives it against a scripted ngx_read_fd stub, because the
+          # three behaviours that matter -- a short count is resumed, EINTR
+          # is retried without losing progress, and early EOF is fatal --
+          # are not reachable from a config-level fixture on a local
+          # filesystem (see the note in test_dict_path_hardening.sh).
+          # Needs only a C compiler.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_read_dict_file_unit.sh
+
+          # ngx_http_zstd_max_length_exceeded(): the length-independent
+          # zstd_max_length cap checked per iteration of the streaming body
+          # filter. Extracts the predicate verbatim and asserts an unset cap
+          # never fires, a body exactly at the cap does not, one byte over
+          # does, and a bytes_in far past INT32_MAX still compares correctly
+          # against a small cap. That last case only diverges from the
+          # historical signed-cast form on a genuine 32-bit off_t build
+          # (plain -m32, no _FILE_OFFSET_BITS override); a native 64-bit
+          # build cannot reach it, so the -m32 pass is not optional
+          # coverage. Needs only a C compiler.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_max_length_cap_unit.sh
+
+          # The normal body-filter path walks caller-owned chain links through
+          # a local cursor and allocates wrappers only for a tail retained
+          # across callbacks. Extracts the shipped cursor/copy helpers and
+          # pins fully drained zero-allocation, partial/backpressured input,
+          # retained-before-new ordering, many links, flush/last carriers and
+          # lazy-copy allocation failure without mutating caller links.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_input_chain_cursor_unit.sh
+
+      - name: compressBound skip gate unit fixture (size_t-width correctness)
+        run: |
+          # A27-F4: get_buf()'s ZSTD_compressBound() skip is gated on a
+          # compile-time proof that off_t's range cannot reach
+          # ZSTD_MAX_INPUT_SIZE -- but that libzstd constant is itself
+          # size_t-width-dependent (0xFF00FF00FF00FF00 on an 8-byte size_t,
+          # 0xFF00FF00 on a 4-byte one), so an off_t-only gate is wrong on
+          # an ILP32 target built with a 64-bit off_t
+          # (_FILE_OFFSET_BITS=64). This repo builds and tests only on
+          # LP64 hosts, where the old (wrong) and the corrected gate
+          # evaluate identically, so this is the only way to observe the
+          # difference without standing up a cross-compiled ILP32 leg.
+          # Extracts the shipped #if/#endif verbatim and evaluates it
+          # under substituted NGX_MAX_OFF_T_VALUE/SIZE_MAX pairs for
+          # LP64, ILP32+64-bit-off_t and plain ILP32. Needs only a C
+          # compiler.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_compressbound_skip_gate.sh
+
+      - name: soak.sh ASAN/UBSAN verdict unit fixture (A27-F9)
+        run: |
+          # A27-F9: ci/tools/soak.sh's ASan/UBSan check used to fail on
+          # whether "$WORK/logs/asan*" merely EXISTED, never reading its
+          # content -- so LeakSanitizer's own "ptrace appears to be
+          # blocked" startup diagnostic (this runner pool's LXC
+          # seccomp/yama profile blocks its exit-time tracer; see
+          # test_reload_leak.sh and the smoke-tests step above for the
+          # same signature) failed the soak exactly like a real finding.
+          # Observed in CI: PR #214 run 33117464973 job "A/UBSan" attempt
+          # 1 failed on pure ptrace noise with all four soak workers
+          # clean; attempt 2 (identical build) passed.
+          # ci/tools/soak_asan_verdict.sh now extracts the fixed triage
+          # (real finding -> fail, ptrace-blocked -> INDETERMINATE warn,
+          # no log/no finding -> pass) into one function soak.sh sources,
+          # and this fixture drives it directly against ptrace-only,
+          # real-ASan, real-UBSan and absent-log cases, plus a negative
+          # control proving the original ls-only gate fails on the
+          # ptrace-only fixture. No nginx, no libzstd -- pure Bash.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_soak_asan_verdict_unit.sh
+
+      - name: LSan positive control unit fixture (smoke-tests clean-vs-could-not-run)
+        run: |
+          # The "Run smoke tests under ASAN+UBSAN" step's leak verdict
+          # already told a real finding from a ptrace-blocked log (the
+          # soak_asan_verdict() shape, A27-F9), but a log with NEITHER
+          # signature only means "no finding was written" -- it does not
+          # prove LSan's exit-time check ran at all. Observed in CI: run
+          # 33084048220 ("Tests ASAN+UBSAN" job) printed "All smoke tests
+          # clean under ASAN+UBSAN" from a /tmp/lsan-smoke.* log with
+          # neither shape, and SECONDS later in the SAME job the
+          # zstd_dict_file reload-leak step hit the ptrace-blocked
+          # signature 4/4 -- same runner, same environment. That "clean"
+          # was indistinguishable from "never ran".
+          # ci/tools/lsan_positive_control.sh (extracted from the canary
+          # test_reload_leak.sh already used) now gates the smoke step's
+          # "clean" branch on independently proving a deliberate leak IS
+          # caught here; if the control fails, the step demotes to a
+          # loud, distinct "INDETERMINATE (could not run)" instead of a
+          # silent green. This fixture drives the real if/elif/else +
+          # control shape against finding / ptrace-signature /
+          # clean-but-control-fails / clean-and-control-passes fixtures,
+          # runs the control function for real, and ends with a negative
+          # control proving the pre-fix (no control) shape would have
+          # reported the run-33084048220 case as clean. Needs a working
+          # `cc`; skips (does not fail) if none is on PATH.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_lsan_positive_control_unit.sh
+
+      - name: static pread retry/accumulate unit fixture (EINTR, short read, O_DIRECT alignment)
+        run: |
+          # ngx_http_zstd_static_pread(): the static probe's retry/accumulate
+          # loop. Extracts the helper verbatim and drives it against a
+          # scripted pread(2) stub, because EINTR, a legal short read, true
+          # EOF and a hard error are not reachable from ci/t/01-static.t on a
+          # local filesystem -- and neither is the O_DIRECT constraint the
+          # loop's alignment round-down exists to satisfy. The stub asserts
+          # buffer/offset/length alignment on every call, so a continuation
+          # that resumed mid-block fails here instead of on an operator's
+          # directio mount. Needs only a C compiler.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_static_pread_unit.sh
+
+      - name: static frame-header probe unit fixture
+        run: |
+          # ngx_http_zstd_static_probe_frame(): pure frame-header arithmetic.
+          # Extracts the helper verbatim and checks the reserved descriptor
+          # bit, a passing small frame and the oversized-window verdict without
+          # standing up nginx. Needs only a C compiler.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_static_probe_unit.sh
+
+      - name: freeCCtxParams six-exit unit fixture (config-time leak-on-error)
+        run: |
+          # ngx_http_zstd_estimate_cctx_memory() runs during "nginx -t"
+          # config load, not on any per-request path, so the HTTP
+          # fault-injection probe cannot reach it. It has six early-return
+          # error exits plus one success exit, and every one of the seven
+          # must call ZSTD_freeCCtxParams(cp) before returning -- a leak on
+          # any single exit would pass CI silently, since the other six
+          # still free correctly. Extracts the function verbatim and drives
+          # it against scripted ZSTD_CCtx_params fakes that force each exit
+          # independently, asserting the free count is exactly 1 (not 0, a
+          # leak; not 2+, a double free) on every one of the seven paths.
+          # Needs only a C compiler.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_freecctxparams_unit.sh
+
       - name: Configure a real nginx source tree (for scan-build headers)
         run: |
           # scan-build needs the COMPLETE nginx headers — including the
@@ -197,14 +424,16 @@ jobs:
           # headers but NOT the build system (no auto/configure), so it can
           # never produce ngx_auto_config.h; the old approach silently failed
           # and scan-build "passed" on incomplete headers (the CI2 complaint).
-          # Download + configure a real nginx source instead.
+          # Download + configure a real nginx source instead. Verified via
+          # ci/tools/fetch-verified-nginx.sh -- same PGP-against-vendored-key
+          # check the build matrix uses, so this download is no less trusted
+          # than the one that actually ships in the test binary.
           set -euo pipefail
           ver=$(curl -fsSL https://nginx.org/en/download.html \
             | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
             | sort -V | tail -1)
           echo "Using nginx $ver to generate lint headers"
-          wget -q "https://nginx.org/download/nginx-${ver}.tar.gz"
-          tar -xzf "nginx-${ver}.tar.gz"
+          "$GITHUB_WORKSPACE/ci/tools/fetch-verified-nginx.sh" "$ver"
           cd "nginx-${ver}"
           CC=gcc ./configure --with-compat \
             --add-dynamic-module="$GITHUB_WORKSPACE" > /dev/null
@@ -214,6 +443,7 @@ jobs:
 
       - name: cppcheck (static analysis)
         run: |
+          set -o pipefail
           # Gate on real bug categories (warning/performance/portability), not
           # the full --enable=all style/unusedFunction noise. error-exitcode=1
           # fails the job on any such finding; a checked-in suppressions file is
@@ -230,6 +460,7 @@ jobs:
 
       - name: clang static analyzer
         run: |
+          set -o pipefail
           N="$NGINX_SRC_TREE"
           INCLUDE_FLAGS="-I$N/src/core -I$N/src/event -I$N/src/event/modules \
             -I$N/src/event/quic -I$N/src/os/unix -I$N/objs -I$N/src/http \
@@ -251,7 +482,7 @@ jobs:
 
       - name: Upload lint reports
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: lint-reports
           path: |
@@ -260,6 +491,18 @@ jobs:
           retention-days: 7
 
   # ── Build the module against nginx mainline (amd64) ─────────────────────
+  release-build-fanout:
+    name: Release build fan-out
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    needs: resolve
+    steps:
+      - name: Give mainline a best-effort head start before fan-out
+        # GitHub does not promise ready-queue order. This gate delays the three
+        # fan-out chains by ten seconds after resolve, giving build a bounded,
+        # best-effort eligibility lead without guaranteeing scheduler priority.
+        run: sleep 10
+
   build:
     # Job name must stay VERSION-FREE. It was
     # `Build (${{ matrix.flavor }} ${{ matrix.version }})`, which renamed the
@@ -283,7 +526,10 @@ jobs:
     name: Build (${{ matrix.flavor }})
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
-    needs: [resolve, validation]
+    # Lane 1 starts as soon as the five-second resolver finishes. Validation
+    # remains parallel: serializing the main build behind a multi-minute lint
+    # job left one of the four Linux lanes idle on every PR.
+    needs: resolve
     strategy:
       fail-fast: false
       # nginx mainline, assembled by the resolve job.
@@ -308,26 +554,39 @@ jobs:
           echo "### Build: $FLAVOR $VERSION" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
       - name: Cache apt packages
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          path: /var/cache/apt/archives
+          # User-owned dir, not the system /var/cache/apt/archives: apt runs
+          # under sudo, so the post-step tar (unprivileged runner user) cannot
+          # read the root-owned archives/lock or archives/partial (c2).
+          #
+          # Glob the .deb files rather than the directory: apt recreates
+          # `partial/` (0700 _apt:root) and `lock` (root:root) INSIDE whatever
+          # Dir::Cache::archives points at, so caching the dir itself still
+          # gives tar two unreadable entries and it exits 2 -> "Failed to
+          # save" (a warning, so CI stays green while nothing is ever cached).
+          # Only the .deb files are worth caching anyway.
+          path: ${{ runner.temp }}/apt-archives/*.deb
           key: apt-build-${{ runner.os }}-build-essential-libzstd-libpcre2-zlib
           restore-keys: apt-build-${{ runner.os }}-
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
+          mkdir -p "$RUNNER_TEMP/apt-archives"
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
             'Acquire::http::Timeout "20";' \
             'Acquire::https::Timeout "20";' \
+            "Dir::Cache::archives \"$RUNNER_TEMP/apt-archives\";" \
             | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
           sudo apt-get update
           sudo apt-get install -y \
@@ -345,7 +604,7 @@ jobs:
           echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
 
       - name: Cache ccache objects
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.ccache
           key: ccache-${{ runner.os }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ hashFiles('filter/*.c', 'static/*.c', '*.h', 'config') }}
@@ -355,7 +614,7 @@ jobs:
 
       - name: Cache server source tarball
         id: src-tarball
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ matrix.dir }}.tar.gz
           key: src-${{ matrix.flavor }}-${{ matrix.version }}
@@ -372,17 +631,7 @@ jobs:
         env:
           MATRIX_DIR: ${{ matrix.dir }}
           MATRIX_URL: ${{ matrix.url }}
-        run: |
-          set -euo pipefail
-          wget -q -O "$MATRIX_DIR.tar.gz.asc" "$MATRIX_URL.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "$MATRIX_DIR.tar.gz.asc" "$MATRIX_DIR.tar.gz"
-          rm -rf "$gnupghome"
+        run: ci/tools/verify-nginx-tarball.sh "$MATRIX_DIR.tar.gz" "$MATRIX_URL.asc"
 
       - name: Configure (full debug build)
         env:
@@ -468,11 +717,170 @@ jobs:
           "$MATRIX_DIR/objs/$MATRIX_FLAVOR" -V 2>&1
 
       - name: Upload server binary artifact
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: server-binary-${{ matrix.flavor }}-${{ matrix.version }}
           path: ${{ matrix.dir }}/objs/${{ matrix.flavor }}
           retention-days: 1
+
+  # ── Native arm64 build and decoded runtime smoke with current libzstd ───
+  build-arm64:
+    name: Build (nginx arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    needs: resolve
+    env:
+      NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
+
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'DPkg::Lock::Timeout "120";' \
+            'Acquire::Retries "3";' \
+            'Acquire::http::Timeout "20";' \
+            'Acquire::https::Timeout "20";' \
+            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libzstd-dev \
+            libpcre2-dev \
+            zlib1g-dev \
+            python3 \
+            python3-requests \
+            wget \
+            zstd
+
+      - name: Cache nginx source tarball
+        id: nginx-tarball-arm64
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: nginx-${{ env.NGINX_VERSION }}.tar.gz
+          key: nginx-src-${{ env.NGINX_VERSION }}
+
+      - name: Download nginx
+        if: steps.nginx-tarball-arm64.outputs.cache-hit != 'true'
+        run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+
+      - name: Verify nginx tarball PGP signature
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
+
+      - name: Configure arm64 build
+        run: |
+          set -euo pipefail
+          tar -xzf "nginx-${NGINX_VERSION}.tar.gz"
+          cd "nginx-${NGINX_VERSION}"
+          ./configure \
+            --with-compat \
+            --with-debug \
+            --with-http_ssl_module \
+            --with-http_gzip_static_module \
+            --with-http_realip_module \
+            --with-http_v2_module \
+            --with-http_sub_module \
+            --with-http_auth_request_module \
+            --with-cc-opt="$(pkg-config --cflags libzstd zlib libpcre2-8)" \
+            --with-ld-opt="$(pkg-config --libs libzstd zlib libpcre2-8)" \
+            --add-dynamic-module="$GITHUB_WORKSPACE"
+
+      - name: Strict compile module sources
+        run: |
+          set -euo pipefail
+          cd "nginx-${NGINX_VERSION}"
+          NGINX_CFLAGS=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' objs/Makefile)
+          ALL_INCS=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); gsub(/\\$/, "", line); printf "%s ", line; if (!/\\$/) exit}' objs/Makefile)
+          for src in \
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_filter_module.c" \
+            "$GITHUB_WORKSPACE/src/ngx_http_zstd_static_module.c"; do
+            # NGINX_CFLAGS and ALL_INCS are flag lists that MUST word-split.
+            # shellcheck disable=SC2086
+            gcc -c -fPIC $NGINX_CFLAGS \
+              -Wall -Wextra -Wshadow -Wstrict-aliasing \
+              -Wunreachable-code -Wunused -Werror \
+              $ALL_INCS \
+              "$src" -o "/tmp/$(basename "$src" .c)-arm64.o"
+          done
+
+      - name: Build and verify arm64 binary
+        run: |
+          set -euo pipefail
+          cd "nginx-${NGINX_VERSION}"
+          make -j"$(nproc)"
+          "$GITHUB_WORKSPACE/ci/tools/check-zstd-dynamic-linkage.sh" \
+            objs/ngx_http_zstd_filter_module.so
+          file objs/nginx | grep -Eq 'ARM aarch64|ARM64'
+          for module in \
+            objs/ngx_http_zstd_filter_module.so \
+            objs/ngx_http_zstd_static_module.so; do
+            test -f "$module"
+            grep -q "$module" objs/Makefile
+          done
+          grep -q -- '-lzstd' objs/Makefile
+          objs/nginx -V 2>&1
+          echo "TEST_NGINX_BINARY=$PWD/objs/nginx" >> "$GITHUB_ENV"
+
+      - name: Decoded runtime smoke on arm64
+        run: |
+          set -euo pipefail
+          python3 ci/tools/test_encoding.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18094
+          smoke_root="$(mktemp -d)"
+          module_dir="$(dirname "$TEST_NGINX_BINARY")"
+          mkdir -p "$smoke_root/conf" "$smoke_root/logs" "$smoke_root/html"
+          printf 'origin body\n' > "$smoke_root/html/bad.txt"
+          printf 'not a zstd frame' > "$smoke_root/html/bad.txt.zst"
+          cat > "$smoke_root/conf/nginx.conf" <<EOF
+          load_module $module_dir/ngx_http_zstd_filter_module.so;
+          load_module $module_dir/ngx_http_zstd_static_module.so;
+          events {}
+          http {
+              server {
+                  listen 127.0.0.1:18095;
+                  root $smoke_root/html;
+                  zstd_static on;
+              }
+          }
+          EOF
+          "$TEST_NGINX_BINARY" -t -p "$smoke_root" -c conf/nginx.conf
+          "$TEST_NGINX_BINARY" -p "$smoke_root" -c conf/nginx.conf
+          trap '"$TEST_NGINX_BINARY" -s quit -p "$smoke_root" -c conf/nginx.conf >/dev/null 2>&1 || true' EXIT
+          python3 - <<'PY' > /tmp/bad-static-response.zst
+          import http.client, time
+
+          for _ in range(40):
+              try:
+                  conn = http.client.HTTPConnection("127.0.0.1", 18095, timeout=2)
+                  conn.request("GET", "/bad.txt.zst", headers={"Accept-Encoding": "zstd"})
+                  resp = conn.getresponse()
+                  body = resp.read()
+                  if resp.status != 200:
+                      raise SystemExit(f"unexpected malformed-static response: {resp.status} {resp.getheaders()!r}")
+                  import sys
+                  sys.stdout.buffer.write(body)
+                  break
+              except OSError:
+                  time.sleep(0.25)
+              finally:
+                  try:
+                      conn.close()
+                  except Exception:
+                      pass
+          else:
+              raise SystemExit("nginx did not answer malformed static request")
+          PY
+          if zstd -dc /tmp/bad-static-response.zst >/dev/null 2>&1; then
+            echo "invalid zstd frame served by nginx decoded successfully" >&2
+            exit 1
+          fi
+          echo "✓ native arm64 build and decoded runtime smoke passed"
 
   # ── Build against libzstd 1.4.x — exercises the documented fallback
   #    paths (#ifdef ZSTD_c_targetCBlockSize and the ZSTD_VERSION_NUMBER
@@ -485,22 +893,9 @@ jobs:
     name: Build (libzstd 1.4.x — fallback paths)
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 25
-    # Lane D: takes validation's slot rather than starting a new one. The pool
-    # has 6 real slots and this workflow's own fan-out after `resolve` was 7
-    # jobs wide, so one of them had to queue. validation(216s) ->
-    # build-old-libzstd(135s) = 351s, still under the 370s
-    # resolve(6s)->build(212s)->tests(145s) critical path measured on run
-    # 32547163515, so this costs no wall-clock while dropping this
-    # workflow's peak from 7 to 6. The `if:` keeps it running when validation
-    # FAILS -- it depends on validation only for the slot, never for an
-    # artifact, and a validation failure must not silently skip a build-matrix
-    # leg. It must still SKIP when `resolve` fails: every step below builds
-    # against `needs.resolve.outputs.nginx_version`, which is empty in that
-    # case, so a bare `!cancelled()` would download a bogus tarball instead of
-    # skipping. Hence the explicit resolve success test rather than relying on
-    # default `needs` semantics, which the `if:` overrides for BOTH deps.
-    needs: [resolve, validation]
-    if: ${{ !cancelled() && needs.resolve.result == 'success' }}
+    # Released after the barrier's bounded best-effort eligibility lead for
+    # build; it may contend with build and validation once the delay expires.
+    needs: [resolve, release-build-fanout]
 
     env:
       # Resolved mainline nginx (used by the cache keys + download/build steps
@@ -516,14 +911,15 @@ jobs:
 
     steps:
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
       - name: Install build dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -537,7 +933,7 @@ jobs:
 
       - name: Cache libzstd 1.4.x source tarball
         id: zstd-tarball
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: zstd-${{ env.OLD_ZSTD_VERSION }}.tar.gz
           key: zstd-src-${{ env.OLD_ZSTD_VERSION }}
@@ -547,6 +943,28 @@ jobs:
         run: |
           wget -q -O "zstd-${OLD_ZSTD_VERSION}.tar.gz" \
             "https://github.com/facebook/zstd/releases/download/v${OLD_ZSTD_VERSION}/zstd-${OLD_ZSTD_VERSION}.tar.gz"
+
+      - name: Verify libzstd 1.4.x tarball sha256
+        # Runs on EVERY run, cache hit or fresh download -- a cached tarball
+        # from actions/cache is exactly as untrusted as a freshly-downloaded
+        # one until re-checked (same rule ci-build.sh's header documents for
+        # nginx/angie tarballs, audit sha e289021 F3). facebook/zstd does not
+        # publish a detached signature for release tarballs, so this is
+        # pinned sha256 only, computed once from an HTTPS fetch -- same
+        # approach as ci-build.sh's ANGIE_SHA256 table.
+        env:
+          ZSTD_145_SHA256: 98e91c7c6bf162bf90e4e70fdbc41a8188b9fa8de5ad840c401198014406ce9e
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum "zstd-${OLD_ZSTD_VERSION}.tar.gz" | awk '{print $1}')"
+          if [ "$actual" != "$ZSTD_145_SHA256" ]; then
+            echo "✗ sha256 mismatch for zstd-${OLD_ZSTD_VERSION}.tar.gz" >&2
+            echo "  expected: $ZSTD_145_SHA256" >&2
+            echo "  actual:   $actual" >&2
+            rm -f "zstd-${OLD_ZSTD_VERSION}.tar.gz"
+            exit 1
+          fi
+          echo "✓ sha256 verified for zstd-${OLD_ZSTD_VERSION}.tar.gz"
 
       - name: Build libzstd 1.4.x to a private prefix
         run: |
@@ -565,7 +983,7 @@ jobs:
 
       - name: Cache nginx source tarball
         id: nginx-tarball-old
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: nginx-${{ env.NGINX_VERSION }}.tar.gz
           key: nginx-src-${{ env.NGINX_VERSION }}
@@ -575,27 +993,20 @@ jobs:
         run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Configure & build nginx with module against libzstd 1.4.x
         run: |
           tar -xzf "nginx-${NGINX_VERSION}.tar.gz"
           cd "nginx-${NGINX_VERSION}"
           # ZSTD_INC/ZSTD_LIB tell the module's filter/config to pick up
-          # the private libzstd 1.4.x build, not the system one. No
-          # -DZSTD_STATIC_LINKING_ONLY here on purpose: the fallback
-          # paths must compile under the plain dynamic-link build too.
+          # the private libzstd 1.4.x build, not the system one. This
+          # prefix has no libzstd.a (install-shared only, above), so
+          # auto/zstd's static probe fails and it falls back to the
+          # dynamic -lzstd retry, which auto/zstd no longer builds with
+          # -DZSTD_STATIC_LINKING_ONLY (see the symbol-import assertion
+          # below): the fallback paths must compile clean under the plain
+          # dynamic-link build too, without ZSTDLIB_STATIC_API imports.
           ZSTD_INC="$ZSTD_INC" ZSTD_LIB="$ZSTD_LIB" \
             ./configure \
               --with-compat \
@@ -617,6 +1028,22 @@ jobs:
           # through the dynamic auto-discovery path).
           echo "LD_LIBRARY_PATH=$ZSTD_LIB" >> "$GITHUB_ENV"
           echo "TEST_NGINX_BINARY=$PWD/objs/nginx" >> "$GITHUB_ENV"
+
+      - name: Assert no static-only libzstd symbols leaked into the dynamic build
+        run: |
+          set -euo pipefail
+          cd "nginx-${NGINX_VERSION}"
+          # This job's private libzstd was built with install-shared only
+          # (no libzstd.a), so auto/zstd's static probe must have failed
+          # and fallen back to the dynamic -lzstd retry. That retry must
+          # NOT carry -DZSTD_STATIC_LINKING_ONLY: those declarations
+          # (ZSTDLIB_STATIC_API) have no stable ABI, so importing them
+          # into a dynamically linked module is unsupported even when the
+          # symbols happen to resolve today. Keep the denied-symbol list
+          # shared with the dynamic-module artifact gate.
+          ls "$HOME"/zstd14/lib/libzstd.a 2>/dev/null && \
+            { echo "FAIL: static archive present, this leg no longer tests the dynamic-only fallback"; exit 1; }
+          "$GITHUB_WORKSPACE/ci/tools/check-zstd-dynamic-linkage.sh" objs/nginx
 
       - name: Assert the private 1.4.x HEADERS were really compiled against
         run: |
@@ -676,20 +1103,29 @@ jobs:
     name: Dynamic-module linkage isolation
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
-    needs: [resolve, validation]
+    # Lane 4 is cvary-interop -> linkage. The explicit result expression keeps
+    # linkage diagnostic coverage even when cvary itself fails; `needs` here is
+    # an ordering edge, not a reason to hide a second independent failure.
+    needs: [resolve, cvary-interop]
+    if: >-
+      ${{
+        !cancelled()
+        && needs.resolve.result == 'success'
+      }}
     env:
       NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
 
     steps:
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -702,7 +1138,7 @@ jobs:
 
       - name: Cache nginx source tarball
         id: nginx-tarball
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: nginx-${{ env.NGINX_VERSION }}.tar.gz
           key: nginx-src-${{ env.NGINX_VERSION }}
@@ -712,18 +1148,7 @@ jobs:
         run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Configure with zstd + stubs as dynamic modules, build
         # Full build (not just `make modules`): the vary-suppression
@@ -738,7 +1163,6 @@ jobs:
             --with-compat \
             --add-dynamic-module="$GITHUB_WORKSPACE" \
             --add-dynamic-module="$GITHUB_WORKSPACE/ci/tools/ci-linkcheck-module" \
-            --add-dynamic-module="$GITHUB_WORKSPACE/ci/tools/ci-compression-vary-stub" \
             > /dev/null
           make -j"$(nproc)"
 
@@ -833,18 +1257,15 @@ jobs:
           fi
           echo "✓ readelf agrees on both"
 
-      - name: Assert gzip_vary warning suppression witness (both directions)
-        # When a module named ngx_http_compression_vary_filter_module is
-        # loaded, the per-location gzip_vary-off warnings collapse into
-        # one summary warning per module — never full silence, because
-        # that module's compression_vary directive defaults to off and
-        # its effective value cannot be read from here (see
-        # ngx_http_zstd_common.h). Loading the CI stub that claims that
-        # name via load_module is the hardest detection case (dynamic,
-        # not static linkage); the warn-direction control keeps the
-        # quiet-direction greps from passing vacuously if the warning
-        # text ever changes. The cvary-interop job repeats this against
-        # the real third-party module and adds runtime Vary checks.
+      - name: "Assert Vary: Accept-Encoding is emitted without gzip_vary"
+        # G5: the modules emit "Vary: Accept-Encoding" themselves, so the
+        # header no longer depends on the operator's "gzip_vary"
+        # directive and the old gzip_vary-off warnings are gone. This
+        # step is the config-load half of that contract: the fixture
+        # below has NO gzip_vary anywhere, and must load with no
+        # gzip_vary advice of any kind. The runtime half (exactly one
+        # Vary line in every gzip_vary / compression_vary state) is the
+        # cvary-interop job and the vary-matrix job.
         run: |
           set -euo pipefail
           cd "nginx-${NGINX_VERSION}"
@@ -867,47 +1288,40 @@ jobs:
           }
           EOF
 
-          # Identical config plus the stub that claims the
-          # compression_vary module's name.
-          { echo "load_module $PWD/objs/ngx_http_compression_vary_filter_module.so;"
-            cat wprefix/warn.conf; } > wprefix/quiet.conf
-
-          # Cardinality, not just presence: one location per module in
-          # the fixture means each expected line must appear EXACTLY
-          # once — a duplicate emission (e.g. postconfiguration running
-          # twice) is a bug grep -q would wave through.
-          expect_one() {
-            local n
-            n=$(echo "$out" | grep -cF "$1" || true)
-            if [ "$n" -ne 1 ]; then
-              echo "✗ expected exactly one \"$1\" line, got $n"
-              exit 1
-            fi
-          }
-
-          # Control direction: without the stub, each module must warn
-          # once for the single affected location.
           out=$(objs/nginx -p "$PWD/wprefix" -c warn.conf -t 2>&1)
           echo "$out"
           echo "$out" | grep -q 'test is successful'
-          expect_one 'zstd is enabled but "gzip_vary" is off'
-          expect_one 'zstd_static is enabled but "gzip_vary" is off'
-          echo "✓ both warnings fire exactly once without the stub"
 
-          # Witness direction: with the stub loaded, the per-location
-          # lines must vanish and each per-module summary must appear
-          # exactly once (the count in the message also mutation-checks
-          # the counter: a broken count changes "in 1 location(s)").
-          out=$(objs/nginx -p "$PWD/wprefix" -c quiet.conf -t 2>&1)
-          echo "$out"
-          echo "$out" | grep -q 'test is successful'
-          if echo "$out" | grep -q 'is enabled but "gzip_vary" is off'; then
-            echo "✗ per-location warning not suppressed with stub loaded"
+          # No gzip_vary advice may survive: neither the old
+          # per-location lines nor the old per-module summary. A stale
+          # warning telling operators to set a directive that no longer
+          # affects the header is worse than none.
+          if echo "$out" | grep -qi 'gzip_vary'; then
+            echo "✗ config load still mentions gzip_vary:"
+            echo "$out" | grep -i 'gzip_vary'
             exit 1
           fi
-          expect_one 'zstd is enabled with "gzip_vary" off in 1 location'
-          expect_one 'zstd_static is enabled with "gzip_vary" off in 1 location'
-          echo "✓ per-location warnings suppressed, one summary each"
+          echo "✓ loads clean with no gzip_vary anywhere in the config"
+
+      - name: Dictionary path hardening + read-completeness fixtures
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          # Fixture matrix over both dictionary loaders: non-regular
+          # inputs (FIFO/dir/socket/device) are refused without blocking
+          # the config-parsing master, zstd_dict_strict_path refuses a
+          # symlink and a group/world-writable target, a rejected reload
+          # leaves the old cycle serving, and the config-level half of
+          # the read contract (a large dictionary loads; empty and
+          # unreadable are refused). Every fixture is bounded by
+          # `timeout`, so a blocking-open regression fails the job
+          # instead of hanging it.
+          #
+          # This script existed but was wired into no workflow, so none
+          # of the above was actually being checked on any PR.
+          bash ci/tools/test_dict_path_hardening.sh \
+            "nginx-${NGINX_VERSION}/objs/nginx" \
+            "nginx-${NGINX_VERSION}/objs"
 
   # ── Interop against the REAL compression_vary module — the stub above
   #    proves name detection; this proves the semantic contract the
@@ -919,7 +1333,7 @@ jobs:
     name: compression_vary interop (real module)
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 15
-    needs: [resolve, validation]
+    needs: [resolve, release-build-fanout]
     env:
       NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
       # HanadaLee/ngx_http_compression_vary_filter_module, pinned by
@@ -930,7 +1344,7 @@ jobs:
 
     steps:
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
@@ -944,7 +1358,8 @@ jobs:
           # ubuntu-latest resolves apt through azure.archive.ubuntu.com,
           # whose outage shape is ~2 minutes of default Acquire timeout
           # per index file before the runner's mirror list falls back
-          # (the #117 cancellations); short timeouts make that cheap.
+          # (the #117 cancellations); the bare apt-get lines below
+          # rely on this file.
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "1";' \
@@ -957,7 +1372,7 @@ jobs:
 
       - name: Cache nginx source tarball
         id: nginx-tarball
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: nginx-${{ env.NGINX_VERSION }}.tar.gz
           key: nginx-src-${{ env.NGINX_VERSION }}
@@ -967,18 +1382,7 @@ jobs:
         run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Clone compression_vary module at the pin
         run: |
@@ -1036,20 +1440,25 @@ jobs:
           out=$(objs/nginx -p "$PWD/iprefix" -c interop.conf -t 2>&1)
           echo "$out"
           echo "$out" | grep -q 'test is successful'
-          if echo "$out" | grep -q 'is enabled but "gzip_vary" is off'; then
-            echo "✗ per-location warning fired despite the real module"
+          # G5: no gzip_vary advice of any kind survives — the header
+          # does not depend on that directive any more.
+          if echo "$out" | grep -qi 'gzip_vary'; then
+            echo "✗ config load still mentions gzip_vary:"
+            echo "$out" | grep -i 'gzip_vary'
             exit 1
           fi
-          # Exactly one summary — presence alone would miss duplicate
-          # emission.
-          n=$(echo "$out" | grep -cF 'zstd is enabled with "gzip_vary" off in 2 location' || true)
-          if [ "$n" -ne 1 ]; then
-            echo "✗ expected exactly one summary warning, got $n"
-            exit 1
-          fi
-          echo "✓ suppression + one summary against the real module"
+          echo "✓ clean load against the real module, no gzip_vary advice"
 
       - name: Assert runtime Vary contract (compression_vary on and off)
+        # THE point of G5. Both locations have "gzip_vary off". Before
+        # G5, /off/ (compression_vary off — its DEFAULT) served a zstd
+        # body with NO Vary at all: a shared cache would store it and
+        # hand it to a client that cannot decode zstd. That was the
+        # residual risk a warning was asked to cover. Now the module
+        # emits the field itself, so BOTH locations must carry exactly
+        # one Vary: Accept-Encoding — never zero (the cache-poisoning
+        # bug) and never two (compression_vary flattens what it finds,
+        # and a doubled field trips strict intermediaries).
         run: |
           set -euo pipefail
           cd "nginx-${NGINX_VERSION}"
@@ -1058,26 +1467,23 @@ jobs:
           trap 'objs/nginx -p "$PWD/iprefix" -c interop.conf -s stop' EXIT
           sleep 0.5
 
-          hdr_on=$(curl -s -D - -o /dev/null -H "Accept-Encoding: zstd" \
-            http://127.0.0.1:18994/on/x)
-          echo "$hdr_on"
-          echo "$hdr_on" | grep -qi '^content-encoding: zstd'
-          n=$(echo "$hdr_on" | grep -ci '^vary: accept-encoding' || true)
-          if [ "$n" -ne 1 ]; then
-            echo "✗ expected exactly one Vary: Accept-Encoding with compression_vary on, got $n"
-            exit 1
-          fi
-          echo "✓ compression_vary on → single Vary: Accept-Encoding, gzip_vary not needed"
+          check_one_vary() {
+            local loc="$1" label="$2" hdr n
+            hdr=$(curl -s -D - -o /dev/null -H "Accept-Encoding: zstd" \
+              "http://127.0.0.1:18994${loc}x")
+            echo "--- ${label} (${loc})"
+            echo "$hdr"
+            echo "$hdr" | grep -qi '^content-encoding: zstd'
+            n=$(echo "$hdr" | grep -ci '^vary: accept-encoding' || true)
+            if [ "$n" -ne 1 ]; then
+              echo "✗ ${label}: expected exactly one Vary: Accept-Encoding, got $n"
+              exit 1
+            fi
+            echo "✓ ${label}: exactly one Vary: Accept-Encoding"
+          }
 
-          hdr_off=$(curl -s -D - -o /dev/null -H "Accept-Encoding: zstd" \
-            http://127.0.0.1:18994/off/x)
-          echo "$hdr_off"
-          echo "$hdr_off" | grep -qi '^content-encoding: zstd'
-          if echo "$hdr_off" | grep -qi '^vary:'; then
-            echo "✗ expected NO Vary with compression_vary off (its default)"
-            exit 1
-          fi
-          echo "✓ compression_vary off → no Vary: the exact risk the summary warning names"
+          check_one_vary /on/  "gzip_vary off + compression_vary on"
+          check_one_vary /off/ "gzip_vary off + compression_vary off"
 
   # ── ASAN + UBSAN build — catches the lifetime/UB bugs in this module's
   #    history (per-request ctx, terminal-frame). Uses valgrind.suppress'd
@@ -1086,7 +1492,7 @@ jobs:
     name: Build ASAN+UBSAN
     runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
     timeout-minutes: 30
-    needs: [resolve, validation]
+    needs: [resolve, release-build-fanout]
 
     env:
       # Resolved mainline nginx — feeds the cache keys, download and the
@@ -1095,14 +1501,15 @@ jobs:
 
     steps:
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1115,7 +1522,7 @@ jobs:
 
       - name: Cache nginx source tarball
         id: nginx-tarball
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: nginx-${{ env.NGINX_VERSION }}.tar.gz
           key: nginx-src-${{ env.NGINX_VERSION }}
@@ -1125,18 +1532,7 @@ jobs:
         run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Configure & build nginx with ASAN + UBSAN
         env:
@@ -1164,7 +1560,7 @@ jobs:
           echo "✓ ASAN+UBSAN nginx binary built (portable SHA-256 in use)"
 
       - name: Upload ASAN nginx binary
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: nginx-binary-asan
           path: nginx-${{ env.NGINX_VERSION }}/objs/nginx
@@ -1201,26 +1597,39 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
       - name: Cache apt packages
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          path: /var/cache/apt/archives
+          # User-owned dir, not the system /var/cache/apt/archives: apt runs
+          # under sudo, so the post-step tar (unprivileged runner user) cannot
+          # read the root-owned archives/lock or archives/partial (c2).
+          #
+          # Glob the .deb files rather than the directory: apt recreates
+          # `partial/` (0700 _apt:root) and `lock` (root:root) INSIDE whatever
+          # Dir::Cache::archives points at, so caching the dir itself still
+          # gives tar two unreadable entries and it exits 2 -> "Failed to
+          # save" (a warning, so CI stays green while nothing is ever cached).
+          # Only the .deb files are worth caching anyway.
+          path: ${{ runner.temp }}/apt-archives/*.deb
           key: apt-tests-${{ runner.os }}-libperl-cpanminus-libzstd1
           restore-keys: apt-tests-${{ runner.os }}-
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
+          mkdir -p "$RUNNER_TEMP/apt-archives"
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
             'Acquire::http::Timeout "20";' \
             'Acquire::https::Timeout "20";' \
+            "Dir::Cache::archives \"$RUNNER_TEMP/apt-archives\";" \
             | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
           sudo apt-get update
           sudo apt-get install -y \
@@ -1232,7 +1641,7 @@ jobs:
             zstd
 
       - name: Download nginx binary (mainline, from build matrix)
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           # The build matrix uploads server-binary-<flavor>-<version>; the
           # full Perl/Python suite runs against nginx mainline specifically.
@@ -1246,15 +1655,14 @@ jobs:
           echo "✓ nginx binary ready: $(nginx-bin/nginx -v 2>&1)"
 
       - name: Cache Perl modules
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/perl5
-          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket
+          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket-${{ env.TEST_NGINX_SOCKET_VERSION }}
 
       - name: Install Test::Nginx::Socket
         run: |
-          cpanm -l ~/perl5 --notest Test::Nginx::Socket
-          echo "PERL5LIB=$HOME/perl5/lib/perl5:$PERL5LIB" >> "$GITHUB_ENV"
+          ci/tools/install-test-nginx-socket.sh "$HOME/perl5"
 
       - name: Run filter module tests
         env:
@@ -1354,6 +1762,12 @@ jobs:
           python3 ci/tools/test_terminal_frame.py --nginx-binary "$TEST_NGINX_BINARY" --port 18085
           echo "✓ Terminal-frame regression test passed"
 
+      - name: Run $zstd_ratio dynamic-cacheable regression test
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          python3 ci/tools/test_var_dynamic_cacheable.py --nginx-binary "$TEST_NGINX_BINARY" --port 18142
+          echo "✓ Dynamic-cacheable variable regression test passed"
+
       - name: Run proxy_buffering-off truncation regression (bug B)
         run: |
           cd "$GITHUB_WORKSPACE"
@@ -1415,10 +1829,19 @@ jobs:
           # but wrong body). Fire many distinct concurrent requests
           # through one worker over reused keepalive connections; each
           # response must decode byte-exact to its OWN origin.
+          # --require-multi-slot additionally asserts, from the debug
+          # witnesses, that MORE THAN ONE ring slot was actually lent.
+          # Without it the byte-exactness oracle is satisfied by a build
+          # where every concurrent claimant falls through to a
+          # per-request context -- which is what the single-slot cache
+          # did, so the test would pass without ever exercising the
+          # concurrent slot borrowing the ring introduces. Only on this
+          # non-sanitized job: UBSAN cannot log at debug at all (see the
+          # --log-level warn note on the sanitizer jobs below).
           python3 ci/tools/test_concurrent_cctx_isolation.py \
             --nginx-binary "$TEST_NGINX_BINARY" \
             --port 18098 --backend-port 18099 \
-            --concurrency 16 --rounds 6
+            --concurrency 16 --rounds 6 --require-multi-slot
           echo "✓ per-request CCtx isolation regression passed"
 
       - name: Run worker CCtx cache regression
@@ -1486,6 +1909,64 @@ jobs:
             --port 18104 --backend-port 18105
           echo "✓ window-cap + dictionary effect test passed"
 
+      - name: Run dcz budget + CCtx ring-key regression
+        timeout-minutes: 6
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          # A dcz (RFC 9842) request does not compress at zstd_window_log:
+          # it derives its own window from the negotiated dictionary, up to
+          # 2^23. Nothing coupled that to either memory control before.
+          # Asserts three things the fix has to hold at once: the dcz
+          # request lands in its OWN CCtx ring slot (keyed on the effective
+          # window, so it cannot raise a plain slot's permanently-retained
+          # workspace), zstd_max_cctx_memory clamps the dcz window to the
+          # budget-derived cap, and with NEITHER directive set the dcz
+          # window is unchanged -- the clamp is opt-in and must not move
+          # wire bytes for operators who never asked for a memory bound.
+          # Needs --with-debug: the ring witnesses are debug log lines.
+          python3 ci/tools/test_dcz_budget_ring.py \
+            --nginx-binary "$TEST_NGINX_BINARY" \
+            --port 18160 --backend-port 18162
+          echo "✓ dcz budget + CCtx ring-key regression passed"
+          # Config-load regression: "zstd_long on" + "zstd_max_cctx_memory"
+          # made nginx -t die with SIGFPE, because libzstd's estimator
+          # divides by an LDM sub-parameter that is only derived lazily
+          # during compression setup. ci/t/00-filter.t cannot cover this:
+          # its "--- must_die" cannot distinguish a crash from a
+          # diagnostic. This asserts on the exit status and its sign.
+          python3 ci/tools/test_ldm_budget_config.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18124
+          echo "✓ zstd_long + zstd_max_cctx_memory config validation passed"
+          # Implicit per-request CCtx memory advisory. zstd_max_cctx_memory
+          # is optional, so the estimator used to be skipped entirely for
+          # the common no-budget config and an expensive profile
+          # (zstd_comp_level 22, zstd_long on) committed hundreds of MB per
+          # concurrent response silently. The matrix asserts the advisory
+          # fires on the large profiles, stays silent on the ordinary ones
+          # and on an explicit budget/acknowledgement, and -- the part
+          # Test::Nginx cannot express -- that it never turns a working
+          # nginx -t into a failing one.
+          python3 ci/tools/test_cctx_advisory_policy.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18130
+          echo "✓ CCtx memory advisory policy matrix passed"
+          # Aggregate "zstd_buffers number size" bound: ngx_conf_set_bufs_slot()
+          # (nginx core) never checks the product, and neither does the
+          # merge that applies an inherited or defaulted value. Overflow
+          # is a hard error; a representable-but-large total is advisory
+          # only. ci/t cannot express "PASS and warns"; see the tool.
+          python3 ci/tools/test_bufs_bound_policy.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18141
+          echo "✓ zstd_buffers aggregate bound policy matrix passed"
+          # zstd_bypass_vary config-load table: rejection (comma/semicolon
+          # /quote/bare wildcard), acceptance (non-solitary wildcard),
+          # verbatim retention and http-vs-location override. None of this
+          # is expressible via ci/t's --- must_die (it needs both a PASS
+          # assertion and an exact Vary-header byte comparison); see the
+          # tool's docstring.
+          python3 ci/tools/test_bypass_vary_config_policy.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18150
+          echo "✓ zstd_bypass_vary config-load policy matrix passed"
+
       - name: Run RFC 9842 dcz end-to-end test
         timeout-minutes: 6
         run: |
@@ -1495,8 +1976,27 @@ jobs:
           # dictionary SHA-256), decode via `zstd -d -D` capped at the
           # RFC's 8 MB client-window guarantee, byte-compare to origin,
           # and proof the dictionary engaged (dcz body < plain zstd).
-          python3 ci/tools/test_dcz.py --nginx-binary "$TEST_NGINX_BINARY" --port 18106
+          python3 ci/tools/test_dcz.py --nginx-binary "$TEST_NGINX_BINARY" \
+            --port 18106 --tls-port 18117 --insecure-port 18118
+          # Shared-cache partitioning of the dcz cross-origin decision:
+          # Sec-Fetch-Site selects the representation, so a real
+          # proxy_cache in front of the module must not serve the dcz
+          # variant to a cross-site request (or suppress it for a
+          # same-origin one). Runs the {same-origin, cross-site,
+          # absent} x {both fill orders} matrix end to end.
+          python3 ci/tools/test_dcz_cache_partition.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18120 --origin-port 18121
           echo "✓ RFC 9842 dcz end-to-end test passed"
+          # dcz 40-byte prefix inlining: one compressor-buffer allocation
+          # per response, not a separate dedicated prefix buffer, and the
+          # wire body still decodes byte-exact. Needs --with-debug (same as
+          # the ring-key test above): the allocation-count oracle greps
+          # debug log lines ("zstd get_buf: allocated buffer" /
+          # "zstd dcz: 40-byte frame header queued"). This tool previously
+          # existed in ci/tools/ but was never wired into any CI job.
+          python3 ci/tools/test_dcz_prefix_alloc.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18311
+          echo "✓ dcz prefix single-allocation regression passed"
 
       - name: Test summary
         if: success()
@@ -1504,7 +2004,7 @@ jobs:
 
       - name: Upload test logs on failure
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: test-logs
           path: |
@@ -1525,14 +2025,15 @@ jobs:
 
     steps:
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
       - name: Install dependencies
         run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
+          # apt profile the bare apt-get lines below rely on: loose timeouts
+          # for the shared self-hosted box; Azure mirror only on the
+          # ubuntu-latest fallback when vars.POOL is unset (PR #121)
           printf '%s\n' \
             'DPkg::Lock::Timeout "120";' \
             'Acquire::Retries "3";' \
@@ -1544,7 +2045,7 @@ jobs:
             libperl-dev cpanminus
 
       - name: Download ASAN nginx binary
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: nginx-binary-asan
           path: nginx-bin
@@ -1555,15 +2056,14 @@ jobs:
           echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/nginx-bin/nginx" >> "$GITHUB_ENV"
 
       - name: Cache Perl modules
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/perl5
-          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket
+          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket-${{ env.TEST_NGINX_SOCKET_VERSION }}
 
       - name: Install Test::Nginx::Socket
         run: |
-          cpanm -l ~/perl5 --notest Test::Nginx::Socket
-          echo "PERL5LIB=$HOME/perl5/lib/perl5:$PERL5LIB" >> "$GITHUB_ENV"
+          ci/tools/install-test-nginx-socket.sh "$HOME/perl5"
 
       - name: Run Perl suites under ASAN+UBSAN
         # Put the static-file / magic-probe / conditional / HEAD paths (covered
@@ -1591,6 +2091,17 @@ jobs:
           export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static-${RUN_ID}-${JOB_NAME}"
           mkdir -p "$TEST_NGINX_SERVROOT"
           perl ci/t/01-static.t > ci/t/static-asan.log 2>&1 || true
+
+          # NOTE (A29-F7, deferred): this lane still cannot tell "no
+          # sanitizer report" from "the suite never ran". A TAP/executed-
+          # count gate was implemented and DID work -- and immediately
+          # went red here, because nginx under ASan stops accepting on
+          # 127.0.0.1:2024 partway through: 00-filter.t bails at TEST 39
+          # and 01-static.t executed 22 of its 774 assertions
+          # (run 33229149473). That is a real, PRE-EXISTING defect this
+          # lane has been masking via `|| true`, not a gate bug. Fixing
+          # the bind failure is a prerequisite for landing the gate, so
+          # the gate is held back rather than shipped red.
           # Gate strictly on sanitizer reports attributable to this module.
           if cat /tmp/asan-zstd.* ci/t/filter-asan.log ci/t/static-asan.log 2>/dev/null \
                | grep -nE 'ngx_http_zstd' \
@@ -1621,7 +2132,11 @@ jobs:
           # it fires in -- an nginx worker started by a harness, whose CWD is
           # not the workspace. A relative path there fails to open and LSan
           # aborts, so the suppressions must not depend on where nginx ran.
-          LSAN_OPTIONS: suppressions=${{ github.workspace }}/lsan.suppress:print_suppressions=0
+          # verbosity=1 supplies a per-process exit-hook witness. LLVM's
+          # ptrace preflight is only a heuristic and can false-warn before the
+          # real stop-the-world check; ci/tools/lsan_log_verdict.sh separates
+          # that warning from an actual attach failure.
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/lsan.suppress:print_suppressions=0:verbosity=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
           cd "$GITHUB_WORKSPACE"
@@ -1669,7 +2184,15 @@ jobs:
           # config-pool memory from the request path and the 40-byte
           # frame header is hand-assembled — both lifetime/OOB classes.
           python3 ci/tools/test_dcz.py --nginx-binary "$TEST_NGINX_BINARY" \
-            --port 18089
+            --port 18089 --tls-port 18109 --insecure-port 18113
+          # Shared-cache partitioning of the dcz cross-origin decision:
+          # Sec-Fetch-Site selects the representation, so a real
+          # proxy_cache in front of the module must not serve the dcz
+          # variant to a cross-site request (or suppress it for a
+          # same-origin one). Runs the {same-origin, cross-site,
+          # absent} x {both fill orders} matrix end to end.
+          python3 ci/tools/test_dcz_cache_partition.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18122 --origin-port 18123
           # Baseline loaded-and-blocking control (PR2 step 22): the ASAN
           # binary is a static --add-module build, the shape this check
           # needs to prove the compiled-in `zstd on;` default is OFF.
@@ -1682,38 +2205,8 @@ jobs:
             --nginx-binary "$TEST_NGINX_BINARY" \
             --port 18107 --backend-port 18108 --off-port 18112
 
-          # Leak verdict. Everything in lsan.suppress is gone by now, so any
-          # surviving "ERROR: LeakSanitizer" is an unsuppressed leak and fails
-          # the job -- which is the coverage this step never had.
-          #
-          # A ptrace-blocked runner cannot run the exit-time check at all
-          # (LXC seccomp / yama on builder02). That is INDETERMINATE, not
-          # clean: warn rather than print a checkmark that would mean "no
-          # leaks" when nothing was actually checked. Same distinction
-          # ci/tools/test_reload_leak.sh draws.
-          #
-          # Order matters, and the two conditions are NOT mutually exclusive.
-          # log_path writes one file per process, so a run can easily produce
-          # a ptrace warning from one nginx worker and a real leak report from
-          # another -- ptrace works only intermittently on this runner. Test
-          # the leak FIRST: checking ptrace first lets a warning anywhere in
-          # the set short-circuit the verdict and mask a leak elsewhere, which
-          # is the exact defect this whole step exists to fix.
-          if grep -q 'ERROR: LeakSanitizer' /tmp/lsan-smoke.* 2>/dev/null; then
-            echo "❌ unsuppressed leak under the smoke tests:"
-            cat /tmp/lsan-smoke.* 2>/dev/null
-            exit 1
-          elif grep -qE 'ptrace appears to be blocked|LeakSanitizer may hang' \
-                 /tmp/lsan-smoke.* 2>/dev/null; then
-            echo "::warning::LeakSanitizer could not run its exit-time check" \
-                 "(ptrace blocked on this runner — LXC seccomp / yama). Smoke" \
-                 "leak check INDETERMINATE, not clean; fix the runner profile" \
-                 "to restore coverage."
-            echo "⚠ smoke tests passed; leak check INDETERMINATE"
-          else
-            echo "✓ no unsuppressed leaks under the smoke tests"
-            echo "✓ All smoke tests clean under ASAN+UBSAN"
-          fi
+          bash ci/tools/lsan_log_verdict.sh '/tmp/lsan-smoke.*'
+          echo "✓ All smoke tests clean under ASAN+UBSAN"
 
       - name: zstd_dict_file reload leak check (CDict lifecycle)
         env:
@@ -1722,234 +2215,3 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE"
           bash ci/tools/test_reload_leak.sh "$TEST_NGINX_BINARY" 5
-
-  # ── gcov coverage — separate --coverage build so the sanitizer/strict
-  #    builds above stay unpolluted by instrumentation overhead. Informational
-  #    (not a hard gate on absolute %, since most of the remainder is
-  #    alloc-failure/ZSTD-API-error defensive paths not worth fault-injecting)
-  #    but DOES fail if line coverage regresses below the last-known floor, so
-  #    a future change can't silently drop tested surface. ─────────────────
-  coverage:
-    name: Coverage (gcov/lcov)
-    runs-on: ${{ fromJSON(vars.POOL || '["ubuntu-latest"]') }}
-    timeout-minutes: 20
-    needs: [resolve, validation]
-    env:
-      NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
-      # This job's own Test::Nginx port band -- see ci/tools/max-port.sh.
-      # Distinct from every other TEST_BASE_PORT in this repo so a collision
-      # with another runtime job on the same self-hosted runner reads as the
-      # bind error it is, not as an unrelated flake in a rerun.
-      TEST_BASE_PORT: 19200
-      # Test::Nginx reads TEST_NGINX_PORT, not TEST_BASE_PORT -- every `prove`
-      # call below shares this job's band.
-      TEST_NGINX_PORT: 19200
-      # See ci-deep.yml:117 for why this must be 20, not the ~2s Test::Nginx::Socket default.
-      TEST_NGINX_TIMEOUT: "20"
-
-    steps:
-      - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-
-      - name: Install dependencies
-        run: |
-          # builder02 apt profile: loose timeouts — the box runs jobs
-          # concurrently and never talks to the Azure mirror (PR #121)
-          printf '%s\n' \
-            'DPkg::Lock::Timeout "120";' \
-            'Acquire::Retries "3";' \
-            'Acquire::http::Timeout "20";' \
-            'Acquire::https::Timeout "20";' \
-            | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libzstd-dev \
-            libpcre2-dev zlib1g-dev libssl-dev libperl-dev cpanminus \
-            python3 python3-requests zstd lcov wget
-
-      - name: Cache nginx source tarball
-        id: nginx-tarball
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: nginx-${{ env.NGINX_VERSION }}.tar.gz
-          key: nginx-src-${{ env.NGINX_VERSION }}
-
-      - name: Download nginx source tarball
-        if: steps.nginx-tarball.outputs.cache-hit != 'true'
-        run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
-
-      - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
-
-      - name: Configure & build nginx with --coverage instrumentation
-        env:
-          # Coverage measures THIS module's code. With libcrypto detected,
-          # dictionary hashing goes through EVP and the portable SHA-256 —
-          # ours, and the larger body of code — would count as ~100
-          # uncovered lines, breaking the floor for the wrong reason.
-          # Building with detection disabled keeps the portable
-          # implementation measured (as before the EVP change) and
-          # preprocesses the EVP wrapper out of the measurement entirely.
-          # The EVP path's behaviour is still covered: the mainline build
-          # asserts detection and its suites run against it.
-          NGX_ZSTD_NO_LIBCRYPTO: 1
-        run: |
-          tar -xzf "nginx-${NGINX_VERSION}.tar.gz"
-          cd "nginx-${NGINX_VERSION}"
-          ./configure \
-            --with-compat --with-debug --with-threads --with-file-aio \
-            --with-http_ssl_module --with-http_v2_module --with-http_v3_module \
-            --with-http_gzip_static_module --with-http_realip_module \
-            --with-http_sub_module --with-http_addition_module \
-            --with-http_stub_status_module --with-http_auth_request_module \
-            --with-cc-opt="-DZSTD_STATIC_LINKING_ONLY --coverage -O0 -g $(pkg-config --cflags libzstd zlib libpcre2-8 openssl)" \
-            --with-ld-opt="--coverage $(pkg-config --libs libzstd zlib libpcre2-8 openssl)" \
-            --add-dynamic-module="$GITHUB_WORKSPACE"
-          make -j"$(nproc)"
-          echo "TEST_NGINX_BINARY=$PWD/objs/nginx" >> "$GITHUB_ENV"
-          echo "COV_OBJDIR=$PWD/objs/addon" >> "$GITHUB_ENV"
-
-      - name: Install Test::Nginx::Socket
-        run: |
-          cpanm -l ~/perl5 --notest Test::Nginx::Socket
-          echo "PERL5LIB=$HOME/perl5/lib/perl5:$PERL5LIB" >> "$GITHUB_ENV"
-
-      - name: Verify test port band
-        # Before the first `prove` -- see ci/tools/max-port.sh.
-        run: ci/tools/max-port.sh "$TEST_BASE_PORT"
-
-      - name: Run filter module tests
-        env:
-          RUN_ID: ${{ github.run_id }}
-          JOB_NAME: ${{ github.job }}
-        run: |
-          export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-filter-${RUN_ID}-${JOB_NAME}"
-          mkdir -p "$TEST_NGINX_SERVROOT"
-          cd "$GITHUB_WORKSPACE"
-          prove ci/t/00-filter.t
-
-      - name: Run config-load warning tests
-        env:
-          RUN_ID: ${{ github.run_id }}
-          JOB_NAME: ${{ github.job }}
-        run: |
-          export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-confwarn-${RUN_ID}-${JOB_NAME}"
-          rm -rf "$TEST_NGINX_SERVROOT"
-          mkdir -p "$TEST_NGINX_SERVROOT"
-          cd "$GITHUB_WORKSPACE"
-          prove ci/t/02-conf-warn.t
-
-      - name: Run static module tests
-        env:
-          RUN_ID: ${{ github.run_id }}
-          JOB_NAME: ${{ github.job }}
-        run: |
-          export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static-${RUN_ID}-${JOB_NAME}"
-          mkdir -p "$TEST_NGINX_SERVROOT"
-          touch -d @1541504307 "$GITHUB_WORKSPACE/ci/t/suite/test" "$GITHUB_WORKSPACE/ci/t/suite/test.zst"
-          cd "$GITHUB_WORKSPACE"
-          prove ci/t/01-static.t
-
-      - name: Run dcz negotiation tests
-        env:
-          RUN_ID: ${{ github.run_id }}
-          JOB_NAME: ${{ github.job }}
-        run: |
-          export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-dcz-${RUN_ID}-${JOB_NAME}"
-          rm -rf "$TEST_NGINX_SERVROOT"
-          mkdir -p "$TEST_NGINX_SERVROOT"
-          cd "$GITHUB_WORKSPACE"
-          prove ci/t/03-dcz.t
-
-      - name: Run correctness/regression tool suite (drives filter edge cases)
-        run: |
-          cd "$GITHUB_WORKSPACE"
-          python3 ci/tools/test_encoding.py --nginx-binary "$TEST_NGINX_BINARY" --port 19080
-          python3 ci/tools/test_compression_matrix.py \
-            --nginx-binary "$TEST_NGINX_BINARY" --port 19096 --backend-port 19097
-          python3 ci/tools/test_concurrent_cctx_isolation.py \
-            --nginx-binary "$TEST_NGINX_BINARY" --port 19098 --backend-port 19099
-          # --log-level warn: UBSAN (-fno-sanitize-recover) fatally traps
-          # nginx core's own debug logging (ngx_string.c:586), so a
-          # sanitized nginx cannot run at debug at all. The byte-exactness
-          # oracles still gate here; the cache-engagement witnesses are
-          # asserted by the same tool in the non-sanitized tests job.
-          python3 ci/tools/test_cctx_reuse.py \
-            --nginx-binary "$TEST_NGINX_BINARY" --port 19114 --log-level warn
-          python3 ci/tools/test_proxy_unbuffered_truncation.py \
-            --nginx-binary "$TEST_NGINX_BINARY" --port 19094 --backend-port 19095
-          # The reason this tool exists: the floor below assumes the
-          # nomem-recovery and content-less-flush lines are covered,
-          # but they only ran when builder02's load produced the right
-          # races (8 lines = 0.67pp; the floor's headroom is 0.6pp —
-          # one unlucky run failed an unrelated two-line PR). This
-          # forces both paths every run.
-          python3 ci/tools/test_slow_drain.py \
-            --nginx-binary "$TEST_NGINX_BINARY" --port 19110 --backend-port 19111
-          # See the tests job's "sub_filter/CCtx-reset" step for the
-          # TEST 92 coalescing gap this closes.
-          python3 ci/tools/test_sub_filter_cctx_reset.py \
-            --nginx-binary "$TEST_NGINX_BINARY" --port 19112 --backend-port 19113
-          python3 ci/tools/test_terminal_frame.py --nginx-binary "$TEST_NGINX_BINARY" --port 19093
-          python3 ci/tools/test_window_cap.py \
-            --nginx-binary "$TEST_NGINX_BINARY" --port 19104 --backend-port 19105
-          python3 ci/tools/test_zstd_long_ldm.py \
-            --nginx-binary "$TEST_NGINX_BINARY" --port 19102 --backend-port 19103
-          python3 ci/tools/test_dcz.py --nginx-binary "$TEST_NGINX_BINARY" --port 19106
-
-      - name: Capture coverage (lcov) and enforce line-coverage floor
-        run: |
-          cd "$GITHUB_WORKSPACE"
-          lcov --capture --directory "$COV_OBJDIR" --output-file zstd-coverage.info \
-            --rc lcov_branch_coverage=1 --ignore-errors inconsistent
-          lcov --summary zstd-coverage.info --rc lcov_branch_coverage=1 | tee coverage-summary.txt
-          # Floor raised by the 2026-07-31 coverage push, measured on this
-          # branch's tree (i.e. including the dcz work): 80.9% -> 82.6% line,
-          # 70.1% -> 71.8% branch, after adding config-validation, qvalue-edge
-          # and static-handler tests. Verified that master without those tests
-          # scores 80.9%, so this floor genuinely gates them rather than passing
-          # on pre-existing coverage. Bump this only when a deliberate coverage
-          # improvement raises it — never lower it to make a regression pass.
-          floor_pct=82
-          line_pct=$(grep "lines" coverage-summary.txt | grep -oE '[0-9]+\.[0-9]+%' | head -1 | tr -d '%')
-          line_pct_int=${line_pct%.*}
-          echo "Line coverage: ${line_pct}% (floor: ${floor_pct}%)"
-          if [ "$line_pct_int" -lt "$floor_pct" ]; then
-            echo "❌ Line coverage ${line_pct}% dropped below floor ${floor_pct}%"
-            exit 1
-          fi
-          echo "✓ Line coverage floor held"
-
-      - name: Generate HTML coverage report
-        if: always()
-        run: |
-          cd "$GITHUB_WORKSPACE"
-          genhtml zstd-coverage.info --output-directory coverage-html \
-            --branch-coverage --ignore-errors inconsistent || true
-
-      - name: Upload coverage report
-        if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
-        with:
-          name: coverage-report
-          path: |
-            ${{ github.workspace }}/zstd-coverage.info
-            ${{ github.workspace }}/coverage-summary.txt
-            ${{ github.workspace }}/coverage-html
-          retention-days: 14

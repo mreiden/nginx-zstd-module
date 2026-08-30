@@ -18,6 +18,7 @@ import os
 import pathlib
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,26 @@ def parse_args() -> argparse.Namespace:
         help="Local TCP port for the temporary nginx instance.",
     )
     parser.add_argument(
+        "--tls-port",
+        type=int,
+        default=None,
+        help=(
+            "Local TCP port for the native-TLS listener "
+            "(default: --port + 1). RFC 9842 section 8 restricts dcz to "
+            "secure contexts, so the happy path is exercised here."
+        ),
+    )
+    parser.add_argument(
+        "--insecure-port",
+        type=int,
+        default=None,
+        help=(
+            "Local TCP port for a plain-HTTP listener with NO "
+            "zstd_dcz_assume_secure_transport (default: --port + 2). "
+            "Used for the fail-closed secure-context checks."
+        ),
+    )
+    parser.add_argument(
         "--zstd-bin",
         default=shutil.which("zstd") or "zstd",
         help="Path to the zstd CLI used for decompression.",
@@ -81,6 +102,22 @@ def detect_module(explicit, nginx: pathlib.Path, name: str):
         return pathlib.Path(explicit)
     sib = nginx.parent / name
     return sib if sib.exists() else None
+
+
+def nginx_has_ssl(nginx: pathlib.Path) -> bool:
+    """Whether this binary can parse `listen ... ssl`.
+
+    Same probe shape the sibling tools use for --with-debug
+    (test_concurrent_cctx_isolation.py:206, test_slow_drain.py:233): ask
+    the binary itself via -V rather than inferring from the environment
+    or the job name. The sanitizer and valgrind nginx builds in this
+    repo's CI are configured WITHOUT --with-http_ssl_module, where an
+    `ssl` listen parameter is a config-time emerg that kills the tool
+    before any assertion runs -- including every plain-HTTP check, which
+    needs no TLS at all.
+    """
+    v = subprocess.run([str(nginx), "-V"], capture_output=True, text=True, check=False)
+    return "--with-http_ssl_module" in v.stderr
 
 
 def wait_for_port(port: int, timeout: float = 10.0, stderr_file=None) -> None:
@@ -123,11 +160,77 @@ def build_fixtures(root: pathlib.Path, lines: int) -> tuple[bytes, bytes]:
     return dict_path.read_bytes(), (root / "html" / "app.js").read_bytes()
 
 
-def write_config(root: pathlib.Path, port: int, modules) -> pathlib.Path:
+def make_selfsigned(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """Self-signed localhost cert for the native-TLS listener. Generated
+    per run rather than committed: a fixture certificate in-tree expires
+    and turns into a rolling CI failure
+    (feedback-fixed-date-test-ages-into-failure)."""
+    cert = root / "conf" / "test.crt"
+    key = root / "conf" / "test.key"
+    if shutil.which("openssl") is None:
+        # ci/tools/soak.sh already depends on this binary in the same
+        # jobs, so a miss here means the image changed, not that the
+        # test is optional. Say so instead of surfacing FileNotFoundError.
+        raise RuntimeError(
+            "the openssl CLI is required to generate the native-TLS "
+            "listener's certificate (RFC 9842 secure-context checks); "
+            "install the openssl package"
+        )
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=127.0.0.1",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return cert, key
+
+
+def write_config(
+    root: pathlib.Path,
+    port: int,
+    tls_port: int,
+    insecure_port: int,
+    modules,
+    with_ssl: bool,
+) -> pathlib.Path:
     conf_dir = root / "conf"
     conf_dir.mkdir()
     (root / "logs").mkdir()
     load = "".join(f"load_module {m};\n" for m in modules)
+
+    # Only emitted for an SSL-capable binary: `listen ... ssl` against an
+    # nginx without ngx_http_ssl_module is [emerg] at config parse, so an
+    # unconditional block would take every non-TLS assertion down with it.
+    tls_server = ""
+    if with_ssl:
+        cert, key = make_selfsigned(root)
+        tls_server = f"""
+    # Native TLS: the secure context the RFC actually describes, with no
+    # acknowledgement directive at all. Proves the gate passes on
+    # r->connection->ssl rather than only on the opt-in.
+    server {{
+        listen 127.0.0.1:{tls_port} ssl;
+        ssl_certificate {cert};
+        ssl_certificate_key {key};
+        root html;
+    }}
+"""
     conf = conf_dir / "nginx.conf"
     conf.write_text(
         f"""{load}
@@ -138,14 +241,36 @@ pid logs/nginx.pid;
 events {{ }}
 http {{
     access_log off;
+    # $zstd_bytes_out / $zstd_ratio are log-phase variables (only valid
+    # once the filter has finished writing the response); this format
+    # exists so the dcz byte-accounting oracle below can read the
+    # module's own count of bytes it queued downstream and cross-check
+    # it against the bytes actually received over the socket.
+    log_format zstd_bytes_fmt "$zstd_bytes_out $zstd_ratio";
     types {{ application/javascript js; }}
     default_type application/octet-stream;
     gzip_vary on;
     zstd on;
     zstd_min_length 64;
     zstd_dcz_dict_file {root}/dicts/app-v1.js;
+
+    # Cleartext listener modelling "TLS terminated by a proxy in front":
+    # RFC 9842 section 8 forbids dcz outside a secure context, and this
+    # listener carries the explicit operator acknowledgement that the
+    # client-facing hop was HTTPS. Every pre-existing check in this file
+    # runs here.
     server {{
         listen 127.0.0.1:{port};
+        zstd_dcz_assume_secure_transport on;
+        root html;
+        access_log logs/zstd_bytes.log zstd_bytes_fmt;
+    }}
+
+{tls_server}
+    # Cleartext with NO acknowledgement: the compiled-in default. Nothing
+    # a client can send may negotiate dcz here.
+    server {{
+        listen 127.0.0.1:{insecure_port};
         root html;
     }}
 }}
@@ -156,13 +281,26 @@ http {{
     return conf
 
 
-def fetch(port: int, headers: dict):
+def fetch(port: int, headers: dict, tls: bool = False):
     """Returns (email.message.Message, body). The Message preserves
     repeated header lines — the module legitimately emits two Vary
     lines (Accept-Encoding via gzip_vary, Available-Dictionary its own),
-    and a dict would silently keep only one of them."""
-    request = urllib.request.Request(f"http://127.0.0.1:{port}/app.js", headers=headers)
-    with urllib.request.urlopen(request, timeout=10) as response:
+    and a dict would silently keep only one of them.
+
+    tls=True talks to the native-TLS listener. The certificate is the
+    per-run self-signed one from make_selfsigned(), so verification is
+    switched off deliberately: this asserts the module's view of
+    r->connection->ssl, not PKI."""
+    scheme = "https" if tls else "http"
+    request = urllib.request.Request(
+        f"{scheme}://127.0.0.1:{port}/app.js", headers=headers
+    )
+    context = None
+    if tls:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(request, timeout=10, context=context) as response:
         return response.headers, response.read()
 
 
@@ -173,6 +311,27 @@ def content_encoding(headers) -> str:
 
 def vary_values(headers) -> str:
     return ",".join(headers.get_all("Vary") or []).lower()
+
+
+def read_last_log_line(path: pathlib.Path, timeout: float = 10.0) -> str:
+    """Poll for the access log line the most recent request just wrote.
+
+    $zstd_bytes_out / $zstd_ratio are log-phase variables: nginx writes
+    the access_log line only after the response is fully sent, which can
+    race a fast local request. Poll instead of reading once, mirroring
+    test_encoding.py's validate_ratio_log.
+    """
+    deadline = time.time() + timeout
+    line = ""
+    while time.time() < deadline:
+        if path.exists():
+            content = path.read_text(encoding="utf-8", errors="replace")
+            lines = [l for l in content.splitlines() if l.strip()]
+            if lines:
+                line = lines[-1]
+                break
+        time.sleep(0.05)
+    return line
 
 
 def decode_dcz(
@@ -240,7 +399,10 @@ def main() -> int:
         os.chmod(tmp, 0o755)
         root = pathlib.Path(tmp)
         dict_bytes, resource = build_fixtures(root, args.fixture_lines)
-        conf = write_config(root, args.port, modules)
+        tls_port = args.tls_port if args.tls_port else args.port + 1
+        insecure_port = args.insecure_port if args.insecure_port else args.port + 2
+        with_ssl = nginx_has_ssl(nginx_path)
+        conf = write_config(root, args.port, tls_port, insecure_port, modules, with_ssl)
         dict_hash = hashlib.sha256(dict_bytes).digest()
         dict_b64 = base64.b64encode(dict_hash).decode()
         bad_b64 = base64.b64encode(b"\x01" * 32).decode()
@@ -254,6 +416,84 @@ def main() -> int:
             )
         try:
             wait_for_port(args.port, stderr_file=stderr_file)
+            wait_for_port(insecure_port, stderr_file=stderr_file)
+            if with_ssl:
+                wait_for_port(tls_port, stderr_file=stderr_file)
+
+            # -- RFC 9842 section 8: dcz is a secure-context-only coding.
+            dcz_headers = {
+                "Accept-Encoding": "zstd, dcz",
+                "Available-Dictionary": f":{dict_b64}:",
+            }
+
+            if with_ssl:
+                tls_headers, tls_body = fetch(tls_port, dict(dcz_headers), tls=True)
+                check(
+                    "secure context: native TLS negotiates dcz with no opt-in",
+                    content_encoding(tls_headers) == "dcz",
+                    f"(got {content_encoding(tls_headers)})",
+                )
+                check(
+                    "secure context: native-TLS dcz body carries the RFC magic",
+                    tls_body[:8] == DCZ_MAGIC and tls_body[8:40] == dict_hash,
+                    f"(got {tls_body[:8].hex()})",
+                )
+            else:
+                # Loud and named, not silent: the sanitizer and valgrind
+                # builds have no ngx_http_ssl_module, so the native-TLS
+                # leg cannot run there. Everything below still gates --
+                # the fail-closed default and the spoof cases are the
+                # security-relevant assertions and need no TLS.
+                print(
+                    "  native-TLS checks skipped (nginx -V has no "
+                    "--with-http_ssl_module: this binary cannot parse "
+                    "`listen ... ssl`); cleartext fail-closed and spoof "
+                    "checks below still run"
+                )
+
+            insecure_headers, insecure_body = fetch(insecure_port, dict(dcz_headers))
+            check(
+                "secure context: plain HTTP falls back to zstd "
+                "(compiled-in default, no directive)",
+                content_encoding(insecure_headers) == "zstd",
+                f"(got {content_encoding(insecure_headers)})",
+            )
+            insecure_src = root / "insecure-fallback.zst"
+            insecure_src.write_bytes(insecure_body)
+            # check=False on purpose: if the gate regresses, this body is
+            # a dcz frame and the dictionary-less decode EXITS NON-ZERO.
+            # With check=True that regression surfaces as a traceback
+            # that skips every remaining assertion instead of as a
+            # readable FAIL line.
+            insecure_decode = subprocess.run(
+                [args.zstd_bin, "-d", "-q", "-c", str(insecure_src)],
+                check=False,
+                capture_output=True,
+            )
+            check(
+                "secure context: the plain-HTTP fallback is still decodable "
+                "without the dictionary",
+                insecure_decode.returncode == 0 and insecure_decode.stdout == resource,
+                f"(rc={insecure_decode.returncode}, "
+                f"{len(insecure_decode.stdout)} bytes)",
+            )
+
+            # An untrusted client-supplied scheme signal must not
+            # re-enable dcz: X-Forwarded-Proto is settable by anyone who
+            # can reach the listener, so the module never consults it.
+            for spoof in (
+                {"X-Forwarded-Proto": "https"},
+                {"Forwarded": "proto=https"},
+                {"X-Forwarded-Ssl": "on"},
+                {"Front-End-Https": "on"},
+            ):
+                spoof_headers, _ = fetch(insecure_port, {**dcz_headers, **spoof})
+                name = next(iter(spoof))
+                check(
+                    f"secure context: spoofed {name} does not enable dcz",
+                    content_encoding(spoof_headers) == "zstd",
+                    f"(got {content_encoding(spoof_headers)})",
+                )
 
             # -- plain zstd client: baseline and cache-key contract
             headers, plain_body = fetch(args.port, {"Accept-Encoding": "zstd"})
@@ -270,6 +510,14 @@ def main() -> int:
             check(
                 "plain variant varies on Accept-Encoding",
                 "accept-encoding" in vary_values(headers),
+                f"(vary: {vary_values(headers)!r})",
+            )
+            check(
+                # Sec-Fetch-Site selects the representation (dcz is
+                # refused cross-site), so a shared cache must key on it
+                # or it serves one origin's variant to the other.
+                "plain variant varies on Sec-Fetch-Site",
+                "sec-fetch-site" in vary_values(headers),
                 f"(vary: {vary_values(headers)!r})",
             )
 
@@ -289,6 +537,11 @@ def main() -> int:
             check(
                 "dcz variant varies on Available-Dictionary",
                 "available-dictionary" in vary_values(headers),
+                f"(vary: {vary_values(headers)!r})",
+            )
+            check(
+                "dcz variant varies on Sec-Fetch-Site",
+                "sec-fetch-site" in vary_values(headers),
                 f"(vary: {vary_values(headers)!r})",
             )
             check(
@@ -315,6 +568,52 @@ def main() -> int:
                 len(dcz_body) < len(plain_body),
                 f"(dcz {len(dcz_body)} vs zstd {len(plain_body)})",
             )
+
+            # -- $zstd_bytes_out / $zstd_ratio byte-accounting oracle.
+            #
+            # Regression for the 40-byte dcz prefix being counted twice:
+            # ngx_http_zstd_filter_get_buf() advances out_buf->last past
+            # the 40-byte skippable-frame prefix AND used to separately
+            # add 40 to ctx->bytes_out, while the emit path in
+            # ngx_http_zstd_filter_compress() already counts the whole
+            # buffer (prefix included) via ngx_buf_size(). Ground truth
+            # is len(dcz_body): the exact bytes this request put on the
+            # wire, already captured above. $zstd_bytes_out must equal it
+            # exactly -- not "close", not "within 40" -- and $zstd_ratio
+            # (bytes_in*1000/bytes_out, truncated to 3 decimals) must be
+            # derivable from that same bytes_out.
+            bytes_log_line = read_last_log_line(root / "logs" / "zstd_bytes.log")
+            check(
+                "$zstd_bytes_out / $zstd_ratio access_log line was written",
+                bool(bytes_log_line),
+                f"(zstd_bytes.log: {bytes_log_line!r})",
+            )
+            if bytes_log_line:
+                logged_bytes_out_str, logged_ratio_str = bytes_log_line.split(" ", 1)
+                logged_bytes_out = int(logged_bytes_out_str)
+                check(
+                    "$zstd_bytes_out equals the actual dcz response byte "
+                    "length (prefix counted exactly once)",
+                    logged_bytes_out == len(dcz_body),
+                    f"(zstd_bytes_out={logged_bytes_out}, wire body={len(dcz_body)})",
+                )
+
+                # Ground truth is len(dcz_body), NOT logged_bytes_out: the
+                # ratio must match the ACTUAL wire bytes. Deriving the
+                # expectation from logged_bytes_out instead would make
+                # this check vacuous under the exact bug this test guards
+                # against (bytes_out inflated by 40 would inflate the
+                # expectation the same way and the two would always
+                # agree, however wrong bytes_out is).
+                bytes_in = len(resource)
+                scaled = bytes_in * 1000 // len(dcz_body)
+                expected_ratio = f"{scaled // 1000}.{scaled % 1000:03d}"
+                check(
+                    "$zstd_ratio matches bytes_in*1000/bytes_out computed "
+                    "from the actual wire byte count",
+                    logged_ratio_str == expected_ratio,
+                    f"(logged {logged_ratio_str!r}, expected {expected_ratio!r})",
+                )
 
             # -- content checksum (defence in depth): the inner zstd frame
             # starts right after the 40-byte dcz header, so byte 44 is its

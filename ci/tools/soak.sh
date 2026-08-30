@@ -67,6 +67,15 @@ http {
             zstd on;
             zstd_min_length 100;
             zstd_types text/plain;
+            # RFC 9842 section 8 restricts dcz to secure contexts, and
+            # this soak listener is plain HTTP -- the sanitizer and
+            # valgrind nginx builds it runs against have no
+            # ngx_http_ssl_module, so it cannot be anything else. The
+            # acknowledgement models the supported TLS-terminating-proxy
+            # deployment and keeps the dcz path (negotiation,
+            # ZSTD_CCtx_refPrefix, the 40-byte frame header) under the
+            # sanitizers, which is the whole point of exercising it here.
+            zstd_dcz_assume_secure_transport on;
             zstd_dcz_dict_file $WORK/html/dcz-dict;
             alias $WORK/html/dczbody;
         }
@@ -240,7 +249,10 @@ worker() {
         echo "FAIL worker $wid: no dcz response was ever verified"
         return 1
     fi
-    [ "$bad" -eq 0 ] && [ "$ok" -gt 0 ]
+    if [ "$bad" -ne 0 ] || [ "$ok" -eq 0 ]; then
+        return 1
+    fi
+    return 0
 }
 
 pids=()
@@ -255,11 +267,32 @@ kill -QUIT "$NGINX_PID" 2>/dev/null || true
 wait "$NGINX_PID" 2>/dev/null
 rc=$?
 
+# shellcheck source=ci/tools/soak_asan_verdict.sh
+. "$(cd "$(dirname "$0")" && pwd)/soak_asan_verdict.sh"
+
 problems=0
+indeterminate=0
 if ls "$WORK"/logs/asan* >/dev/null 2>&1; then
-    echo "FAIL: ASAN/UBSAN report:"
+    echo "ASAN/UBSAN log:"
     cat "$WORK"/logs/asan*
-    problems=1
+    set +e
+    soak_asan_verdict "$WORK"/logs/asan*
+    asan_rc=$?
+    set -e
+    case "$asan_rc" in
+        0) : ;;
+        2)
+            echo "::warning::LeakSanitizer could not run its exit-time check" \
+                 "(ptrace blocked on this runner — LXC seccomp / yama). Soak" \
+                 "leak check INDETERMINATE, not clean; fix the runner profile" \
+                 "to restore coverage."
+            indeterminate=1
+            ;;
+        *)
+            echo "FAIL: ASAN/UBSAN report (see log above)"
+            problems=1
+            ;;
+    esac
 fi
 if ls "$WORK"/logs/valgrind.* "$WORK"/logs/helgrind.* >/dev/null 2>&1; then
     if grep -qE 'ERROR SUMMARY: [1-9]|definitely lost: [1-9]' \
@@ -296,4 +329,10 @@ if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then
 fi
 
 [ "$problems" -ne 0 ] && exit 1
-echo "✓ soak clean: ${DURATION}s @ ${CONC} concurrent, no sanitizer/leak/crash"
+if [ "$indeterminate" -ne 0 ]; then
+    echo "⚠ soak passed: ${DURATION}s @ ${CONC} concurrent, no crash/sanitizer" \
+         "finding, but the leak lane is INDETERMINATE this run (ptrace" \
+         "blocked -- see warning above)"
+else
+    echo "✓ soak clean: ${DURATION}s @ ${CONC} concurrent, no sanitizer/leak/crash"
+fi

@@ -46,7 +46,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout module
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
@@ -76,7 +76,7 @@ jobs:
           # that is not really a gate. This module has no lint-sync-stamp.sh
           # or lint-prompt-steps.* (those track the skeleton's own adoption
           # prompt, not this module), so they are not listed.
-          LINT_ONLY: nginx sh python perl yaml spelling ci-runners ci-ports ci-cadence ci-secrets docs-drift
+          LINT_ONLY: nginx sh python perl yaml spelling ci-runners ci-ports ci-cadence ci-topology ci-secrets ci-provenance docs-drift
         run: ci/linter/run-all.sh
 
       # ast-grep and gitleaks live in .pre-commit-config.yaml rather than in a

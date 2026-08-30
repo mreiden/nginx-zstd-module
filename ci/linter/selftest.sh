@@ -35,7 +35,7 @@ case_() {
         echo "ok   $desc (exit $got)"
     else
         echo "FAIL $desc: expected exit $want, got $got" >&2
-        echo "$out" | sed 's/^/       | /' >&2
+        printf '       | %s\n' "${out//$'\n'/$'\n       | '}" >&2
         rc=1
     fi
 }
@@ -66,6 +66,25 @@ fi
 # Positive control: the selector still selects. --list is used rather than a
 # real run so this stays independent of which linters are installed.
 case_ 0 "--list works" ci/linter/run-all.sh --list
+case_ 0 "CI topology negative controls hold" \
+    python3 ci/linter/ci_topology.py --selftest
+
+# Work-list consumers used process substitution, whose exit status is not
+# visible to mapfile. Exercise each real consumer with a producer that emits a
+# plausible prefix and then fails; all three must propagate its exact status.
+case_ 23 "lint work list rejects partial output followed by failure" \
+    env MAPFILE_CHECKED_FAULT=partial-error ci/linter/lint-sh.sh ci/linter/lib.sh
+case_ 23 "dictionary work list rejects partial output followed by failure" \
+    env MAPFILE_CHECKED_FAULT=partial-error ci/fuzz/gen_dict.sh --check
+case_ 23 "coverage work list rejects partial output followed by failure" \
+    env MAPFILE_CHECKED_FAULT=partial-error ci/tools/coverage.sh \
+        --selftest-work-list "$ROOT"
+case_ 23 "docs directive list rejects partial output followed by failure" \
+    env MAPFILE_CHECKED_FAULT=partial-error ci/tools/test_docs_ci_drift.sh \
+        --selftest-directive-list
+case_ 23 "docs workflow list rejects partial output followed by failure" \
+    env MAPFILE_CHECKED_FAULT=partial-error ci/tools/test_docs_ci_drift.sh \
+        --selftest-workflow-list
 
 # ----------------------------------------------------------------------------
 # workflow_policy.py -- the red path of each policy check.
@@ -117,6 +136,7 @@ policy_msg_() {
 policy_ 0 clean runners
 policy_ 0 clean ports
 policy_ 0 clean docs
+policy_ 0 clean provenance
 # Deliberately NO `policy_ 0 clean cadence`: the clean fixture has no
 # workflow_call member, so that line would assert green over an empty set --
 # vacuous, and indistinguishable from the check being broken. The green control
@@ -206,6 +226,44 @@ policy_ 1 secrets-undeclared secrets
 # first written: member requires it, caller wires nothing.
 policy_ 1 secrets-required-not-wired secrets
 policy_ 0 secrets-typed-ok secrets
+
+# A step downloads a tarball; a later step in the same job extracts it and
+# runs the unpacked configure with no gpg/sha256 trust-anchor assertion
+# anywhere in between -- the class this repo hit in build-test.yml/ci-deep.yml
+# after the ci-build.sh fix (a direct download/extract/execute path added
+# outside that already-verified helper). These run as a PAIR: the -ok fixture
+# is the same job with a sha256 comparison step inserted, so the red above is
+# not equally consistent with "any download in a job is flagged".
+policy_ 1 provenance-unverified-extract provenance
+policy_ 0 provenance-verified-ok provenance
+# A reviewed verification helper named later in the SAME run block cannot
+# retroactively protect extraction that occurred earlier in that block.
+policy_ 1 provenance-verify-helper-after-extract provenance
+# The trap this check exists to close: the download step is gated
+# `cache-hit != 'true'`, so a cache HIT skips it entirely and a checker that
+# only looks for a download step present would read the job as having
+# nothing to verify. This must still go red -- a cached tarball is exactly as
+# untrusted as a fresh one until re-checked.
+policy_ 1 provenance-cache-hit-skips-verify provenance
+# The scoping regex must know every spelling that writes a file from the
+# network, not just `-O`/`-o`. A bare `wget "<url>"` is the idiom four of this
+# repo's own jobs use; while the regex required -O those jobs matched no
+# download token and were skipped wholesale rather than checked -- a gate
+# failing open. Same class for `curl -O` and `Invoke-WebRequest -OutFile`.
+policy_ 1 provenance-bare-wget-unverified provenance
+# One probe per spelling the DOWNLOAD_RE comment claims to cover. Without
+# these two, a regression in the curl -O or Invoke-WebRequest branch passes
+# the selftest while the comment still advertises them as handled.
+policy_ 1 provenance-curl-O-unverified provenance
+policy_ 1 provenance-iwr-outfile-unverified provenance
+# The ANCHOR half failing open, not the scoping half: a bare `sha256sum f`
+# prints a digest and compares nothing, yet used to satisfy TRUST_ANCHOR_RE.
+# provenance-verified-ok is the green control for a real comparison.
+policy_ 1 provenance-noncomparing-sha256 provenance
+# No archive at all: download a standalone binary, chmod +x, run it. The
+# tar/unzip patterns miss this entirely, yet it is the same privilege
+# boundary one step shorter.
+policy_ 1 provenance-exec-downloaded-binary provenance
 
 # A mistyped pool label in a schedule-only workflow. The trust half of the
 # runners check does not apply to a workflow no fork can reach, and skipping it
