@@ -359,14 +359,25 @@ ngx_http_compression_static_probe_frame(const u_char *hdr, size_t n,
 {
     uint32_t    mw;
     uint64_t    w;
-    ngx_uint_t  i, fhd, fcs_size, off;
+    ngx_uint_t  fhd, fcs_size, off;
 
     static const ngx_uint_t  did_len[4] = { 0, 1, 2, 4 };
 
+    /*
+     * Fixed-width decodes (parent #259): on little-endian targets the
+     * wire format IS the native layout, and ngx_memcpy() of the exact
+     * width keeps unaligned access safe while the compiler collapses it
+     * to one load. The bytewise assembly stays as the other-byte-order
+     * fallback — behavior-identical, just more instructions.
+     */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    ngx_memcpy(&mw, hdr, sizeof(uint32_t));
+#else
     mw = ((uint32_t) hdr[0])
        | ((uint32_t) hdr[1] << 8)
        | ((uint32_t) hdr[2] << 16)
        | ((uint32_t) hdr[3] << 24);
+#endif
 
     if (mw != NGX_HTTP_COMPRESSION_STATIC_ZSTD_MAGIC
         && (mw & NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_MASK)
@@ -389,10 +400,19 @@ ngx_http_compression_static_probe_frame(const u_char *hdr, size_t n,
             return NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED;
         }
 
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        {
+            uint32_t  skip_size;
+
+            ngx_memcpy(&skip_size, hdr + 4, sizeof(uint32_t));
+            *window = skip_size;
+        }
+#else
         *window = ((uint64_t) hdr[4])
                 | ((uint64_t) hdr[5] << 8)
                 | ((uint64_t) hdr[6] << 16)
                 | ((uint64_t) hdr[7] << 24);
+#endif
 
         return NGX_HTTP_COMPRESSION_STATIC_FRAME_SKIP;
     }
@@ -434,10 +454,45 @@ ngx_http_compression_static_probe_frame(const u_char *hdr, size_t n,
             return NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED;
         }
 
-        w = 0;
-        for (i = 0; i < fcs_size; i++) {
-            w |= (uint64_t) hdr[off + i] << (8 * i);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        switch (fcs_size) {
+
+        case 1:
+            w = hdr[off];
+            break;
+
+        case 2:
+            {
+                uint16_t  value;
+
+                ngx_memcpy(&value, hdr + off, sizeof(uint16_t));
+                w = value;
+            }
+            break;
+
+        case 4:
+            {
+                uint32_t  value;
+
+                ngx_memcpy(&value, hdr + off, sizeof(uint32_t));
+                w = value;
+            }
+            break;
+
+        default:
+            ngx_memcpy(&w, hdr + off, sizeof(uint64_t));
+            break;
         }
+#else
+        {
+            ngx_uint_t  i;
+
+            w = 0;
+            for (i = 0; i < fcs_size; i++) {
+                w |= (uint64_t) hdr[off + i] << (8 * i);
+            }
+        }
+#endif
 
         if (fcs_size == 2) {
             w += 256;  /* RFC 8878: the 2-byte field is offset */
