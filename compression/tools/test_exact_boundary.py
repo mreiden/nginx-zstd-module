@@ -27,8 +27,8 @@ the compression module compiled in, plus the zstd and brotli CLIs.
 from __future__ import annotations
 
 import argparse
-import pathlib
 import os
+import pathlib
 import re
 import socket
 import subprocess
@@ -110,7 +110,7 @@ def get(port: int, path: str, coding: str, timeout: float = 30.0) -> bytes:
 
 def decode(coding: str, blob: bytes) -> bytes:
     r = subprocess.run(CODINGS[coding]["decode"], input=blob,
-                       capture_output=True)
+                       capture_output=True, check=False)
     if r.returncode != 0:
         raise RuntimeError(
             f"{coding} decode failed (truncated/corrupt stream): "
@@ -176,7 +176,7 @@ def main() -> int:
     if not nginx.exists():
         raise FileNotFoundError(nginx)
 
-    v = subprocess.run([str(nginx), "-V"], capture_output=True, text=True)
+    v = subprocess.run([str(nginx), "-V"], capture_output=True, text=True, check=False)
     if "compression" not in v.stderr:
         raise RuntimeError("nginx -V shows no compression module")
     if args.log_level == "debug" and "--with-debug" not in v.stderr:

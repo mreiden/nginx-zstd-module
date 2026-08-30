@@ -184,7 +184,7 @@ def timed_get(port: int, path: str, coding: str,
 
 def decode(coding: str, blob: bytes) -> bytes:
     r = subprocess.run(CODINGS[coding]["decode"], input=blob,
-                       capture_output=True)
+                       capture_output=True, check=False)
     if r.returncode != 0:
         raise RuntimeError(
             f"{coding} decode failed (truncated/corrupt stream): "
@@ -198,7 +198,7 @@ def main() -> int:
     if not nginx.exists():
         raise FileNotFoundError(nginx)
 
-    v = subprocess.run([str(nginx), "-V"], capture_output=True, text=True)
+    v = subprocess.run([str(nginx), "-V"], capture_output=True, text=True, check=False)
     if "compression" not in v.stderr:
         raise RuntimeError("nginx -V shows no compression module "
                            "(--add-module=.../compression missing?)")

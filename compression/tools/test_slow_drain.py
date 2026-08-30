@@ -208,7 +208,7 @@ def http_get(port: int, path: str, coding: str, slow: bool,
 def decode(coding: str, blob: bytes) -> bytes:
     """Decompress with the reference CLI; nonzero exit = truncation."""
     r = subprocess.run(CODINGS[coding]["decode"], input=blob,
-                       capture_output=True)
+                       capture_output=True, check=False)
     if r.returncode != 0:
         raise RuntimeError(
             f"{coding} decode failed (truncated/corrupt stream): "
@@ -223,7 +223,7 @@ def main() -> int:
     if not nginx.exists():
         raise FileNotFoundError(nginx)
 
-    v = subprocess.run([str(nginx), "-V"], capture_output=True, text=True)
+    v = subprocess.run([str(nginx), "-V"], capture_output=True, text=True, check=False)
     if "compression" not in v.stderr:
         raise RuntimeError("nginx -V shows no compression module")
     if "--with-debug" not in v.stderr:
@@ -286,7 +286,10 @@ http {{
         # nginx's own stdout/stderr to a file, not a PIPE: nothing
         # drains a pipe here, and on failure the tail is the diagnosis.
         nlog_path = root / "logs" / "nginx-stdout.log"
-        nlog = open(nlog_path, "w", encoding="utf-8")
+        # SIM115 suppressed: the handle must outlive this block -- it is
+        # Popen's stdout for the whole server lifetime; a with-block
+        # would close it while nginx is still writing (master's shape).
+        nlog = open(nlog_path, "w", encoding="utf-8")  # noqa: SIM115
         proc = subprocess.Popen(
             [str(nginx), "-p", str(root), "-c", str(conf),
              "-g", "daemon off; master_process off;"],
