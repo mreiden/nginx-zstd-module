@@ -1874,61 +1874,30 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     conf = ngx_http_get_module_loc_conf(r, ngx_http_compression_filter_module);
 
     /*
-     * PHASE3: the parent zstd filter's status set — every 2xx except
-     * 204/205 (no body by definition) and 206 (ranges address the
-     * ENCODED representation; compressing a slice would corrupt it),
-     * plus 403 and 404, whose bodies are often the most-served
-     * compressible content on a busy origin.
+     * GATE ORDER (round 5, eilandert's finding — the tier boundaries
+     * are load-bearing):
+     *
+     * SCOPE first — off, subrequest, already-encoded. The module makes
+     * no whole-stack claim on these; core gzip legitimately owns them.
+     *
+     * WHOLE-STACK VETOES second — no-transform and compression_bypass
+     * speak for the entire stack, gzip token included, so they must
+     * run BEFORE the local eligibility gates: those gates are
+     * DEFERRALS to core gzip, and with the vetoes below them,
+     * "compression_types application/json" beside "gzip_types
+     * text/plain" answered a text/plain no-transform (or bypassed)
+     * response with Content-Encoding: gzip — the type mismatch
+     * deferred before the veto could latch gzip off.
+     *
+     * LOCAL ELIGIBILITY last — status set, protocol floor, types,
+     * min/max length: this location declines, core gzip still applies
+     * its own rules.
      */
     if (!conf->enable
         || r != r->main
-        || r->headers_out.status < NGX_HTTP_OK
-        || r->headers_out.status == NGX_HTTP_NO_CONTENT
-        || r->headers_out.status == 205  /* Reset Content: no core macro */
-        || r->headers_out.status == NGX_HTTP_PARTIAL_CONTENT
-        || (r->headers_out.status > 299
-            && r->headers_out.status != NGX_HTTP_FORBIDDEN
-            && r->headers_out.status != NGX_HTTP_NOT_FOUND)
-        /*
-         * NO r->header_only skip (parent-audit find): a HEAD response
-         * must advertise the same Content-Encoding its GET would
-         * produce — core gzip does, and skipping made HEAD and GET
-         * disagree. The body filter sees no body on HEAD and simply
-         * never runs the encoder.
-         */
-        /*
-         * Protocol floor (Mark's call, gzip_http_version parity,
-         * default 1.1): an RFC 1945-era client is gzip-at-best, and
-         * HTTP/1.0 frequently means an ancient intermediary. Skipping
-         * WITHOUT a latch is a deferral — core gzip below applies its
-         * own gzip_http_version rule, which is as good as it gets for
-         * those clients.
-         */
-        || r->http_version < conf->http_version
         || (r->headers_out.content_encoding != NULL
-            && r->headers_out.content_encoding->value.len != 0)
-        || ngx_http_test_content_type(r, &conf->types) == NULL)
+            && r->headers_out.content_encoding->value.len != 0))
     {
-        return ngx_http_next_header_filter(r);
-    }
-
-    if (r->headers_out.content_length_n != -1
-        && r->headers_out.content_length_n < conf->min_length)
-    {
-        return ngx_http_next_header_filter(r);
-    }
-
-    /* known body larger than the compression_max_length ceiling (the
-     * parents' zstd_max_length / brotli_max_length worker protection);
-     * the RUNNING cap in the body filter covers undeclared lengths */
-    if (conf->max_length != NGX_CONF_UNSET
-        && r->headers_out.content_length_n != -1
-        && r->headers_out.content_length_n > conf->max_length)
-    {
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "compression: skip, body %O > compression_max_length "
-                       "%O", r->headers_out.content_length_n,
-                       (off_t) conf->max_length);
         return ngx_http_next_header_filter(r);
     }
 
@@ -1997,6 +1966,61 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         r->gzip_ok = 0;
 #endif
 
+        return ngx_http_next_header_filter(r);
+    }
+
+    /*
+     * PHASE3: the parent zstd filter's status set — every 2xx except
+     * 204/205 (no body by definition) and 206 (ranges address the
+     * ENCODED representation; compressing a slice would corrupt it),
+     * plus 403 and 404, whose bodies are often the most-served
+     * compressible content on a busy origin.
+     */
+    if (r->headers_out.status < NGX_HTTP_OK
+        || r->headers_out.status == NGX_HTTP_NO_CONTENT
+        || r->headers_out.status == 205  /* Reset Content: no core macro */
+        || r->headers_out.status == NGX_HTTP_PARTIAL_CONTENT
+        || (r->headers_out.status > 299
+            && r->headers_out.status != NGX_HTTP_FORBIDDEN
+            && r->headers_out.status != NGX_HTTP_NOT_FOUND)
+        /*
+         * NO r->header_only skip (parent-audit find): a HEAD response
+         * must advertise the same Content-Encoding its GET would
+         * produce — core gzip does, and skipping made HEAD and GET
+         * disagree. The body filter sees no body on HEAD and simply
+         * never runs the encoder.
+         */
+        /*
+         * Protocol floor (Mark's call, gzip_http_version parity,
+         * default 1.1): an RFC 1945-era client is gzip-at-best, and
+         * HTTP/1.0 frequently means an ancient intermediary. Skipping
+         * WITHOUT a latch is a deferral — core gzip below applies its
+         * own gzip_http_version rule, which is as good as it gets for
+         * those clients.
+         */
+        || r->http_version < conf->http_version
+        || ngx_http_test_content_type(r, &conf->types) == NULL)
+    {
+        return ngx_http_next_header_filter(r);
+    }
+
+    if (r->headers_out.content_length_n != -1
+        && r->headers_out.content_length_n < conf->min_length)
+    {
+        return ngx_http_next_header_filter(r);
+    }
+
+    /* known body larger than the compression_max_length ceiling (the
+     * parents' zstd_max_length / brotli_max_length worker protection);
+     * the RUNNING cap in the body filter covers undeclared lengths */
+    if (conf->max_length != NGX_CONF_UNSET
+        && r->headers_out.content_length_n != -1
+        && r->headers_out.content_length_n > conf->max_length)
+    {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "compression: skip, body %O > compression_max_length "
+                       "%O", r->headers_out.content_length_n,
+                       (off_t) conf->max_length);
         return ngx_http_next_header_filter(r);
     }
 

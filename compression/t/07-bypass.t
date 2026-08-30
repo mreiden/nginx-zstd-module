@@ -556,3 +556,68 @@ Accept-Encoding: gzip
 no-transform fixture body: repeated compressible text
 --- no_error_log
 [error]
+
+
+=== TEST 16: no-transform vetoes gzip even when OUR types gate defers
+# Round 5 (eilandert): the local eligibility gates are DEFERRALS to
+# core gzip, so the whole-stack vetoes must run before them --
+# compression_types application/json beside gzip_types text/plain used
+# to answer a text/plain no-transform response with
+# Content-Encoding: gzip, because the type mismatch deferred before
+# the veto could latch gzip off.
+--- config
+    location /origin/ {
+        compression off;
+        add_header Cache-Control "no-transform";
+        default_type text/plain;
+        return 200 "no-transform fixture body: repeated compressible text\n";
+    }
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types application/json;
+        gzip on;
+        gzip_min_length 1;
+        gzip_types text/plain;
+        proxy_pass http://127.0.0.1:$server_port/origin/;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: gzip
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+no-transform fixture body: repeated compressible text
+--- no_error_log
+[error]
+
+
+=== TEST 17: compression_bypass vetoes gzip even when OUR types gate defers
+# Same tier-ordering pin for the operator's veto: a truthy bypass
+# predicate must mean identity from the whole stack regardless of
+# whether THIS location's types would have elected a coding.
+--- config
+    location /origin/ {
+        compression off;
+        default_type text/plain;
+        return 200 "no-transform fixture body: repeated compressible text\n";
+    }
+    location /t {
+        compression on;
+        compression_bypass $arg_nocomp;
+        compression_min_length 1;
+        compression_types application/json;
+        gzip on;
+        gzip_min_length 1;
+        gzip_types text/plain;
+        proxy_pass http://127.0.0.1:$server_port/origin/;
+    }
+--- request
+GET /t?nocomp=1
+--- more_headers
+Accept-Encoding: gzip
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+no-transform fixture body: repeated compressible text
+--- no_error_log
+[error]
