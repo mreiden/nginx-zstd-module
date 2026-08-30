@@ -2277,6 +2277,44 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
 
 
 /*
+ * ngx_create_temp_buf() costs two pool allocations per buffer — the
+ * ngx_buf_t and its payload (parent #258). One aligned block carries
+ * both; the header fields end up identical, so ngx_buf_in_memory(),
+ * the writer's special-buf test, and the recycled/tag handling below
+ * see no difference.
+ */
+static ngx_buf_t *
+ngx_http_compression_create_temp_buf(ngx_pool_t *pool, size_t size)
+{
+    size_t      data_offset;
+    u_char     *allocation;
+    ngx_buf_t  *b;
+
+    data_offset = ngx_align(sizeof(ngx_buf_t), NGX_ALIGNMENT);
+
+    if (size > NGX_MAX_SIZE_T_VALUE - data_offset) {
+        return NULL;
+    }
+
+    allocation = ngx_palloc(pool, data_offset + size);
+    if (allocation == NULL) {
+        return NULL;
+    }
+
+    b = (ngx_buf_t *) allocation;
+    ngx_memzero(b, sizeof(ngx_buf_t));
+
+    b->start = allocation + data_offset;
+    b->pos = b->start;
+    b->last = b->start;
+    b->end = b->start + size;
+    b->temporary = 1;
+
+    return b;
+}
+
+
+/*
  * PHASE3: produce the working output buf — a reclaimed one when the
  * free list has any, a fresh allocation while under the
  * compression_buffers cap, or NGX_DECLINED with ctx->nomem latched
@@ -2323,7 +2361,8 @@ ngx_http_compression_get_buf(ngx_http_request_t *r,
     }
 
     if (ctx->allocated < ctx->bufs_num) {
-        ctx->ob = ngx_create_temp_buf(r->pool, ctx->out_size);
+        ctx->ob = ngx_http_compression_create_temp_buf(r->pool,
+                                                       ctx->out_size);
         if (ctx->ob == NULL) {
             return NGX_ERROR;
         }
