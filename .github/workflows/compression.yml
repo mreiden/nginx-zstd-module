@@ -41,7 +41,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NGINX_VERSION: "1.31.3"
+  # Pinned, unlike the parent's build-test.yml (whose resolve job scrapes
+  # nginx.org for the current mainline at run time): a version bump here
+  # should be a deliberate, blameable commit while phase0 is a prototype.
+  # Adopt the parent's resolve+verify machinery at productization.
+  NGINX_VERSION: "1.31.4"
 
 jobs:
   suites:
