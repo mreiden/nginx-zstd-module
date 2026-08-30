@@ -37,3 +37,6 @@ tools/patches/** text eol=lf
 # The CPAN dependency lock is byte-compared against cpanm output on a
 # Linux runner: a CRLF smudge turns every line into a mismatch.
 *.cpan.lock text eol=lf
+
+# Testkit scenario files execute under bash/nginx on Linux runners
+compression/t/harness-scenarios/** text eol=lf

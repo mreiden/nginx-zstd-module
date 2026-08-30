@@ -470,6 +470,103 @@ jobs:
             -I src/http -I src/http/modules -I objs \
             "${codec_cflags[@]}"
 
+  # ── Testkit consumer scenarios (per-request allocation neutrality) ──
+  # The first slice of the #192-style leak effort, via the parent's
+  # nginx-module-testkit (the ci/t/harness submodule master carries;
+  # same pin): cycle-pool and fd deltas across one extra served
+  # compressed request, asserted from INSIDE the worker — the assertion
+  # the Perl suites structurally cannot make, and the leak class ASan
+  # (which runs with detect_leaks=0 below) never sees. ZERO-HOOK: the
+  # harness's reference probe module supplies the probe endpoint as its
+  # own .so; the compression module carries no probe C. Both directions
+  # run per the harness import-prompt's rule: the staged tree must
+  # produce real assertions AND an unstaged tree must SKIP cleanly —
+  # a permanently-skipping leg reads green in a job summary, which is
+  # exactly the vacuous pass the rule exists to prevent. The oracle's
+  # ability to fail is control-mutation-proven (a planted one-fd-per-
+  # request leak reds oracle 5; see the adopting commit).
+  testkit:
+    name: Testkit scenarios (alloc-neutral)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # 19400 suites, 19500 asan; this job gets its own band (the
+      # harness engine picks its own port; the band reserves headroom)
+      TEST_BASE_PORT: 19600
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Fetch the harness submodule
+        # Only this one — submodules: true would also pull the brotli
+        # graft's google/brotli gitlink, which this job never builds.
+        run: git submodule update --init ci/t/harness
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update
+          sudo apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 install -y \
+            build-essential libzstd-dev libbrotli-dev libpcre2-dev \
+            zlib1g-dev wget
+
+      - name: Cache nginx source tarball
+        id: nginx-tarball
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: nginx-${{ env.NGINX_VERSION }}.tar.gz
+          key: nginx-src-${{ env.NGINX_VERSION }}
+
+      - name: Download nginx source tarball
+        if: steps.nginx-tarball.outputs.cache-hit != 'true'
+        run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+
+      - name: Verify nginx tarball PGP signature
+        run: |
+          set -euo pipefail
+          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
+            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
+          gnupghome="$(mktemp -d)"
+          export GNUPGHOME="$gnupghome"
+          chmod 700 "$gnupghome"
+          for keyfile in ci/tools/keys/*.key; do
+            gpg --quiet --import "$keyfile" 2>/dev/null
+          done
+          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
+          rm -rf "$gnupghome"
+
+      - name: Configure and build (harness-enabled, module + reference probe)
+        run: |
+          set -euo pipefail
+          tar -xzf "nginx-${NGINX_VERSION}.tar.gz"
+          cd "nginx-${NGINX_VERSION}"
+          # TEST_HARNESS=1 + the CFLAGS define together are what compile
+          # the probe non-empty; either alone yields a loadable,
+          # probe-free .so (the requires gate checks symbols, not env)
+          TEST_HARNESS=1 CFLAGS="-DNGX_TEST_HARNESS" ./configure --with-debug \
+            --add-dynamic-module="$GITHUB_WORKSPACE/compression" \
+            --add-dynamic-module="$GITHUB_WORKSPACE/ci/t/harness/t/module" \
+            > configure.log
+          grep -q "ZStandard" configure.log
+          make -j"$(nproc)"
+
+      - name: Build the prober
+        run: cd ci/t/harness && bash ci/prober/build.sh
+
+      - name: Run scenarios (staged tree must produce real assertions)
+        run: |
+          bash compression/tools/run_testkit_scenarios.sh \
+            --build "$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}" \
+            --version "${NGINX_VERSION}"
+
+      - name: Unstaged direction (must SKIP cleanly, not fail)
+        run: |
+          mkdir -p /tmp/testkit-empty-tree/objs
+          bash compression/tools/run_testkit_scenarios.sh \
+            --build /tmp/testkit-empty-tree \
+            --version "${NGINX_VERSION}" --expect-skip
+
   # ── ASan+UBSan over the chain-state paths ────────────────────────────
   # Round-4 review: compression/ never ran under a sanitizer on any job
   # (the root asan.yml builds the repo root as its addon). The three
@@ -479,9 +576,9 @@ jobs:
   # a UB pointer advance would hide behind green functional asserts.
   # Leak checking is deliberately OFF here: LSan's exit-time check is
   # the flaky ptrace-dependent machinery the root repo wraps in its
-  # verdict scripts (#111), and per-request leak coverage is its own
-  # planned effort (#192-style alloc-neutral oracle). This job is
-  # about heap errors and UB, halting on the first finding.
+  # verdict scripts (#111), and per-request leak coverage lives in the
+  # testkit job above (the #192-style alloc-neutral oracle, landed).
+  # This job is about heap errors and UB, halting on the first finding.
   asan:
     name: ASan+UBSan (proxy tools)
     runs-on: ubuntu-latest

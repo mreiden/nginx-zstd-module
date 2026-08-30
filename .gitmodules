@@ -10,3 +10,12 @@
 [submodule "brotli/deps/brotli"]
 	path = brotli/deps/brotli
 	url = https://github.com/google/brotli.git
+
+# eilandert's externalized test harness (nginx-module-testkit, the
+# ci/t/harness submodule master carries): same path and pin as master
+# so the next master->phase0 sync merges the gitlink clean. The
+# compression suites consume it from here (compression/t reaches over
+# via ../../ci/t/harness).
+[submodule "ci/t/harness"]
+	path = ci/t/harness
+	url = https://github.com/myguard-labs/nginx-module-testkit.git
