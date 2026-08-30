@@ -101,6 +101,18 @@ typedef struct {
     ngx_uint_t    dicts_hashed;
 
     /*
+     * One EVP digest context reused across every hash this config load
+     * computes (parent #262): lazily created on the first computed hash,
+     * freed with cf->pool when parsing ends. void* so this header pulls
+     * in no OpenSSL types; NULL (creation failed, or no libcrypto) makes
+     * every hash take the portable path — same total-function contract
+     * as before. Only the directive handler touches it, and only during
+     * parse; a reload's fresh main conf starts over.
+     */
+    void          *sha256_evp_ctx;
+    ngx_flag_t    sha256_evp_ctx_attempted;
+
+    /*
      * Preformatted decimal of dicts_hashed (parent #154), rendered once
      * in init_main_conf() — the count is final after config parsing (all
      * hashing happens in the compression_dict_file directive handler,

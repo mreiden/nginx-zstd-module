@@ -29,6 +29,9 @@ extern ngx_module_t  ngx_http_compression_filter_module;
 
 static ngx_int_t ngx_http_compression_hex_decode(ngx_str_t *hex,
     u_char out[NGX_HTTP_COMPRESSION_SHA256_LEN]);
+static void ngx_http_compression_sha256(ngx_conf_t *cf,
+    ngx_http_compression_main_conf_t *cmcf, const u_char *data, size_t len,
+    u_char digest[NGX_HTTP_COMPRESSION_SHA256_LEN]);
 static ssize_t ngx_http_compression_read_dict_file(ngx_fd_t fd, u_char *buf,
     size_t size);
 static ngx_int_t ngx_http_compression_dicts_hashed_variable(
@@ -324,6 +327,80 @@ ngx_http_compression_hex_encode(const u_char *bin, size_t len, u_char *out)
 }
 
 
+#if (NGX_HTTP_ZSTD_HAVE_LIBCRYPTO)
+
+static void
+ngx_http_compression_sha256_ctx_cleanup(void *data)
+{
+    EVP_MD_CTX_free(data);
+}
+
+#endif
+
+
+/*
+ * Every computed hash in this store goes through here rather than the
+ * parent header's one-shot (parent #262): EVP_Digest() allocates and
+ * frees a digest context internally on every call, so a config load
+ * over hundreds of dictionaries pays hundreds of transient allocations.
+ * One lazily created context, freed with cf->pool when parsing ends,
+ * serves them all. Every failure — context creation, cleanup
+ * registration, or any EVP stage — falls through to the parent's
+ * portable implementation, keeping this a total function; and this
+ * wrapper deliberately does NOT call the header's one-shot, so its
+ * signature owes nothing to the parent's (#262 changed it upstream —
+ * the staged helpers below are the stable surface).
+ */
+static void
+ngx_http_compression_sha256(ngx_conf_t *cf,
+    ngx_http_compression_main_conf_t *cmcf, const u_char *data, size_t len,
+    u_char digest[NGX_HTTP_COMPRESSION_SHA256_LEN])
+{
+    ngx_http_zstd_sha256_t  c;
+
+#if (NGX_HTTP_ZSTD_HAVE_LIBCRYPTO)
+    unsigned int         mdlen;
+    ngx_pool_cleanup_t  *cln;
+
+    if (!cmcf->sha256_evp_ctx_attempted) {
+        cmcf->sha256_evp_ctx_attempted = 1;
+        cmcf->sha256_evp_ctx = EVP_MD_CTX_new();
+
+        if (cmcf->sha256_evp_ctx != NULL) {
+            cln = ngx_pool_cleanup_add(cf->pool, 0);
+
+            if (cln == NULL) {
+                EVP_MD_CTX_free(cmcf->sha256_evp_ctx);
+                cmcf->sha256_evp_ctx = NULL;
+
+            } else {
+                cln->handler = ngx_http_compression_sha256_ctx_cleanup;
+                cln->data = cmcf->sha256_evp_ctx;
+            }
+        }
+    }
+
+    mdlen = NGX_HTTP_COMPRESSION_SHA256_LEN;
+
+    if (cmcf->sha256_evp_ctx != NULL
+        && EVP_DigestInit_ex(cmcf->sha256_evp_ctx, EVP_sha256(), NULL) == 1
+        && EVP_DigestUpdate(cmcf->sha256_evp_ctx, data, len) == 1
+        && EVP_DigestFinal_ex(cmcf->sha256_evp_ctx, digest, &mdlen) == 1
+        && mdlen == NGX_HTTP_COMPRESSION_SHA256_LEN)
+    {
+        return;
+    }
+#else
+    (void) cf;
+    (void) cmcf;
+#endif
+
+    ngx_http_zstd_sha256_init(&c);
+    ngx_http_zstd_sha256_update(&c, data, len);
+    ngx_http_zstd_sha256_final(&c, digest);
+}
+
+
 char *
 ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -466,8 +543,8 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
                 /* optional: the file's computed truth outranks BOTH
                  * declared values — serving keys stay correct */
-                ngx_http_zstd_sha256(entry->bytes.data, entry->bytes.len,
-                                     entry->sha256);
+                ngx_http_compression_sha256(cf, cmcf, entry->bytes.data,
+                                            entry->bytes.len, entry->sha256);
                 cmcf->dicts_hashed++;
                 entry->verified = 1;
                 ngx_http_compression_hex_encode(entry->sha256,
@@ -493,7 +570,8 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
              * hash hazard (deploy script hashed an older file) that
              * verbatim trust cannot catch on its own.
              */
-            ngx_http_zstd_sha256(entry->bytes.data, entry->bytes.len, want);
+            ngx_http_compression_sha256(cf, cmcf, entry->bytes.data,
+                                        entry->bytes.len, want);
             cmcf->dicts_hashed++;
 
             if (ngx_memcmp(entry->sha256, want,
@@ -805,8 +883,8 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             entry->supplied = 1;
 
         } else {
-            ngx_http_zstd_sha256(entry->bytes.data, entry->bytes.len,
-                                 entry->sha256);
+            ngx_http_compression_sha256(cf, cmcf, entry->bytes.data,
+                                        entry->bytes.len, entry->sha256);
             cmcf->dicts_hashed++;
             entry->verified = 1;
 
