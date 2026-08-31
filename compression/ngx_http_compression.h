@@ -281,6 +281,19 @@ struct ngx_http_compression_backend_s {
 extern ngx_http_compression_backend_t
     *ngx_http_compression_backends[NGX_HTTP_COMPRESSION_NBACKENDS + 1];
 
+#if (NGX_HTTP_COMPRESSION_HAVE_ZSTD)
+/*
+ * Runtime libzstd feature-floor check (parent #284), called from the
+ * filter's init_module hook. Lives in the zstd backend TU so the
+ * chassis stays codec-clean: warns on build-vs-runtime version skew,
+ * returns NGX_ERROR only when a configured negative level needs an API
+ * floor the loaded library predates. The policy itself is the parent's
+ * ../src/ngx_http_zstd_version.h verbatim (the unification dividend).
+ */
+ngx_int_t ngx_http_compression_zstd_verify_runtime(ngx_cycle_t *cycle,
+    ngx_flag_t any_negative_level);
+#endif
+
 
 /*
  * One election-order entry. backend == NULL is the gzip token: on the

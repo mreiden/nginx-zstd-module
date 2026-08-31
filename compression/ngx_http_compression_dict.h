@@ -196,6 +196,19 @@ typedef struct {
      * carries the module but never enables it.
      */
     ngx_flag_t    any_enabled;
+
+    /*
+     * "Some compression_level configured a negative zstd level" latch
+     * (parent #284): negative levels first exist in libzstd 1.4.0, a
+     * COMPILE-time gate — but a dynamically loaded libzstd older than
+     * the build headers would take those configured levels into API
+     * territory it does not have. Latched at compression_level parse
+     * time (only the zstd scale admits negatives); init_module feeds
+     * it to the parent's runtime version policy, which warns on any
+     * skew and refuses startup only when a configured feature crosses
+     * its floor.
+     */
+    ngx_flag_t    any_negative_zstd_level;
 } ngx_http_compression_main_conf_t;
 
 

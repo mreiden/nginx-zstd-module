@@ -24,7 +24,8 @@ if test -n "$ngx_module_link"; then
     ngx_module_deps="$ngx_addon_dir/ngx_http_compression.h \
                      $ngx_addon_dir/ngx_http_compression_ae.h \
                      $ngx_addon_dir/ngx_http_compression_dict.h \
-                     $ngx_addon_dir/../src/ngx_http_zstd_sha256.h"
+                     $ngx_addon_dir/../src/ngx_http_zstd_sha256.h \
+                     $ngx_addon_dir/../src/ngx_http_zstd_version.h"
     ngx_module_srcs="$ngx_addon_dir/ngx_http_compression_module.c \
                      $ngx_addon_dir/ngx_http_compression_dict.c \
                      $ngx_addon_dir/ngx_http_compression_zstd.c \
@@ -68,10 +69,12 @@ if test -n "$ngx_module_link"; then
             next=ngx_http_range_header_filter_module
         fi
 
-        HTTP_FILTER_MODULES=`echo " $HTTP_FILTER_MODULES " \
-                             | sed "s/ $ngx_module_name / /" \
-                             | sed "s/ $next / $next $ngx_module_name /" \
-                             | sed "s/^ *//;s/ *\$//"`
+        # The reorder helper is the parent filter's, shared verbatim
+        # (#286): it refuses an absent anchor and verifies the final
+        # order, so a core filter-chain rename fails the build loudly
+        # instead of leaving this filter mis-ordered.
+        . "$ngx_addon_dir/../filter/reorder-static.sh"
+        ngx_http_zstd_reorder_static_filter || exit 1
     fi
 
     ngx_module_type=HTTP

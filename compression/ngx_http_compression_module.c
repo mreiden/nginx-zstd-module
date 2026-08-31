@@ -300,14 +300,50 @@ static ngx_http_module_t  ngx_http_compression_filter_module_ctx = {
 };
 
 
+static ngx_int_t ngx_http_compression_init_module(ngx_cycle_t *cycle);
+
 ngx_module_t  ngx_http_compression_filter_module = {
     NGX_MODULE_V1,
     &ngx_http_compression_filter_module_ctx,      /* module context */
     ngx_http_compression_commands,         /* module directives */
     NGX_HTTP_MODULE,                       /* module type */
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL,                                  /* init master */
+    ngx_http_compression_init_module,      /* init module */
+    NULL,                                  /* init process */
+    NULL,                                  /* init thread */
+    NULL,                                  /* exit thread */
+    NULL,                                  /* exit process */
+    NULL,                                  /* exit master */
     NGX_MODULE_V1_PADDING
 };
+
+
+/*
+ * Runtime feature-floor gate (parent #284). Only the zstd backend has
+ * version-gated API territory (negative levels, libzstd >= 1.4.0);
+ * the check lives in its TU and runs only when that backend is
+ * compiled in. A cycle with no http block has no main conf and
+ * nothing configured — that is a pass, not an error.
+ */
+static ngx_int_t
+ngx_http_compression_init_module(ngx_cycle_t *cycle)
+{
+#if (NGX_HTTP_COMPRESSION_HAVE_ZSTD)
+    ngx_http_compression_main_conf_t  *cmcf;
+
+    cmcf = ngx_http_cycle_get_module_main_conf(
+               cycle, ngx_http_compression_filter_module);
+    if (cmcf == NULL) {
+        return NGX_OK;
+    }
+
+    return ngx_http_compression_zstd_verify_runtime(
+               cycle, cmcf->any_negative_zstd_level);
+#else
+    (void) cycle;
+    return NGX_OK;
+#endif
+}
 
 
 static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
@@ -864,12 +900,13 @@ ngx_http_compression_level_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
 {
     ngx_http_compression_conf_t *ccf = conf;
 
-    u_char                          *p;
-    size_t                           len;
-    ngx_int_t                        i, n;
-    ngx_str_t                       *value;
-    ngx_uint_t                       neg;
-    ngx_http_compression_backend_t  *b;
+    u_char                            *p;
+    size_t                             len;
+    ngx_int_t                          i, n;
+    ngx_str_t                         *value;
+    ngx_uint_t                         neg;
+    ngx_http_compression_backend_t    *b;
+    ngx_http_compression_main_conf_t  *cmcf;
 
     (void) cmd;
 
@@ -912,6 +949,14 @@ ngx_http_compression_level_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
                            "%i and %i", &b->coding, b->level_min,
                            b->level_max);
         return NGX_CONF_ERROR;
+    }
+
+    if (n < 0) {
+        /* only the zstd scale admits negatives (see the vtable
+         * bounds); latch for init_module's runtime floor check */
+        cmcf = ngx_http_conf_get_module_main_conf(
+                   cf, ngx_http_compression_filter_module);
+        cmcf->any_negative_zstd_level = 1;
     }
 
     if (ccf->levels[i] != NGX_HTTP_COMPRESSION_LEVEL_UNSET) {

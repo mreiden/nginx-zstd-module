@@ -32,6 +32,9 @@
 
 #include <zstd.h>
 
+/* the parent's runtime version policy, shared verbatim (parent #284) */
+#include "../src/ngx_http_zstd_version.h"
+
 
 /*
  * Declared level bounds (parent zstd_comp_level parity). The
@@ -321,5 +324,44 @@ static ngx_http_compression_backend_t  ngx_http_compression_zstd_backend = {
 
 ngx_http_compression_backend_t  *ngx_http_compression_backend_zstd =
     &ngx_http_compression_zstd_backend;
+
+
+/*
+ * Runtime libzstd feature-floor check (parent #284; policy function
+ * shared verbatim from ../src/ngx_http_zstd_version.h). This module
+ * has no target-cblock-size directive, so that refusal arm is
+ * structurally absent — the arguments say so explicitly.
+ */
+ngx_int_t
+ngx_http_compression_zstd_verify_runtime(ngx_cycle_t *cycle,
+    ngx_flag_t any_negative_level)
+{
+    unsigned                         runtime;
+    ngx_http_zstd_version_result_t   policy;
+
+    runtime = ZSTD_versionNumber();
+
+    policy = ngx_http_zstd_version_policy(ZSTD_VERSION_NUMBER, runtime,
+                                          0 /* no target-cblock knob */,
+                                          any_negative_level != 0);
+    if (policy == NGX_HTTP_ZSTD_VERSION_OK) {
+        return NGX_OK;
+    }
+
+    ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
+                  "compression module was built with libzstd %ui but "
+                  "loaded libzstd %ui at runtime",
+                  (ngx_uint_t) ZSTD_VERSION_NUMBER, (ngx_uint_t) runtime);
+
+    if (policy == NGX_HTTP_ZSTD_VERSION_REFUSE_NEGATIVE_LEVEL) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "a configured negative zstd \"compression_level\" "
+                      "requires runtime libzstd 1.4.0 or newer "
+                      "(loaded %ui)", (ngx_uint_t) runtime);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
 
 #endif /* NGX_HTTP_COMPRESSION_HAVE_ZSTD */
