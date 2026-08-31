@@ -58,7 +58,6 @@ ci/fuzz/fuzz_accept_encoding
 ci/fuzz/generated_parser.inc
 ci/fuzz/fuzz_dcz
 ci/fuzz/generated_dcz.inc
-ci/fuzz/generated_static_probe.inc
 ci/fuzz/crash-*
 ci/fuzz/corpus-min/
 ci/fuzz/corpus-dcz-min/

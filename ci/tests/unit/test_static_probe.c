@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  *
  * Unit tests for the .zst frame-header probe
- * (src/ngx_http_zstd_static_module.c: ngx_http_zstd_static_probe_frame()).
+ * (src/ngx_http_zstd_frame_probe.h: ngx_http_zstd_static_probe_frame()).
  *
  * WHY THIS EXISTS ALONGSIDE ci/t/01-static.t
  *
@@ -33,9 +33,9 @@
  * feeds it complete frames.
  *
  * Like ci/tests/unit/test_accept_encoding.c this does NOT re-implement the
- * function: run.sh runs ci/fuzz/extract_static_probe.sh before every build,
- * so this binary always links the SHIPPED src/ngx_http_zstd_static_module.c
- * body, never a hand-copied version that can drift.
+ * function: it includes src/ngx_http_zstd_frame_probe.h directly (#270),
+ * so this binary always links the SHIPPED probe -- the header IS the
+ * production code, with no extraction step left to drift or skip.
  *
  * Extend: add a case_*() function and one line in main().
  */
@@ -52,33 +52,15 @@ typedef unsigned char  u_char;
 #define ngx_memcpy  memcpy
 
 /*
- * From <zstd.h>, stable since 0.8.0. Reproduced rather than included so
- * this layer needs no libzstd headers -- same reasoning as ngx_shim.h for
- * the parser suite. If upstream ever changes these the module stops
- * building against the real header first, long before this copy matters.
- */
-#define ZSTD_MAGICNUMBER             0xFD2FB528U
-#define ZSTD_MAGIC_SKIPPABLE_START   0x184D2A50U
-#define ZSTD_MAGIC_SKIPPABLE_MASK    0xFFFFFFF0U
-
-/* Mirrored from src/ngx_http_zstd_static_module.c. */
-#define NGX_HTTP_ZSTD_STATIC_MAX_WINDOW  (8 * 1024 * 1024)
-
-#define NGX_HTTP_ZSTD_STATIC_FRAME_OK          0
-#define NGX_HTTP_ZSTD_STATIC_FRAME_NOT_ZSTD    1
-#define NGX_HTTP_ZSTD_STATIC_FRAME_TRUNCATED   2
-#define NGX_HTTP_ZSTD_STATIC_FRAME_WINDOW_BIG  3
-#define NGX_HTTP_ZSTD_STATIC_FRAME_SKIP        4
-#define NGX_HTTP_ZSTD_STATIC_FRAME_RESERVED    5
-
-/*
  * Included by RELATIVE path, not via -I, for the same reason
  * test_accept_encoding.c does: a static analyser invoked from anywhere
  * must be able to resolve it. An analyser that cannot resolve an include
  * SKIPS THE WHOLE TRANSLATION UNIT and reports no findings, which is
- * indistinguishable from a clean result.
+ * indistinguishable from a clean result. The header self-defines the
+ * RFC-frozen constants and the verdict set, so the mirrored copies this
+ * shim used to carry are gone -- one authoritative spelling (#270).
  */
-#include "../../fuzz/generated_static_probe.inc"
+#include "../../../src/ngx_http_zstd_frame_probe.h"
 
 
 static int  failures;
