@@ -31,6 +31,19 @@ DICT="$DIR/fuzz.dict"
 # shellcheck source=ci/linter/lib.sh
 . "$ROOT/ci/linter/lib.sh"
 
+# The dictionary is byte-exact (its .gitattributes rule is -text), and
+# every consumer of this script compares LINES: a CRLF-contaminated
+# dict makes --check's marker match fail and report "stale tokens" --
+# a misleading diagnosis for a line-ending problem -- while regeneration
+# would faithfully preserve the CR bytes on the lines it rewrites
+# around. Refuse CR up front, in both modes, with the real diagnosis.
+if [ -f "$DICT" ] && grep -q $'\r' "$DICT"; then
+	echo "✗ gen_dict: $DICT contains CRLF line endings. The dictionary" \
+		"is byte-exact; restore the LF version (git checkout with its" \
+		"-text attribute honored) before regenerating or checking." >&2
+	exit 1
+fi
+
 START_MARK="# BEGIN generated coding tokens (ci/fuzz/gen_dict.sh)"
 END_MARK="# END generated coding tokens"
 

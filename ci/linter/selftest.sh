@@ -76,6 +76,33 @@ case_ 23 "lint work list rejects partial output followed by failure" \
     env MAPFILE_CHECKED_FAULT=partial-error ci/linter/lint-sh.sh ci/linter/lib.sh
 case_ 23 "dictionary work list rejects partial output followed by failure" \
     env MAPFILE_CHECKED_FAULT=partial-error ci/fuzz/gen_dict.sh --check
+
+# shellcheck disable=SC2317  # Invoked indirectly through case_ below.
+dict_crlf_rejected_() (
+    local backup out got mode
+    backup="$(mktemp "${TMPDIR:-/tmp}/fuzz-dict.XXXXXX")" || exit 2
+    cp ci/fuzz/fuzz.dict "$backup" || exit 2
+    trap 'cp "$backup" ci/fuzz/fuzz.dict; rm -f "$backup"' EXIT INT TERM
+    while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\r\n' "$line"
+    done <"$backup" >ci/fuzz/fuzz.dict
+
+    for mode in check regenerate; do
+        if [ "$mode" = check ]; then
+            out="$(ci/fuzz/gen_dict.sh --check 2>&1)"; got=$?
+        else
+            out="$(ci/fuzz/gen_dict.sh 2>&1)"; got=$?
+        fi
+        if [ "$got" -ne 1 ] ||
+            ! printf '%s\n' "$out" | grep -qF 'contains CRLF line endings'; then
+            printf '%s: expected exit 1 with CRLF diagnosis, got %d\n%s\n' \
+                "$mode" "$got" "$out" >&2
+            exit 1
+        fi
+    done
+)
+case_ 0 "dictionary CRLF rejection covers check and regeneration" \
+    dict_crlf_rejected_
 case_ 23 "coverage work list rejects partial output followed by failure" \
     env MAPFILE_CHECKED_FAULT=partial-error ci/tools/coverage.sh \
         --selftest-work-list "$ROOT"
