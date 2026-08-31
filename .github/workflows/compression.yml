@@ -84,18 +84,9 @@ jobs:
         run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
+        # the shared verifier from the parent's #267 (downloads the .asc,
+        # vendored keys, temp GNUPGHOME) -- replaces seven inline copies
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Install Test::Nginx
         # Pinned per upstream #214 + #249: the @0.32 pin alone still
@@ -185,18 +176,9 @@ jobs:
         run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
+        # the shared verifier from the parent's #267 (downloads the .asc,
+        # vendored keys, temp GNUPGHOME) -- replaces seven inline copies
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Build gzip-less (the compat-mask lesson — NO --with-compat)
         run: |
@@ -270,18 +252,9 @@ jobs:
         run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
+        # the shared verifier from the parent's #267 (downloads the .asc,
+        # vendored keys, temp GNUPGHOME) -- replaces seven inline copies
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Build the shape through the real opt-outs
         env:
@@ -385,18 +358,9 @@ jobs:
         run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
+        # the shared verifier from the parent's #267 (downloads the .asc,
+        # vendored keys, temp GNUPGHOME) -- replaces seven inline copies
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Configure detects the absence and builds anyway
         run: |
@@ -444,18 +408,9 @@ jobs:
         run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
+        # the shared verifier from the parent's #267 (downloads the .asc,
+        # vendored keys, temp GNUPGHOME) -- replaces seven inline copies
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Analyze compression/*.c with nginx include paths
         run: |
@@ -533,18 +488,9 @@ jobs:
         run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
+        # the shared verifier from the parent's #267 (downloads the .asc,
+        # vendored keys, temp GNUPGHOME) -- replaces seven inline copies
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Configure and build (harness-enabled, module + reference probe)
         run: |
@@ -635,18 +581,9 @@ jobs:
         run: wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Verify nginx tarball PGP signature
-        run: |
-          set -euo pipefail
-          wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz.asc" \
-            -O "nginx-${NGINX_VERSION}.tar.gz.asc"
-          gnupghome="$(mktemp -d)"
-          export GNUPGHOME="$gnupghome"
-          chmod 700 "$gnupghome"
-          for keyfile in ci/tools/keys/*.key; do
-            gpg --quiet --import "$keyfile" 2>/dev/null
-          done
-          gpg --quiet --verify "nginx-${NGINX_VERSION}.tar.gz.asc" "nginx-${NGINX_VERSION}.tar.gz"
-          rm -rf "$gnupghome"
+        # the shared verifier from the parent's #267 (downloads the .asc,
+        # vendored keys, temp GNUPGHOME) -- replaces seven inline copies
+        run: ci/tools/verify-nginx-tarball.sh "nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Configure and build (ASan+UBSan, both backends)
         run: |

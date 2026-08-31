@@ -174,7 +174,7 @@ drain(ngx_http_request_t *r, ngx_http_compression_ctx_t *ctx,
 int
 main(void)
 {
-    printf("1..24\n");
+    printf("1..25\n");   /* CodeRabbit round 5: 25 check() calls, not 24 */
 
     /* ── 1: retained drains BEFORE the cursor, in order ──────────────── */
     {

@@ -1858,6 +1858,41 @@ ngx_http_compression_no_transform(ngx_http_request_t *r)
 }
 
 
+/*
+ * The negotiated-URI Vary: ONE combined line for dictionary locations,
+ * the by-construction Accept-Encoding line (#163) otherwise. Factored
+ * so the bypass branch and the election path cannot drift — the
+ * bypassed identity response is still a variant of a NEGOTIATED URI
+ * (CodeRabbit, round 5): a cache that stores it as the URI's first
+ * response without an Accept-Encoding dimension can then satisfy
+ * non-bypassed requests with it, or worse, key later compressed
+ * variants inconsistently. Same sloppy-cache paranoia as #163's
+ * emit-by-construction rationale.
+ */
+static ngx_int_t
+ngx_http_compression_emit_vary(ngx_http_request_t *r,
+    ngx_http_compression_conf_t *conf)
+{
+    if (conf->dicts != NULL && conf->dicts->nelts > 0) {
+        ngx_table_elt_t  *v;
+
+        v = ngx_list_push(&r->headers_out.headers);
+        if (v == NULL) {
+            return NGX_ERROR;
+        }
+        v->hash = 1;
+        v->next = NULL;
+        ngx_str_set(&v->key, "Vary");
+        ngx_str_set(&v->value,
+                    "Accept-Encoding, Available-Dictionary, Sec-Fetch-Site");
+
+        return NGX_OK;
+    }
+
+    return ngx_http_compression_vary(r);
+}
+
+
 static ngx_int_t
 ngx_http_compression_header_filter(ngx_http_request_t *r)
 {
@@ -1970,6 +2005,21 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         r->gzip_ok = 0;
 #endif
 
+        /*
+         * The bypassed identity response is still a variant of a
+         * NEGOTIATED URI: without the Accept-Encoding dimension a
+         * cache can store it as the URI's baseline and key later
+         * (non-bypassed, compressed) variants inconsistently
+         * (CodeRabbit, round 5). NOT mirrored in the no-transform
+         * branch above: that skip is response-header-driven, so the
+         * URI serves identity for every client as long as the origin
+         * keeps sending no-transform — there is no negotiation to
+         * advertise.
+         */
+        if (ngx_http_compression_emit_vary(r, conf) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
         return ngx_http_next_header_filter(r);
     }
 
@@ -2058,20 +2108,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
      * every fallback below (plain zstd/brotli, identity) is a variant a
      * cache must not reuse across the gate.
      */
-    if (conf->dicts != NULL && conf->dicts->nelts > 0) {
-        ngx_table_elt_t  *v;
-
-        v = ngx_list_push(&r->headers_out.headers);
-        if (v == NULL) {
-            return NGX_ERROR;
-        }
-        v->hash = 1;
-        v->next = NULL;
-        ngx_str_set(&v->key, "Vary");
-        ngx_str_set(&v->value,
-                    "Accept-Encoding, Available-Dictionary, Sec-Fetch-Site");
-
-    } else if (ngx_http_compression_vary(r) != NGX_OK) {
+    if (ngx_http_compression_emit_vary(r, conf) != NGX_OK) {
         return NGX_ERROR;
     }
 

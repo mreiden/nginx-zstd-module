@@ -34,8 +34,14 @@ fi
 # Non-vacuity gate the standalone repo's gates carry: TEST_HARNESS=1 alone
 # compiles the probe sources to nothing and still yields a loadable,
 # probe-free .so. Gate on the symbol count, not the env var, so that trap
-# cannot silently return.
-if ! nm -D "$PROBE" 2>/dev/null | grep -q ' ngx_test_probe_'; then
+# cannot silently return. "Cannot look" is separated from "looked and
+# found nothing" (CodeRabbit round 5): a missing or non-GNU nm must not
+# report a probe-free build and send someone rebuilding a good .so.
+if ! syms="$(nm -D "$PROBE" 2>&1)"; then
+    echo "cannot inspect $PROBE: nm -D failed (${syms:0:120}) -- GNU binutils nm required for this gate"
+    exit 1
+fi
+if ! grep -q ' ngx_test_probe_' <<<"$syms"; then
     echo "$PROBE carries no ngx_test_probe_* symbols -- this is a probe-free build; configure with TEST_HARNESS=1 CFLAGS=\"\$CFLAGS -DNGX_TEST_HARNESS\" first"
     exit 1
 fi

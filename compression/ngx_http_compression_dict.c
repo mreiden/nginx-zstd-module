@@ -469,7 +469,7 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         if (ngx_http_compression_hex_decode(&hex, want) != NGX_OK) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "invalid dictionary hash \"%V\": want %d "
-                               "lowercase hex characters (the file's "
+                               "hex characters (the file's "
                                "SHA-256)", &hex,
                                NGX_HTTP_COMPRESSION_SHA256_HEX_LEN);
             return NGX_CONF_ERROR;

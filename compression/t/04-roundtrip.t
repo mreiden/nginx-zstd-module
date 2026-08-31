@@ -51,9 +51,15 @@ our %decoders = (
     # dcz's 40-byte skippable-frame prologue is skipped by the decoder
     # natively; the dictionary rides -D
     dcz  => sub { cli_decode("zstd -dq -D $tmp/dict -c", $_[0]) },
-    # dcb's 36 raw bytes are NOT consumed by the decoder: strip first
-    dcb  => sub { cli_decode("brotli -d -D $tmp/dict -c",
-                             substr($_[0], 36)) },
+    # dcb's 36 raw bytes are NOT consumed by the decoder. ASSERT the
+    # prologue before stripping it (CodeRabbit round 5): the regression
+    # these blocks defend against is a corrupt prologue with a valid
+    # stream behind it -- skip-36-and-decode is blind to exactly that.
+    dcb  => sub {
+        return undef
+            if substr($_[0], 0, 36) ne "\xff" . "DCB" . sha256($dict);
+        return cli_decode("brotli -d -D $tmp/dict -c", substr($_[0], 36));
+    },
 );
 
 add_response_body_check(sub {
@@ -65,6 +71,10 @@ add_response_body_check(sub {
 
     my $srckey = $block->expect_src // "big";
     chomp $srckey;
+    # an unknown key must die HERE, not hash undef into a failure that
+    # blames the C code (CodeRabbit round 5)
+    die $block->name . ": unknown expect_src key '$srckey'"
+        unless exists $srcs{$srckey};
 
     my $dec = $decoders{$how} ? $decoders{$how}->($body) : undef;
 

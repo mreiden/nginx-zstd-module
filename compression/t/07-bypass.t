@@ -116,7 +116,11 @@ $::body
 
 
 === TEST 5: compression_bypass_vary rides BOTH paths
-# bypassed request: Vary names the driving header, no Content-Encoding
+# bypassed request: Vary names the driving header AND Accept-Encoding
+# (round 5: the bypassed identity is still a variant of a negotiated
+# URI -- without the AE dimension a cache can store it as the URI's
+# baseline and key later compressed variants inconsistently), no
+# Content-Encoding. The harness folds same-name lines with ", ".
 --- user_files eval
 [ [ "b/a.txt" => $::body ] ]
 --- config
@@ -137,7 +141,7 @@ Accept-Encoding: zstd
 X-No-Compression: 1
 --- raw_response_headers_unlike: Content-Encoding
 --- response_headers
-Vary: X-No-Compression
+Vary: Accept-Encoding, X-No-Compression
 --- response_body eval
 $::body
 --- no_error_log

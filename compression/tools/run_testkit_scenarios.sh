@@ -84,7 +84,10 @@ for s in "${SCENARIOS[@]}"; do
     fi
 
     if [ "$EXPECT_SKIP" -eq 1 ]; then
-        if [ "$skipped_all" -eq 1 ]; then
+        # rc must ALSO be 0: a harness can emit "1..0 # SKIP" and then
+        # die -- an expected-skip verdict on a failed run would bank a
+        # green for a broken engine (CodeRabbit, round 5).
+        if [ "$skipped_all" -eq 1 ] && [ "$rc" -eq 0 ]; then
             echo "ok (expected SKIP) $s"
         else
             echo "FAIL $s: expected a clean SKIP against this tree, got rc=$rc with $real_asserts assertion line(s)"

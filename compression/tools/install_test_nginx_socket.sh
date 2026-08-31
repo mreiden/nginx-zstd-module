@@ -18,6 +18,15 @@ dist="AGENT/Test-Nginx-${version}.tar.gz"
 lock="$(dirname "$0")/test-nginx-socket.cpan.lock"
 spec="Test::Nginx::Socket@${version}"
 
+# The INSTALL must consume the artifact the checks above validated, not
+# re-resolve the spec (CodeRabbit round 5, and the parent #249 script's
+# original shape): a second resolution is a second trip to the index,
+# and an index change between check and install would execute an
+# unreviewed dependency graph. authors/id paths are immutable on CPAN.
+mirror="${CPAN_MIRROR:-https://cpan.metacpan.org}"
+author="${dist%%/*}"
+dist_url="${mirror}/authors/id/${author:0:1}/${author:0:2}/${dist}"
+
 resolved="$(cpanm --info "$spec" 2>/dev/null \
 	| awk '/^[A-Z0-9]+\/.*\.tar\.gz$/ {print; exit}')"
 if [ "$resolved" != "$dist" ]; then
@@ -39,13 +48,13 @@ fi
 
 case "$mode" in
 --sudo)
-	sudo cpanm --notest --quiet "$spec"
+	sudo cpanm --notest --quiet "$dist_url"
 	installed="$(perl -MTest::Nginx::Socket \
 		-e 'print $Test::Nginx::Socket::VERSION')"
 	;;
 --local-lib)
 	: "${libdir:?--local-lib needs a directory}"
-	cpanm -l "$libdir" --notest --quiet "$spec"
+	cpanm -l "$libdir" --notest --quiet "$dist_url"
 	installed="$(perl -I "$libdir/lib/perl5" -MTest::Nginx::Socket \
 		-e 'print $Test::Nginx::Socket::VERSION')"
 	;;

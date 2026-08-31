@@ -70,6 +70,9 @@ ngx_read_fd(ngx_fd_t fd, void *buf, size_t size)
     if (step_i >= nsteps) {
         fprintf(stderr, "FAIL: stub ran out of scripted steps "
                         "(loop called read() more times than expected)\n");
+        errno = EIO;   /* non-retryable: a stale EINTR here would make
+                          the extracted loop retry this bailout forever
+                          (CodeRabbit round 5) */
         return -1;
     }
 
@@ -85,6 +88,9 @@ ngx_read_fd(ngx_fd_t fd, void *buf, size_t size)
         fprintf(stderr, "FAIL: scripted step %d returns %zu for a %zu-byte "
                         "request -- the loop asked for less than it should\n",
                 step_i - 1, give, size);
+        errno = EIO;   /* non-retryable: a stale EINTR here would make
+                          the extracted loop retry this bailout forever
+                          (CodeRabbit round 5) */
         return -1;
     }
 

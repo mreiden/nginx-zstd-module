@@ -160,6 +160,19 @@ ngx_http_compression_zstd_hint_input_size(void *bctx, off_t bytes)
 {
     ngx_http_compression_zstd_ctx_t  *z = bctx;
 
+    /*
+     * Negative sizes never reach the wire as a pledge (CodeRabbit,
+     * round 5): the unsigned cast would turn them into a huge value —
+     * exactly -1 happens to alias ZSTD_CONTENTSIZE_UNKNOWN, but any
+     * other negative becomes a real pledge the stream cannot honour,
+     * and ZSTD_compressStream2 then fails at ZSTD_e_end ("Src size is
+     * incorrect") after the response is already on the wire. Declining
+     * the hint keeps the frame unpledged, which is the no-hint default.
+     */
+    if (bytes < 0) {
+        return NGX_OK;
+    }
+
     if (ZSTD_isError(ZSTD_CCtx_setPledgedSrcSize(z->cctx,
                                                  (unsigned long long) bytes)))
     {
@@ -175,26 +188,29 @@ ngx_http_compression_zstd_attach_dictionary(void *bctx, ngx_str_t *raw)
     ngx_http_compression_zstd_ctx_t  *z = bctx;
 
     /*
-     * Zero-copy: the CCtx references the raw bytes in place for the
-     * whole stream — the reason the interface contract makes the
-     * caller keep `raw` alive for the request.
-     */
-    if (ZSTD_isError(ZSTD_CCtx_refPrefix(z->cctx, raw->data, raw->len))) {
-        return NGX_ERROR;
-    }
-
-    /*
      * Content checksum on dictionary-compressed frames (parent repo
      * #102, defence in depth): a client decoding against the WRONG
      * dictionary bytes can otherwise succeed silently with corrupt
      * output — the checksum converts that into a visible decode
      * error for ~4 bytes per response. Set here rather than at
      * create() so plain-zstd responses keep the parent module's
-     * bare-frame behavior.
+     * bare-frame behavior — and set BEFORE refPrefix (CodeRabbit,
+     * round 5): prefix attachment snapshots the active parameters, so
+     * every parameter write belongs ahead of it rather than leaning on
+     * current libzstd tolerance.
      */
     if (ZSTD_isError(ZSTD_CCtx_setParameter(z->cctx, ZSTD_c_checksumFlag,
                                             1)))
     {
+        return NGX_ERROR;
+    }
+
+    /*
+     * Zero-copy: the CCtx references the raw bytes in place for the
+     * whole stream — the reason the interface contract makes the
+     * caller keep `raw` alive for the request.
+     */
+    if (ZSTD_isError(ZSTD_CCtx_refPrefix(z->cctx, raw->data, raw->len))) {
         return NGX_ERROR;
     }
 

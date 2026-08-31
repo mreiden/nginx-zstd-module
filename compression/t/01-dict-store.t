@@ -14,15 +14,20 @@ our $dict_a  = "const shared = 'store fixture material, dictionary A';\n" x 40;
 # ABSOLUTE path goes into the config verbatim, with a real directory
 # and a symlinked alias to it — the walk must refuse the alias at the
 # intermediate component and accept the real chain.
-our $walkdir = tempdir(CLEANUP => 1);
-mkdir "$walkdir/real" or die "mkdir: $!";
-{
+# Guarded, not die-on-failure (CodeRabbit round 5): only TESTs 26/27
+# consume this fixture, and a host that cannot symlink (a Windows-side
+# checkout without SeCreateSymbolicLink, a restricted tmp) must skip
+# those two via skip_eval instead of killing all 33 tests at file scope.
+our $walkdir;
+our $have_walk = eval {
+    $walkdir = tempdir(CLEANUP => 1);
+    mkdir "$walkdir/real" or die "mkdir: $!";
     open my $h, '>', "$walkdir/real/w.dict" or die "spew: $!";
     print $h "strict walk fixture dictionary contents\n" x 20;
     close $h;
-}
-symlink("$walkdir/real", "$walkdir/link")
-    or die "symlink: $!";
+    symlink("$walkdir/real", "$walkdir/link") or die "symlink: $!";
+    1;
+} || 0;
 our $dict_b  = "let other = 'store fixture material, dictionary B';\n" x 40;
 our $hex_a   = sha256_hex($dict_a);
 our $badhex  = '0' x 64;
@@ -500,6 +505,7 @@ contains a "." or ".." component
 # leaf, so the classic "current -> releases/7" layout walked straight
 # through the old check. The component walk refuses the symlink where
 # it sits. The real chain (positive control below) is byte-identical.
+--- skip_eval: 3: !$::have_walk
 --- http_config eval
 "compression_dict_strict_path on;
  compression_dict_file $::walkdir/link/w.dict;"
@@ -516,6 +522,7 @@ a symlink at any component is refused
 # Positive control for TESTs 25/26: identical file, symlink-free
 # absolute path, strict on — the walk verifies every component and the
 # server starts.
+--- skip_eval: 3: !$::have_walk
 --- http_config eval
 "compression_dict_strict_path on;
  compression_dict_file $::walkdir/real/w.dict;"

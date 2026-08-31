@@ -19,7 +19,14 @@ my $tmp = tempdir(CLEANUP => 1);
 our $big = '';
 {
     open my $ur, '<', '/dev/urandom' or die $!;
-    my $raw; read $ur, $raw, 150_000; close $ur;
+    my $raw;
+    # check the byte count (CodeRabbit round 5): a short read shrinks
+    # $big, both sides hash the same shortened fixture, and the
+    # MUST-pause assertions in TESTs 1/2/11/12 become the only witness
+    my $got = read($ur, $raw, 150_000);
+    die "urandom short read: got " . ($got // 'undef') . " of 150000"
+        unless defined $got && $got == 150_000;
+    close $ur;
     $big = encode_base64($raw, "");
 }
 
@@ -152,7 +159,7 @@ Content-Encoding: zstd
 --- decode_with
 zstd
 --- no_error_log eval
-qr/buffer cap \d+ reached/
+[qr/buffer cap \d+ reached/]
 
 
 === TEST 4: a zero buffer count is a config error

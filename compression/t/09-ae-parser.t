@@ -94,6 +94,9 @@ GET /t
 --- more_headers
 Accept-Encoding: zstd;q=1x
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 
@@ -113,6 +116,9 @@ GET /t
 --- more_headers
 Accept-Encoding: zstd;q=0.0001
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 
@@ -132,6 +138,9 @@ GET /t
 --- more_headers
 Accept-Encoding: zstd;q=1 x
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 
@@ -151,6 +160,9 @@ GET /t
 --- more_headers eval
 "Accept-Encoding: zstd;q=1\tx"
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 
@@ -170,6 +182,9 @@ GET /t
 --- more_headers
 Accept-Encoding: zstd;q=1;q=0
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 
@@ -189,6 +204,9 @@ GET /t
 --- more_headers
 Accept-Encoding: zstd;q
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 
@@ -208,6 +226,9 @@ GET /t
 --- more_headers
 Accept-Encoding: zstd;q=2
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 
@@ -287,6 +308,9 @@ GET /t
 --- more_headers
 Accept-Encoding: zstd;q=
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 
@@ -391,6 +415,9 @@ GET /t
 --- more_headers
 Accept-Encoding: zstd x
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 
@@ -412,6 +439,9 @@ GET /t
 --- more_headers
 Accept-Encoding: zstd"x
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 
@@ -433,6 +463,9 @@ GET /t
 --- more_headers
 Accept-Encoding: zstd;;q=1
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 
@@ -480,6 +513,9 @@ GET /t
 --- more_headers
 Accept-Encoding: zstd;foo=bar;q=0
 --- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
 --- no_error_log
 [error]
 

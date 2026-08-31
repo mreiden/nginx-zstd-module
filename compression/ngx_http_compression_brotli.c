@@ -15,10 +15,16 @@
 
 #include <brotli/encode.h>
 
+/* Guarded like the brotli fork's twin: __has_include predates nothing
+ * on gcc/clang but only exists on MSVC from VS2017 15.3 -- an older
+ * compiler must select DICT 0, not fail at preprocessing. */
+#if defined(__has_include)
 #if __has_include(<brotli/shared_dictionary.h>)
 #include <brotli/shared_dictionary.h>
 #define NGX_HTTP_COMPRESSION_BROTLI_DICT  1
-#else
+#endif
+#endif
+#ifndef NGX_HTTP_COMPRESSION_BROTLI_DICT
 #define NGX_HTTP_COMPRESSION_BROTLI_DICT  0
 #endif
 
@@ -109,6 +115,12 @@ ngx_http_compression_brotli_hint_input_size(void *bctx, off_t bytes)
      * byte. (And its absence is what stamps oversized windows in other
      * encoders — the vite/128MB-window incident class.)
      */
+    /* same negative-size decline as the zstd backend: a negative off_t
+     * must not become a bogus uint32_t hint */
+    if (bytes < 0) {
+        return NGX_OK;
+    }
+
     if (!BrotliEncoderSetParameter(b->enc, BROTLI_PARAM_SIZE_HINT,
                                    (uint32_t) ngx_min(bytes, 0xffffffff)))
     {
