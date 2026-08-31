@@ -722,6 +722,9 @@ Content-Encoding: gzip
 Accept-Ranges: bytes
 --- response_body eval
 $::gz
+--- no_error_log
+[error]
+
 
 
 === TEST 26: byte ranges slice the sidecar's bytes (206 + Content-Range)
@@ -747,6 +750,9 @@ Range: bytes=0-9
 "Content-Range: bytes 0-9/" . length($::gz)
 --- response_body eval
 substr($::gz, 0, 10)
+--- no_error_log
+[error]
+
 
 
 === TEST 27: empty sidecar behind an SSI include ships silently
@@ -793,6 +799,9 @@ Available-Dictionary: :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:
 --- raw_response_headers_unlike: Content-Encoding
 --- response_body eval
 $::src
+--- no_error_log
+[error]
+
 
 
 === TEST 29: default off — the sidecar wins despite AD (unchanged behavior)
@@ -811,6 +820,9 @@ Accept-Encoding: br, dcz
 Available-Dictionary: :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:
 --- response_headers
 Content-Encoding: br
+--- no_error_log
+[error]
+
 
 
 === TEST 30: bypass without an Available-Dictionary serves the sidecar
@@ -829,6 +841,9 @@ GET /st/hello.js
 Accept-Encoding: br, dcz
 --- response_headers
 Content-Encoding: br
+--- no_error_log
+[error]
+
 
 
 === TEST 31: bypass with AD but no dict token in AE serves the sidecar
@@ -848,6 +863,9 @@ Accept-Encoding: br
 Available-Dictionary: :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:
 --- response_headers
 Content-Encoding: br
+--- no_error_log
+[error]
+
 
 
 === TEST 32: bypass overrides always mode too
@@ -869,6 +887,9 @@ Available-Dictionary: :AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:
 --- raw_response_headers_unlike: Content-Encoding
 --- response_body eval
 $::src
+--- no_error_log
+[error]
+
 
 
 === TEST 33a: compression_static on emits Vary by construction, no warn

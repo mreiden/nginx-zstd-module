@@ -2,6 +2,11 @@ use Test::Nginx::Socket;
 use Test::More;
 use Digest::SHA qw(sha256_hex);
 use File::Temp qw(tempdir);
+use File::Basename qw(dirname);
+use lib dirname(__FILE__) . '/lib';
+use CompressionRoundtrip qw(spew slurp cli_decode assert_decoders);
+
+assert_decoders('zstd', 'brotli');
 
 # Phase-3 tuning directives: compression_level <coding> <n> and
 # compression_window <coding> <size>, keyed by coding against
@@ -25,15 +30,8 @@ our $wpage = "top[" . $wbig . "]bottom\n";
 
 our %srcs = ( default => $src, wpage => $wpage );
 
-sub spew { open my $h, '>', $_[0] or die "$_[0]: $!"; binmode $h; print $h $_[1]; close $h }
-sub slurp { open my $h, '<', $_[0] or die "$_[0]: $!"; binmode $h; local $/; <$h> }
+# spew/slurp/cli_decode come from t/lib/CompressionRoundtrip.pm
 
-sub cli_decode {
-    my ($cmd, $data) = @_;
-    spew("$tmp/in", $data);
-    system("$cmd < $tmp/in > $tmp/out 2>/dev/null") == 0 or return undef;
-    return slurp("$tmp/out");
-}
 
 our %decoders = (
     zstd => sub { cli_decode("zstd -dq -c", $_[0]) },

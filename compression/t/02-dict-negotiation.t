@@ -473,6 +473,9 @@ Content-Encoding: dcz
 $::dcz_re
 --- raw_response_headers_like eval
 qr/Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site/
+--- no_error_log
+[error]
+
 
 
 === TEST 15b: control — without the bypass, the sidecar wins
@@ -499,6 +502,9 @@ qq{Accept-Encoding: gzip, deflate, br, zstd, dcb, dcz\nAvailable-Dictionary: :$:
 Content-Encoding: br
 --- response_body eval
 $::br_sidecar
+--- no_error_log
+[error]
+
 
 
 === TEST 15c: bypass + store MISS pays runtime compression (the tradeoff)
@@ -527,6 +533,9 @@ GET /f/app.js
 qq{Accept-Encoding: gzip, deflate, br, zstd, dcb, dcz\nAvailable-Dictionary: :$::bad_b64:}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 16: Sec-Fetch-Site cross-site refuses the dictionary coding
@@ -553,6 +562,9 @@ qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: c
 Content-Encoding: zstd
 --- raw_response_headers_like eval
 qr/Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site/
+--- no_error_log
+[error]
+
 
 
 === TEST 16b: Sec-Fetch-Site same-origin is allowed
@@ -574,6 +586,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: same-origin}
 --- response_headers
 Content-Encoding: dcz
+--- no_error_log
+[error]
+
 
 
 === TEST 16c: Sec-Fetch-Site none (address-bar navigation) is allowed
@@ -595,6 +610,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: none}
 --- response_headers
 Content-Encoding: dcz
+--- no_error_log
+[error]
+
 
 
 === TEST 16d: same-site (subdomain) is refused — same-ORIGIN partitioning
@@ -616,6 +634,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: same-site}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 17: dcz;q=0 is an explicit refusal despite a matching dictionary
@@ -637,6 +658,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz;q=0\nAvailable-Dictionary: :$::b64:}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 18: optional truth-wins — a stale supplied hash re-keys the entry
@@ -693,6 +717,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: cross-site\nSec-Fetch-Site: same-origin}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 19b: duplicate Sec-Fetch-Site fails closed regardless of order
@@ -718,6 +745,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nSec-Fetch-Site: same-origin\nSec-Fetch-Site: cross-site}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 19c: duplicate Available-Dictionary fails closed
@@ -742,6 +772,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nAvailable-Dictionary: :$::b64:}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 20: secure-context default fail-closed — dcz declines over cleartext
@@ -766,6 +799,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 21: secure-context explicit off is identical to the default
@@ -788,6 +824,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 22: secure-context X-Forwarded-Proto https does NOT re-enable dcz
@@ -812,6 +851,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nX-Forwarded-Proto: https}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 23: secure-context Forwarded proto=https does NOT re-enable dcz
@@ -833,6 +875,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nForwarded: proto=https}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 24: secure-context X-Forwarded-Scheme https does NOT re-enable dcz
@@ -854,6 +899,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nX-Forwarded-Scheme: https}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 25: secure-context X-Url-Scheme https does NOT re-enable dcz
@@ -875,6 +923,9 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\nX-Url-Scheme: https}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
 
 
 === TEST 26: secure-context acknowledgement at location level re-enables dcz
@@ -902,6 +953,9 @@ qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
 Content-Encoding: dcz
 --- response_body_like eval
 $::dcz_re
+--- no_error_log
+[error]
+
 
 
 === TEST 27: secure-context inheritance — http on, location off wins
@@ -927,6 +981,10 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
 
 === TEST 28: trust_hashes on — the DECLARED literal is the live negotiation key
 # The trust-verbatim proof (parent #220), the only observable way: the
