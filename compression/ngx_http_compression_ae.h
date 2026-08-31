@@ -6,14 +6,16 @@
  * cases). Only the name prefix changed. Strictly length-bounded,
  * never NUL-reliant.
  *
- * Scope (review round 1): the caller hands this ONE field line — the
- * first Accept-Encoding header — not the RFC 9110 §5.2 combination of
- * every AE line in the request. That is deliberate core-gzip parity:
- * ngx_http_gzip_ok() reads only the first line too, and the defer
- * decision must match what the core filter will conclude, or a
- * multi-line request could be deferred to a gzip that then declines.
- * Walking the ->next chain as a combined field is a productization
- * item, to be taken only together with the defer story.
+ * Scope: ngx_http_compression_coding_weight() below parses ONE field
+ * line; the request-level combination of every AE line (RFC 9110 §5.3
+ * comma-joining, parent #215/#275) lives in
+ * ngx_http_compression_request_coding_weight() at the bottom, which
+ * composes this parser per line without reaching inside one. The defer
+ * story that used to hold this at first-line-only is resolved: an
+ * expressed whole-field gzip refusal VETOES core gzip through its own
+ * gzip_tested/gzip_ok flags, and the one remaining first-line
+ * asymmetry (an allowance visible only on a later line) fails closed
+ * to identity in core's own read — never a wrong compression.
  *
  * Weight semantics: an explicit token always decides (even q=0, which
  * then overrides a permissive "*"); with no explicit token the "*"
@@ -51,6 +53,43 @@ ngx_http_compression_skip_quoted(u_char *p, u_char *end)
     }
 
     return p;
+}
+
+
+/*
+ * Walk the up-to-three fractional digits of a "q=0.NNN" qvalue, starting
+ * right after the '.'. Advances *p past each digit consumed and returns
+ * the accumulated milli-units contribution. Fixed at three guarded steps
+ * with literal weights 100/10/1 (parent #211/#213) instead of a loop
+ * counting a runtime scale down: each step is behaviour-identical to one
+ * loop iteration, and a fourth digit byte is deliberately left
+ * unconsumed for the caller's trailing-junk check to reject — the same
+ * contract the loop's `scale > 0` guard enforced.
+ */
+static ngx_inline ngx_int_t
+ngx_http_compression_parse_q_fraction(u_char *end, u_char **p)
+{
+    /* ngx_int_t so each digit*weight product widens before the add */
+    ngx_int_t   frac = 0;
+    u_char     *q = *p;
+
+    if (q < end && *q >= '0' && *q <= '9') {
+        frac += (*q - '0') * 100;
+        q++;
+
+        if (q < end && *q >= '0' && *q <= '9') {
+            frac += (*q - '0') * 10;
+            q++;
+
+            if (q < end && *q >= '0' && *q <= '9') {
+                frac += *q - '0';
+                q++;
+            }
+        }
+    }
+
+    *p = q;
+    return frac;
 }
 
 
@@ -117,20 +156,12 @@ ngx_http_compression_eval_qvalue(ngx_str_t *ae, u_char *p)
                 }
 
                 if (*p == '0') {
-                    ngx_int_t  scale = 100;
-
                     p++;
                     q = 0;
 
                     if (p < end && *p == '.') {
                         p++;
-                        while (p < end && *p >= '0' && *p <= '9'
-                               && scale > 0)
-                        {
-                            q += (*p - '0') * scale;
-                            scale /= 10;
-                            p++;
-                        }
+                        q += ngx_http_compression_parse_q_fraction(end, &p);
                     }
 
                 } else if (*p == '1') {
@@ -407,9 +438,11 @@ ngx_http_compression_vary(ngx_http_request_t *r)
 }
 
 
-/* the request's Accept-Encoding header: parsed field with the gzip
- * module, list walk without (first header only — deliberate core-gzip
- * parity, the defer decision must match core gzip's conclusion) */
+/* the request's FIRST Accept-Encoding header: parsed field with the
+ * gzip module, list walk without. Presence/Vary decisions only — the
+ * negotiation itself reads the WHOLE field via
+ * ngx_http_compression_request_coding_weight() below (parent #215/#275:
+ * RFC 9110 §5.3 makes repeated field lines one comma-joined field) */
 static ngx_inline ngx_table_elt_t *
 ngx_http_compression_ae_header(ngx_http_request_t *r)
 {
@@ -443,6 +476,136 @@ ngx_http_compression_ae_header(ngx_http_request_t *r)
     }
 
     return NULL;
+#endif
+}
+
+
+/*
+ * Effective weight for `coding` across the WHOLE Accept-Encoding field
+ * — every repeated field line, not just the first (parent #215/#275).
+ * RFC 9110 §5.3 makes a repeated list-valued field identical to the
+ * single field whose value is the lines joined in order with commas, so
+ * "Accept-Encoding: gzip" + "Accept-Encoding: zstd" IS "gzip, zstd".
+ *
+ * Composition, not a second parser: the single-value parser above is
+ * asked twice per line — wildcard suppressed, to learn the line's
+ * EXPLICIT weight, then as the caller asked, so a differing answer can
+ * only have come from "*". The latest explicit token wins across lines
+ * exactly as it does within one line, and the wildcard stays
+ * subordinate to any explicit token anywhere in the field. The
+ * single-value parser itself is untouched — it is the fuzz-differential
+ * lineage shared with the parent, and this function never reaches
+ * inside one line.
+ */
+static ngx_inline ngx_int_t
+ngx_http_compression_chain_coding_weight(const ngx_table_elt_t *ae,
+    ngx_str_t *coding, ngx_uint_t allow_wildcard)
+{
+    ngx_int_t  q, coding_q, star_q;
+
+    coding_q = -1;      /* latest explicit token, -1 = absent */
+    star_q = -1;        /* latest "*" wildcard, -1 = absent */
+
+    for ( /* void */ ; ae != NULL;
+          ae = (const ngx_table_elt_t *) ae->next)
+    {
+        q = ngx_http_compression_coding_weight((ngx_str_t *) &ae->value,
+                                               coding, 0);
+        if (q >= 0) {
+            coding_q = q;       /* comma-joined in received order */
+            continue;
+        }
+
+        if (!allow_wildcard) {
+            continue;
+        }
+
+        q = ngx_http_compression_coding_weight((ngx_str_t *) &ae->value,
+                                               coding, 1);
+        if (q >= 0) {
+            star_q = q;         /* only "*" could answer here */
+        }
+    }
+
+    if (coding_q >= 0) {
+        return coding_q;
+    }
+    if (allow_wildcard && star_q >= 0) {
+        return star_q;
+    }
+    return -1;
+}
+
+
+/*
+ * The request-level entry point. With the gzip module,
+ * headers_in.accept_encoding heads the ->next chain nginx (>= 1.23,
+ * this module's floor) builds for repeated known headers. WITHOUT the
+ * gzip module that field does not exist and nothing chains the lines,
+ * so the list is walked directly — the same accumulation, a different
+ * collection (the parent's #275 legacy shape, needed here for a
+ * different reason: unprocessed headers, not old nginx).
+ */
+static ngx_inline ngx_int_t
+ngx_http_compression_request_coding_weight(ngx_http_request_t *r,
+    ngx_str_t *coding, ngx_uint_t allow_wildcard)
+{
+#if (NGX_HTTP_GZIP)
+    return ngx_http_compression_chain_coding_weight(
+               r->headers_in.accept_encoding, coding, allow_wildcard);
+#else
+    ngx_uint_t        i;
+    ngx_int_t         q, coding_q, star_q;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+
+    coding_q = -1;
+    star_q = -1;
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].key.len != sizeof("Accept-Encoding") - 1
+            || ngx_strncasecmp(h[i].key.data, (u_char *) "Accept-Encoding",
+                               sizeof("Accept-Encoding") - 1) != 0)
+        {
+            continue;
+        }
+
+        q = ngx_http_compression_coding_weight(&h[i].value, coding, 0);
+        if (q >= 0) {
+            coding_q = q;
+            continue;
+        }
+
+        if (!allow_wildcard) {
+            continue;
+        }
+
+        q = ngx_http_compression_coding_weight(&h[i].value, coding, 1);
+        if (q >= 0) {
+            star_q = q;
+        }
+    }
+
+    if (coding_q >= 0) {
+        return coding_q;
+    }
+    if (allow_wildcard && star_q >= 0) {
+        return star_q;
+    }
+    return -1;
 #endif
 }
 

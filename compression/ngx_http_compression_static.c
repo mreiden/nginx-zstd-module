@@ -1069,10 +1069,9 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
             ae = ngx_http_compression_ae_header(r);
 
             if (ae != NULL
-                && ae->value.len != 0
-                && (ngx_http_compression_coding_weight(&ae->value,
+                && (ngx_http_compression_request_coding_weight(r,
                         &ngx_http_compression_static_dcz, 0) > 0
-                    || ngx_http_compression_coding_weight(&ae->value,
+                    || ngx_http_compression_request_coding_weight(r,
                         &ngx_http_compression_static_dcb, 0) > 0))
             {
                 ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1209,9 +1208,13 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
                 vary_emitted = 1;
             }
 
-            if (ae == NULL || ae->value.len == 0) {
+            if (ae == NULL) {
                 /*
-                 * Accepts nothing: no coding can serve, and the Vary
+                 * No Accept-Encoding at all: no coding can serve. An
+                 * empty FIRST line no longer short-circuits (parent
+                 * #215/#275) — the whole-field weight below reads
+                 * every line, and all-empty lines decline naturally.
+                 * The Vary
                  * this usable sidecar earned is already out — further
                  * probes could only confirm what one usable file
                  * already proved. Identity, correctly partitioned.
@@ -1222,8 +1225,8 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
             /* base codings accept the "*" wildcard, same as the
              * filter election; a usable-but-unaccepted sidecar keeps
              * probing — the next coding may be both */
-            w = ngx_http_compression_coding_weight(&ae->value,
-                                                   &c->coding, 1);
+            w = ngx_http_compression_request_coding_weight(r,
+                                                           &c->coding, 1);
             if (w <= 0) {
                 continue;
             }

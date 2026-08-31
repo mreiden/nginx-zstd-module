@@ -2132,7 +2132,12 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
 
     ae = ngx_http_compression_ae_header(r);
 
-    if (ae == NULL || ae->value.len == 0) {
+    /*
+     * Presence only (parent #215/#275): an empty FIRST line must not
+     * mask a meaningful later one — the weights below read the whole
+     * comma-joined field, so all-empty lines simply elect nothing.
+     */
+    if (ae == NULL) {
         return ngx_http_next_header_filter(r);
     }
 
@@ -2155,8 +2160,8 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
 #if (NGX_HTTP_GZIP)
             gzip_listed = 1;
 
-            w = ngx_http_compression_coding_weight(
-                    &ae->value, &ngx_http_compression_gzip_token, 1);
+            w = ngx_http_compression_request_coding_weight(
+                    r, &ngx_http_compression_gzip_token, 1);
             if (w > 0) {
                 /*
                  * DEFER: gzip won the election, and gzip is never
@@ -2168,6 +2173,26 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
                  * there is no second pass back into this election.
                  */
                 return ngx_http_next_header_filter(r);
+            }
+
+            /*
+             * EXPRESSED REFUSAL anywhere in the field — an explicit
+             * gzip;q=0 or a *;q=0 with no later override (parent #275,
+             * the design's veto half): core gzip reads only the FIRST
+             * line and could compress against a refusal it never saw,
+             * so latch it off. Absence (-1) deliberately does NOT
+             * latch: core reaches identity on its own first-line read,
+             * and asserting "refused" where the field merely omits
+             * gzip would stamp a wrong verdict (the wildcard corner —
+             * core gzip has never honored "*", and the day it does,
+             * this module must not have pre-empted it). The one
+             * remaining asymmetry is fail-closed: an allowance visible
+             * only on a later line defers here and cores declines to
+             * identity — never a wrong compression.
+             */
+            if (w == 0) {
+                r->gzip_tested = 1;
+                r->gzip_ok = 0;
             }
 #endif
             continue;
@@ -2188,8 +2213,8 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
             && t[i].backend->dict_coding.len != 0
             && t[i].backend->wire_prologue != NULL)
         {
-            w = ngx_http_compression_coding_weight(
-                    &ae->value, &t[i].backend->dict_coding, 0);
+            w = ngx_http_compression_request_coding_weight(
+                    r, &t[i].backend->dict_coding, 0);
             if (w > 0) {
                 elected = t[i].backend;
                 elected_dict = dict;
@@ -2197,8 +2222,8 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
             }
         }
 
-        w = ngx_http_compression_coding_weight(&ae->value,
-                                               &t[i].backend->coding, 1);
+        w = ngx_http_compression_request_coding_weight(
+                r, &t[i].backend->coding, 1);
         if (w > 0) {
             elected = t[i].backend;
             break;

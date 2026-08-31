@@ -545,3 +545,152 @@ Vary: Accept-Encoding, Cookie
 qr/Vary: Accept-Encoding\r/
 --- no_error_log
 [error]
+
+
+=== TEST 25: an allowance on a SECOND Accept-Encoding line elects (#215/#275)
+# RFC 9110 §5.3: repeated field lines are one comma-joined field; the
+# old first-line-only read declined this request
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: gzip;q=0
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 26: a refusal on a SECOND line is honored (whole-field read)
+# line 1 allows zstd, line 2 refuses it -- the latest explicit token
+# wins across lines exactly as it does within one line
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd;q=0.5
+Accept-Encoding: zstd;q=0
+--- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
+--- no_error_log
+[error]
+
+
+=== TEST 27: a gzip refusal on a SECOND line VETOES core gzip (#275 design)
+# core gzip reads only the first line and would compress against the
+# client's combined refusal; the whole-field walk latches it off
+--- config
+    location /t {
+        compression on;
+        compression_order zstd gzip;
+        compression_min_length 1;
+        compression_types text/plain;
+        gzip on;
+        gzip_min_length 1;
+        gzip_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: gzip
+Accept-Encoding: gzip;q=0
+--- raw_response_headers_unlike: Content-Encoding
+--- error_code: 200
+--- response_body
+ae parser fixture body long enough to compress here
+--- no_error_log
+[error]
+
+
+=== TEST 27b: positive control -- gzip allowed on line 1 still defers
+--- config
+    location /t {
+        compression on;
+        compression_order zstd gzip;
+        compression_min_length 1;
+        compression_types text/plain;
+        gzip on;
+        gzip_min_length 1;
+        gzip_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: gzip
+--- response_headers
+Content-Encoding: gzip
+--- no_error_log
+[error]
+
+
+=== TEST 28: gzip ABSENT from every line does NOT latch (fail-closed corner)
+# absence is not refusal: core gzip declines on its own first-line
+# read, and the wildcard-only field must stay un-pre-empted. zstd on
+# line 2 is elected by us; gzip was never in play.
+--- config
+    location /t {
+        compression on;
+        compression_order gzip zstd;
+        compression_min_length 1;
+        compression_types text/plain;
+        gzip on;
+        gzip_min_length 1;
+        gzip_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br;q=0.1
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 29: an EMPTY first line no longer masks a meaningful second
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+"Accept-Encoding:\nAccept-Encoding: zstd"
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
