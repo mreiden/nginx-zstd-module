@@ -1,3 +1,10 @@
+# Everything is LF unless a later rule says otherwise: git's text=auto
+# heuristic leaves genuine binaries alone, and the byte-exact fixture
+# rules below override this for the crafted corpora. Retires the
+# recurring Windows-checkout CRLF-smudge class (sh-sourced configs,
+# byte-compared locks, freshly-extracted headers) in one line.
+* text=auto eol=lf
+
 *.t linguist-language=Text
 
 # Files that are executed or sourced by POSIX sh/perl on Linux (including
