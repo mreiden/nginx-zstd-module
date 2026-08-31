@@ -61,6 +61,22 @@ typedef struct {
      * registering the content-phase handler entirely.
      */
     ngx_flag_t     any_enabled;
+
+    /*
+     * Worker-lifetime directio scratch (parent #210). Cycle-owned ON
+     * PURPOSE: the buffer is allocated from the cycle pool, and keeping
+     * its bookkeeping in file-scope statics would let an in-process
+     * cycle replacement ("master_process off" + SIGHUP) destroy that
+     * pool while statics retained valid-looking capacity — the next
+     * probe would then write into freed memory. In conf, metadata and
+     * buffer share one lifetime: a new cycle starts from a pcalloc'd
+     * conf and allocates afresh (the #103-era rule — module state lives
+     * in cycle-owned conf, never process statics).
+     */
+    u_char        *dio_scratch;
+    size_t         dio_scratch_cap;
+    size_t         dio_scratch_align;
+    ngx_uint_t     dio_scratch_busy;
 } ngx_http_compression_static_main_conf_t;
 
 
@@ -585,44 +601,48 @@ ngx_http_compression_static_pread(ngx_fd_t fd, u_char *buf, size_t size,
  * File-scope static = per OS process; reloads fork fresh workers, and
  * the cycle-pool allocation dies with the process.
  */
-static u_char     *ngx_http_compression_static_dio_scratch;
-static size_t      ngx_http_compression_static_dio_scratch_cap;
-static size_t      ngx_http_compression_static_dio_scratch_align;
-static ngx_uint_t  ngx_http_compression_static_dio_scratch_busy;
-
 static u_char *
-ngx_http_compression_static_dio_buf(ngx_pool_t *pool, size_t want,
-    size_t align)
+ngx_http_compression_static_dio_buf(
+    ngx_http_compression_static_main_conf_t *smcf, ngx_pool_t *pool,
+    size_t want, size_t align)
 {
     u_char  *p;
 
-    if (ngx_http_compression_static_dio_scratch_busy) {
+    /*
+     * SCRATCH_MAX is the sizing contract the capped alignment
+     * guarantees (want = align * 2, align <= PROBE_MAX); enforce it so
+     * a future geometry change cannot silently grow the cached
+     * worker-lifetime buffer — an oversized ask falls through to the
+     * request pool and caches nothing.
+     */
+    if (smcf->dio_scratch_busy
+        || want > NGX_HTTP_COMPRESSION_STATIC_DIO_SCRATCH_MAX)
+    {
         return ngx_pmemalign(pool, want, align);
     }
 
-    if (ngx_http_compression_static_dio_scratch_cap < want
-        || ngx_http_compression_static_dio_scratch_align < align)
-    {
+    if (smcf->dio_scratch_cap < want || smcf->dio_scratch_align < align) {
         p = ngx_pmemalign((ngx_pool_t *) ngx_cycle->pool, want, align);
         if (p == NULL) {
             return ngx_pmemalign(pool, want, align);
         }
 
-        ngx_http_compression_static_dio_scratch = p;
-        ngx_http_compression_static_dio_scratch_cap = want;
-        ngx_http_compression_static_dio_scratch_align = align;
+        smcf->dio_scratch = p;
+        smcf->dio_scratch_cap = want;
+        smcf->dio_scratch_align = align;
     }
 
-    ngx_http_compression_static_dio_scratch_busy = 1;
+    smcf->dio_scratch_busy = 1;
 
-    return ngx_http_compression_static_dio_scratch;
+    return smcf->dio_scratch;
 }
 
 
 static void
-ngx_http_compression_static_dio_buf_release(void)
+ngx_http_compression_static_dio_buf_release(
+    ngx_http_compression_static_main_conf_t *smcf)
 {
-    ngx_http_compression_static_dio_scratch_busy = 0;
+    smcf->dio_scratch_busy = 0;
 }
 
 
@@ -696,6 +716,11 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
     off_t       pos, base, have_base;
     ngx_log_t  *log;
 
+    ngx_http_compression_static_main_conf_t  *smcf;
+
+    smcf = ngx_http_get_module_main_conf(r,
+                                         ngx_http_compression_static_module);
+
     log = r->connection->log;
 
     scratch = 0;
@@ -738,11 +763,12 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
         /* worker-lifetime scratch, pool fallback under overlap (#210);
          * `scratch` remembers whether THIS call took the shared buffer
          * so only that call clears the guard at probe_done */
-        hdr = ngx_http_compression_static_dio_buf(r->pool, want, align);
+        hdr = ngx_http_compression_static_dio_buf(smcf, r->pool, want,
+                                                  align);
         if (hdr == NULL) {
             return NGX_ERROR;
         }
-        scratch = (hdr == ngx_http_compression_static_dio_scratch);
+        scratch = (hdr == smcf->dio_scratch);
 
     } else {
         align = 0;
@@ -954,7 +980,7 @@ probe_done:
      * under a genuinely concurrent caller.
      */
     if (scratch) {
-        ngx_http_compression_static_dio_buf_release();
+        ngx_http_compression_static_dio_buf_release(smcf);
     }
 
     return probe_rc;

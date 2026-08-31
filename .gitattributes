@@ -31,6 +31,8 @@ ci/fuzz/fuzz.dict -text
 *.dict -text
 *.dat -text
 *.zst binary
+*.br binary
+*.gz binary
 
 # t/suite/test's byte length is asserted verbatim by the static suite
 # (Content-Length and the size half of the ETag) — CRLF smudging changes

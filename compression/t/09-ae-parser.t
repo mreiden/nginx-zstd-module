@@ -694,3 +694,50 @@ GET /t
 Content-Encoding: zstd
 --- no_error_log
 [error]
+
+
+=== TEST 30: an explicit refusal on any line beats a wildcard on another
+# The double-pass rule under test: the wildcard-suppressed first probe
+# must isolate line 2's explicit zstd;q=0 from line 1's "*". Must match
+# TEST 18's comma-joined single line: zstd stays refused, and the next
+# base coding elects through the wildcard.
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: *
+Accept-Encoding: zstd;q=0
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]
+
+
+=== TEST 31: a LATER wildcard does not resurrect an earlier explicit refusal
+# The direction a "latest line wins" simplification would silently
+# break: explicit beats wildcard by kind, not by position, so zstd must
+# not come back — br elects through the wildcard exactly as in TEST 18.
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        return 200 "ae parser fixture body long enough to compress here\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd;q=0
+Accept-Encoding: *;q=1
+--- response_headers
+Content-Encoding: br
+--- no_error_log
+[error]

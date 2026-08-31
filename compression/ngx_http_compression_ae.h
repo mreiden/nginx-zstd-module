@@ -497,36 +497,41 @@ ngx_http_compression_ae_header(ngx_http_request_t *r)
  * lineage shared with the parent, and this function never reaches
  * inside one line.
  */
-static ngx_inline ngx_int_t
-ngx_http_compression_chain_coding_weight(const ngx_table_elt_t *ae,
-    ngx_str_t *coding, ngx_uint_t allow_wildcard)
+/*
+ * One field line folded into the field-wide accumulators, and the
+ * final precedence over them. The two collections below (the ->next
+ * chain with gzip, the raw header list without) may differ per build
+ * shape; the accumulation and precedence MUST not — a private copy in
+ * each walker is how the build shapes' negotiation drifts apart with
+ * CI exercising only one of them per job.
+ */
+static ngx_inline void
+ngx_http_compression_fold_line_weight(ngx_str_t *value, ngx_str_t *coding,
+    ngx_uint_t allow_wildcard, ngx_int_t *coding_q, ngx_int_t *star_q)
 {
-    ngx_int_t  q, coding_q, star_q;
+    ngx_int_t  q;
 
-    coding_q = -1;      /* latest explicit token, -1 = absent */
-    star_q = -1;        /* latest "*" wildcard, -1 = absent */
-
-    for ( /* void */ ; ae != NULL;
-          ae = (const ngx_table_elt_t *) ae->next)
-    {
-        q = ngx_http_compression_coding_weight((ngx_str_t *) &ae->value,
-                                               coding, 0);
-        if (q >= 0) {
-            coding_q = q;       /* comma-joined in received order */
-            continue;
-        }
-
-        if (!allow_wildcard) {
-            continue;
-        }
-
-        q = ngx_http_compression_coding_weight((ngx_str_t *) &ae->value,
-                                               coding, 1);
-        if (q >= 0) {
-            star_q = q;         /* only "*" could answer here */
-        }
+    q = ngx_http_compression_coding_weight(value, coding, 0);
+    if (q >= 0) {
+        *coding_q = q;      /* comma-joined in received order */
+        return;
     }
 
+    if (!allow_wildcard) {
+        return;
+    }
+
+    q = ngx_http_compression_coding_weight(value, coding, 1);
+    if (q >= 0) {
+        *star_q = q;        /* only "*" could answer here */
+    }
+}
+
+
+static ngx_inline ngx_int_t
+ngx_http_compression_field_weight(ngx_int_t coding_q, ngx_int_t star_q,
+    ngx_uint_t allow_wildcard)
+{
     if (coding_q >= 0) {
         return coding_q;
     }
@@ -534,6 +539,28 @@ ngx_http_compression_chain_coding_weight(const ngx_table_elt_t *ae,
         return star_q;
     }
     return -1;
+}
+
+
+static ngx_inline ngx_int_t
+ngx_http_compression_chain_coding_weight(const ngx_table_elt_t *ae,
+    ngx_str_t *coding, ngx_uint_t allow_wildcard)
+{
+    ngx_int_t  coding_q, star_q;
+
+    coding_q = -1;      /* latest explicit token, -1 = absent */
+    star_q = -1;        /* latest "*" wildcard, -1 = absent */
+
+    for ( /* void */ ; ae != NULL;
+          ae = (const ngx_table_elt_t *) ae->next)
+    {
+        ngx_http_compression_fold_line_weight((ngx_str_t *) &ae->value,
+                                              coding, allow_wildcard,
+                                              &coding_q, &star_q);
+    }
+
+    return ngx_http_compression_field_weight(coding_q, star_q,
+                                             allow_wildcard);
 }
 
 
@@ -555,7 +582,7 @@ ngx_http_compression_request_coding_weight(ngx_http_request_t *r,
                r->headers_in.accept_encoding, coding, allow_wildcard);
 #else
     ngx_uint_t        i;
-    ngx_int_t         q, coding_q, star_q;
+    ngx_int_t         coding_q, star_q;
     ngx_list_part_t  *part;
     ngx_table_elt_t  *h;
 
@@ -583,29 +610,13 @@ ngx_http_compression_request_coding_weight(ngx_http_request_t *r,
             continue;
         }
 
-        q = ngx_http_compression_coding_weight(&h[i].value, coding, 0);
-        if (q >= 0) {
-            coding_q = q;
-            continue;
-        }
-
-        if (!allow_wildcard) {
-            continue;
-        }
-
-        q = ngx_http_compression_coding_weight(&h[i].value, coding, 1);
-        if (q >= 0) {
-            star_q = q;
-        }
+        ngx_http_compression_fold_line_weight(&h[i].value, coding,
+                                              allow_wildcard,
+                                              &coding_q, &star_q);
     }
 
-    if (coding_q >= 0) {
-        return coding_q;
-    }
-    if (allow_wildcard && star_q >= 0) {
-        return star_q;
-    }
-    return -1;
+    return ngx_http_compression_field_weight(coding_q, star_q,
+                                             allow_wildcard);
 #endif
 }
 
