@@ -81,7 +81,8 @@ if test -n "$ngx_module_link"; then
     ngx_module_name=ngx_http_compression_static_module
     ngx_module_incs=
     ngx_module_deps="$ngx_addon_dir/ngx_http_compression.h \
-                     $ngx_addon_dir/ngx_http_compression_ae.h"
+                     $ngx_addon_dir/ngx_http_compression_ae.h \
+                     $ngx_addon_dir/../src/ngx_http_zstd_frame_probe.h"
     ngx_module_srcs="$ngx_addon_dir/ngx_http_compression_static.c"
     ngx_module_libs=
 

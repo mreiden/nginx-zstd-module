@@ -28,6 +28,16 @@
 #include "ngx_http_compression.h"
 #include "ngx_http_compression_ae.h"
 
+/*
+ * THE frame probe (parent #270/#278): verdicts, the RFC 8878 window
+ * cap, the bounded skippable-walk limit, probe_frame() and
+ * probe_reuse() all come from the parent's authoritative header --
+ * this module used to carry a synchronized copy of every one of
+ * them. The header self-defines the RFC-frozen format constants, so
+ * this module still links no compression library.
+ */
+#include "../src/ngx_http_zstd_frame_probe.h"
+
 
 /*
  * ITS OWN MODULE since the split (Mark's packaging call, gzip_static /
@@ -160,22 +170,6 @@ ngx_module_t  ngx_http_compression_static_module = {
 };
 
 
-/*
- * RFC 8878 FORMAT constants, deliberately NOT taken from <zstd.h>:
- * static serving is file serving for every coding — a build without
- * libzstd (or without any compression library at all) still probes
- * and serves .zst sidecars byte-exact, exactly as it serves .gz
- * without zlib. The values are the format's, frozen by the RFC:
- * frame magic 0xFD2FB528, skippable magics 0x184D2A5? (low nibble
- * masked).
- */
-#define NGX_HTTP_COMPRESSION_STATIC_ZSTD_MAGIC       0xFD2FB528U
-#define NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_MASK   0xFFFFFFF0U
-#define NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_START  0x184D2A50U
-
-/* browsers enforce 8 MB for Content-Encoding: zstd (RFC 8878 §3.1.1.1.2) */
-#define NGX_HTTP_COMPRESSION_STATIC_MAX_WINDOW  (8 * 1024 * 1024)
-
 /* directio probe floor: one logical block, raised to the operator's
  * directio_alignment when larger */
 #define NGX_HTTP_COMPRESSION_STATIC_DIO_PROBE   4096
@@ -220,23 +214,6 @@ ngx_module_t  ngx_http_compression_static_module = {
 #else
 #define NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE  0
 #endif
-
-/* ngx_http_compression_static_probe_frame() verdicts (parent #159) */
-#define NGX_HTTP_COMPRESSION_STATIC_FRAME_OK          0
-#define NGX_HTTP_COMPRESSION_STATIC_FRAME_NOT_ZSTD    1
-#define NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED   2
-#define NGX_HTTP_COMPRESSION_STATIC_FRAME_WINDOW_BIG  3
-#define NGX_HTTP_COMPRESSION_STATIC_FRAME_SKIP        4
-#define NGX_HTTP_COMPRESSION_STATIC_FRAME_RESERVED    5
-
-/*
- * How many leading skippable frames the handler follows before it
- * declines. A dcz-style prefix is exactly ONE skippable frame ahead of
- * the payload, so 4 is generous headroom while still bounding the walk:
- * an attacker cannot turn a skippable-frame chain into an unbounded
- * scan, since each frame past the bound is a hard decline.
- */
-#define NGX_HTTP_COMPRESSION_STATIC_MAX_SKIP_FRAMES   4
 
 
 static ngx_int_t ngx_http_compression_static_check_zstd(
@@ -380,172 +357,6 @@ ngx_http_compression_static_default_order(ngx_conf_t *cf,
 
 #if (NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE)
 
-/*
- * Pure frame-header probe (parent #159): decides the leading frame of a
- * .zst file from the first `n` bytes read at some offset. No I/O, no
- * logging, no request state — the arithmetic only. Reads at most 18
- * bytes and never past `n`; every layout path checks it got the bytes
- * that layout requires. On FRAME_WINDOW_BIG the declared window is
- * stored through `window`; on FRAME_SKIP the skippable frame's 4-byte
- * little-endian declared skip length (RFC 8878 §3.2) is stored there
- * instead — same out-param, different unit, read only against the
- * matching verdict. Hardcoded magic constants, not zstd.h: the static
- * module links no compression library.
- */
-static ngx_int_t
-ngx_http_compression_static_probe_frame(const u_char *hdr, size_t n,
-    uint64_t *window)
-{
-    uint32_t    mw;
-    uint64_t    w;
-    ngx_uint_t  fhd, fcs_size, off;
-
-    static const ngx_uint_t  did_len[4] = { 0, 1, 2, 4 };
-
-    /*
-     * Fixed-width decodes (parent #259): on little-endian targets the
-     * wire format IS the native layout, and ngx_memcpy() of the exact
-     * width keeps unaligned access safe while the compiler collapses it
-     * to one load. The bytewise assembly stays as the other-byte-order
-     * fallback — behavior-identical, just more instructions.
-     */
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    ngx_memcpy(&mw, hdr, sizeof(uint32_t));
-#else
-    mw = ((uint32_t) hdr[0])
-       | ((uint32_t) hdr[1] << 8)
-       | ((uint32_t) hdr[2] << 16)
-       | ((uint32_t) hdr[3] << 24);
-#endif
-
-    if (mw != NGX_HTTP_COMPRESSION_STATIC_ZSTD_MAGIC
-        && (mw & NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_MASK)
-           != NGX_HTTP_COMPRESSION_STATIC_SKIPPABLE_START)
-    {
-        return NGX_HTTP_COMPRESSION_STATIC_FRAME_NOT_ZSTD;
-    }
-
-    /*
-     * Skippable frame: magic(4) + Frame_Size(4, LE) + Frame_Size opaque
-     * bytes. There is no window here, only a length to jump, so the
-     * caller must resolve the skip (bounded) and probe the frame that
-     * follows — an attacker-controlled skippable prefix must not dodge
-     * the window check on the frame that actually decodes. That was the
-     * bug: OK-ing every skippable magic let a one-frame-longer file
-     * bypass the 8 MB guard entirely.
-     */
-    if (mw != NGX_HTTP_COMPRESSION_STATIC_ZSTD_MAGIC) {
-        if (n < 8) {
-            return NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED;
-        }
-
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-        {
-            uint32_t  skip_size;
-
-            ngx_memcpy(&skip_size, hdr + 4, sizeof(uint32_t));
-            *window = skip_size;
-        }
-#else
-        *window = ((uint64_t) hdr[4])
-                | ((uint64_t) hdr[5] << 8)
-                | ((uint64_t) hdr[6] << 16)
-                | ((uint64_t) hdr[7] << 24);
-#endif
-
-        return NGX_HTTP_COMPRESSION_STATIC_FRAME_SKIP;
-    }
-
-    /* declared-window check on the leading regular frame (RFC 8878) */
-    if (n < 5) {
-        return NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED;
-    }
-
-    fhd = hdr[4];
-
-    /*
-     * Frame_Header_Descriptor bit 3 is Reserved_bit (RFC 8878 §3.1.1.1):
-     * "must be zero; a decoder compliant with this version of the
-     * specification must ensure it is not set" — so every decoder a
-     * client runs rejects the frame, and serving it would suppress the
-     * usable identity fallback (upstream #252).
-     */
-    if (fhd & 0x08) {
-        return NGX_HTTP_COMPRESSION_STATIC_FRAME_RESERVED;
-    }
-
-    if (!(fhd & 0x20)) {
-        /* Window_Descriptor follows */
-        if (n < 6) {
-            return NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED;
-        }
-
-        w = (uint64_t) 1 << (10 + (hdr[5] >> 3));
-        w += (w >> 3) * (hdr[5] & 7);
-
-    } else {
-        /* Single_Segment: window = frame content size, behind the
-         * optional dictionary id */
-        fcs_size = (fhd >> 6) ? ((ngx_uint_t) 1 << (fhd >> 6)) : 1;
-        off = 5 + did_len[fhd & 3];
-
-        if (n < off + fcs_size) {
-            return NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED;
-        }
-
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-        switch (fcs_size) {
-
-        case 1:
-            w = hdr[off];
-            break;
-
-        case 2:
-            {
-                uint16_t  value;
-
-                ngx_memcpy(&value, hdr + off, sizeof(uint16_t));
-                w = value;
-            }
-            break;
-
-        case 4:
-            {
-                uint32_t  value;
-
-                ngx_memcpy(&value, hdr + off, sizeof(uint32_t));
-                w = value;
-            }
-            break;
-
-        default:
-            ngx_memcpy(&w, hdr + off, sizeof(uint64_t));
-            break;
-        }
-#else
-        {
-            ngx_uint_t  i;
-
-            w = 0;
-            for (i = 0; i < fcs_size; i++) {
-                w |= (uint64_t) hdr[off + i] << (8 * i);
-            }
-        }
-#endif
-
-        if (fcs_size == 2) {
-            w += 256;  /* RFC 8878: the 2-byte field is offset */
-        }
-    }
-
-    if (w > NGX_HTTP_COMPRESSION_STATIC_MAX_WINDOW) {
-        *window = w;
-        return NGX_HTTP_COMPRESSION_STATIC_FRAME_WINDOW_BIG;
-    }
-
-    return NGX_HTTP_COMPRESSION_STATIC_FRAME_OK;
-}
-
 
 /*
  * The probe's only platform-dependent step (parent #162): fetch up to
@@ -645,38 +456,6 @@ ngx_http_compression_static_dio_buf_release(
     smcf->dio_scratch_busy = 0;
 }
 
-
-/*
- * Can the previous read's buffer serve this iteration without another
- * read (parent #233 generalized by #261)? True when the block already
- * in `hdr` (read at have_base, n bytes) covers [pos, pos+need). Under
- * directio the rounded-down base can repeat across the skip-frame walk;
- * off it, the enlarged buffered read can retain a canonical 40-byte dcz
- * prefix plus the following maximum 18-byte frame header. Requiring the
- * whole possible header (or all bytes remaining in a shorter file)
- * means a partial suffix still takes the established fresh-read path.
- */
-static ngx_uint_t
-ngx_http_compression_static_probe_reuse(off_t pos, off_t have_base,
-    ssize_t n, size_t need, size_t *frame_off, off_t *base)
-{
-    uint64_t  offset;
-
-    if (n <= 0 || pos < have_base) {
-        return 0;
-    }
-
-    offset = (uint64_t) (pos - have_base);
-
-    if (offset > (uint64_t) n || (uint64_t) n - offset < need) {
-        return 0;
-    }
-
-    *frame_off = (size_t) offset;
-    *base = have_base;
-
-    return 1;
-}
 
 #endif /* NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE */
 
@@ -803,14 +582,14 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
          * declined a valid file with exactly four leading skippable
          * frames one probe early.
          */
-        if (frames > NGX_HTTP_COMPRESSION_STATIC_MAX_SKIP_FRAMES) {
+        if (frames > NGX_HTTP_ZSTD_STATIC_MAX_SKIP_FRAMES) {
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" has more than %ui "
                           "leading skippable frames — declining rather "
                           "than searching further for the first regular "
                           "frame", path,
                           (ngx_uint_t)
-                              NGX_HTTP_COMPRESSION_STATIC_MAX_SKIP_FRAMES);
+                              NGX_HTTP_ZSTD_STATIC_MAX_SKIP_FRAMES);
             probe_rc = NGX_DECLINED;
             goto probe_done;
         }
@@ -837,7 +616,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                                 ngx_max((off_t) 4, of->size - pos));
 
         reuse = have_block
-                && ngx_http_compression_static_probe_reuse(pos, have_base,
+                && ngx_http_zstd_static_probe_reuse(pos, have_base,
                                                            n, need,
                                                            &frame_off,
                                                            &base);
@@ -888,11 +667,11 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                            "directio file \"%V\"", align, path);
         }
 
-        switch (ngx_http_compression_static_probe_frame(frame, avail,
+        switch (ngx_http_zstd_static_probe_frame(frame, avail,
                                                         &window))
         {
 
-        case NGX_HTTP_COMPRESSION_STATIC_FRAME_NOT_ZSTD:
+        case NGX_HTTP_ZSTD_STATIC_FRAME_NOT_ZSTD:
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" is not a zstd frame "
                           "(leading bytes 0x%02xd%02xd%02xd%02xd)", path,
@@ -901,14 +680,14 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
             probe_rc = NGX_DECLINED;
             goto probe_done;
 
-        case NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED:
+        case NGX_HTTP_ZSTD_STATIC_FRAME_TRUNCATED:
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" frame header "
                           "truncated", path);
             probe_rc = NGX_DECLINED;
             goto probe_done;
 
-        case NGX_HTTP_COMPRESSION_STATIC_FRAME_WINDOW_BIG:
+        case NGX_HTTP_ZSTD_STATIC_FRAME_WINDOW_BIG:
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" declares a %uL-byte "
                           "decompression window, above the 8 MB limit "
@@ -919,7 +698,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
             probe_rc = NGX_DECLINED;
             goto probe_done;
 
-        case NGX_HTTP_COMPRESSION_STATIC_FRAME_RESERVED:
+        case NGX_HTTP_ZSTD_STATIC_FRAME_RESERVED:
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" frame header sets "
                           "reserved Frame_Header_Descriptor bit 0x08 "
@@ -928,7 +707,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
             probe_rc = NGX_DECLINED;
             goto probe_done;
 
-        case NGX_HTTP_COMPRESSION_STATIC_FRAME_SKIP:
+        case NGX_HTTP_ZSTD_STATIC_FRAME_SKIP:
 
             /*
              * `window` carries the declared skip length here. Prove the
@@ -991,8 +770,6 @@ probe_done:
 
     return NGX_OK;
 }
-
-
 
 
 static ngx_int_t
