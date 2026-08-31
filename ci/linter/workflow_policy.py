@@ -627,7 +627,8 @@ def check_cadence() -> int:
 # check): a `tar -xzf` or a direct `./configure`/binary invocation is the
 # actual privilege boundary, not the download line above it.
 EXTRACT_OR_EXEC_RE = re.compile(
-    r"(?<![\w-])tar\s+-?x|(?<![\w-])unzip\b|(?<![\w-])/tmp/actionlint\b"
+    r"(?<![\w-])tar\s+-?x|(?<![\w-])unzip\b|"
+    r"(?<![\w-])/tmp/actionlint\b"
     # Direct execution of a fetched artifact, without any unpacking step in
     # between: `chmod +x tool && ./tool`, or a bare `./tool` / `./tool/x`
     # invocation. A standalone downloaded executable is the same privilege
@@ -638,6 +639,29 @@ EXTRACT_OR_EXEC_RE = re.compile(
     # scoped to jobs that DO fetch something (see DOWNLOAD_RE).
     r"|(?<![\w./-])\./[\w.-]+"
 )
+
+# CodeQL's pinned analyze action produces this database archive locally. It is
+# not restored by cache or downloaded by the job's wget/curl steps.
+LOCAL_CODEQL_DATABASE_UNZIP_RE = re.compile(
+    r'unzip(?:\s+-\S+)*\s+["\']?\$db/src\.zip["\']?\s+-d\s+'
+)
+
+
+def is_package_or_comment_token(run: str, token_start: int) -> bool:
+    """Return whether an extract-token spelling is not a shell invocation."""
+    line_start = run.rfind("\n", 0, token_start) + 1
+    while line_start:
+        previous_end = line_start - 1
+        previous_start = run.rfind("\n", 0, previous_end) + 1
+        if not run[previous_start:previous_end].rstrip().endswith("\\"):
+            break
+        line_start = previous_start
+    prefix = run[line_start:token_start]
+    if prefix.lstrip().startswith("#"):
+        return True
+    logical_prefix = prefix.replace("\\\n", " ")
+    return bool(re.search(r"\bapt(?:-get)?\s+install\b[^;&|\n]*$", logical_prefix))
+
 
 # What counts as a trust-anchor assertion having been made ON THIS PATH
 # before the extract/exec point. Any one of:
@@ -724,20 +748,23 @@ def check_provenance() -> int:
                 continue
             anchored = False
             for i, run in enumerate(runs):
-                extract = EXTRACT_OR_EXEC_RE.search(run)
                 # Same-step trust anchors count only before extraction, in
                 # the same order the shell consumes the commands.
-                if (
-                    extract is not None
-                    and not anchored
-                    and not TRUST_ANCHOR_RE.search(run[: extract.start()])
-                ):
-                    errors.append(
-                        f"{path.name}:{job} step {i + 1} extracts or executes "
-                        "a downloaded artifact with no gpg/sha256 trust-anchor "
-                        "assertion earlier in the job -- verify before "
-                        "extraction/execution, cache-hit path included"
-                    )
+                for extract in EXTRACT_OR_EXEC_RE.finditer(run):
+                    if is_package_or_comment_token(run, extract.start()):
+                        continue
+                    local = LOCAL_CODEQL_DATABASE_UNZIP_RE.search(run, extract.start())
+                    if local is not None and local.start() == extract.start():
+                        continue
+                    if not anchored and not TRUST_ANCHOR_RE.search(
+                        run[: extract.start()]
+                    ):
+                        errors.append(
+                            f"{path.name}:{job} step {i + 1} extracts or executes "
+                            "a downloaded artifact with no gpg/sha256 trust-anchor "
+                            "assertion earlier in the job -- verify before "
+                            "extraction/execution, cache-hit path included"
+                        )
                 # A same-step anchor only protects later commands. Recording
                 # it before the extraction check lets `tar ...; verify ...`
                 # satisfy the gate after untrusted bytes already executed.
