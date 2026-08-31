@@ -24,6 +24,12 @@ auto/* text eol=lf
 # them.
 fuzz/corpus/* -text
 fuzz/fuzz.dict -text
+# Any dictionary fixture is byte-significant -- libFuzzer token files
+# and RFC 9842 raw dictionaries alike; -text keeps the former diffable.
+# .dat per Compression Dictionary Transport guidance for web-served
+# dictionaries, covered for future examples.
+*.dict -text
+*.dat -text
 *.zst binary
 
 # t/suite/test's byte length is asserted verbatim by the static suite
