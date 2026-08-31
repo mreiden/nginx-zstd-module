@@ -1408,10 +1408,40 @@ ngx_module_t  ngx_http_zstd_filter_module = {
 };
 
 
+static u_char *
+ngx_http_zstd_cache_control_directive_end(u_char *p, u_char *last)
+{
+    while (p < last) {
+        if (*p == '"') {
+            p++;
+
+            while (p < last && *p != '"') {
+                if (*p == '\\' && p + 1 < last) {
+                    p++;
+                }
+                p++;
+            }
+
+            if (p < last) {
+                p++;
+            }
+
+        } else if (*p == ',') {
+            break;
+
+        } else {
+            p++;
+        }
+    }
+
+    return p;
+}
+
+
 static ngx_int_t
 ngx_http_zstd_cache_control_value_no_transform(ngx_table_elt_t *cc)
 {
-    u_char  *p, *last, *start, *end, *semi;
+    u_char  *p, *last, *start, *end, *directive_end, *semi;
 
     if (cc->value.len == 0) {
         return 0;
@@ -1426,10 +1456,7 @@ ngx_http_zstd_cache_control_value_no_transform(ngx_table_elt_t *cc)
             start++;
         }
 
-        end = start;
-        while (end < last && *end != ',') {
-            end++;
-        }
+        directive_end = ngx_http_zstd_cache_control_directive_end(start, last);
 
         /*
          * Cut at '=' as well as ';': the compared token is then the
@@ -1440,7 +1467,7 @@ ngx_http_zstd_cache_control_value_no_transform(ngx_table_elt_t *cc)
          * cuts to "extension" and still does not match.
          */
         semi = start;
-        while (semi < end && *semi != ';' && *semi != '=') {
+        while (semi < directive_end && *semi != ';' && *semi != '=') {
             semi++;
         }
         end = semi;
@@ -1456,10 +1483,7 @@ ngx_http_zstd_cache_control_value_no_transform(ngx_table_elt_t *cc)
             return 1;
         }
 
-        p = semi;
-        while (p < last && *p != ',') {
-            p++;
-        }
+        p = directive_end;
         if (p < last) {
             p++;
         }
@@ -1994,7 +2018,7 @@ ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
     ngx_int_t                  rc;
     ngx_uint_t                 secure;
     ngx_uint_t                 i, avail_dict_count, sec_fetch_site_count;
-    ngx_table_elt_t           *avail_dict_h, *sec_fetch_site_h, *ae;
+    ngx_table_elt_t           *avail_dict_h, *sec_fetch_site_h;
     ngx_http_zstd_dcz_dict_t  *dicts;
 
     if (zlcf->dcz_dicts == NULL || zlcf->dcz_dicts->nelts == 0) {
@@ -2044,14 +2068,15 @@ ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
     }
 
     /*
-     * Accept-Encoding is in nginx's headers_in table, so duplicate lines
-     * are chained on ae->next rather than rejected. EVERY line is
+     * Accept-Encoding is in nginx's headers_in table. nginx >= 1.23 chains
+     * duplicate lines while older supported nginx leaves them in the list;
+     * EVERY line is
      * evaluated, not just the first: RFC 9110 section 5.3 makes a
      * repeated list-valued field identical to the single comma-joined
      * field, so a client that split "zstd, dcz" across two lines
      * advertises dcz exactly as much as one that sent it on one.
      *
-     * This deliberately shares ngx_http_zstd_chain_coding_weight() with
+     * This deliberately shares ngx_http_zstd_request_coding_weight() with
      * the plain-zstd path in ngx_http_zstd_accepts(). The two used to
      * carry independent copies of the first-line-only assumption, which
      * is how one negotiation contract turned into two -- the shared
@@ -2061,11 +2086,6 @@ ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
      * it on. The duplicate-coding rule (an explicit q=0 anywhere is
      * final) is documented on the helper.
      */
-    ae = r->headers_in.accept_encoding;
-    if (ae == NULL) {
-        return NULL;
-    }
-
     /*
      * Cheapest gate first: reject before paying for the header-list walk
      * or the base64 decode below. No client sends "dcz" in Accept-Encoding
@@ -2080,7 +2100,7 @@ ngx_http_zstd_dcz_negotiate(ngx_http_request_t *r,
      * message is emitted instead of theirs. See t/03-dcz.t for a test
      * pinning that order.
      */
-    if (ngx_http_zstd_chain_coding_weight(ae, "dcz",
+    if (ngx_http_zstd_request_coding_weight(r, "dcz",
                                           sizeof("dcz") - 1, 0) <= 0)
     {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -2399,10 +2419,22 @@ ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             if (ngx_http_zstd_max_length_exceeded(ctx->bytes_in,
                                                    zlcf->max_length))
             {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "zstd: input exceeded zstd_max_length (%O) on a "
-                              "response with no Content-Length; aborting to "
-                              "protect the worker", (off_t) zlcf->max_length);
+                if (ctx->pledged_size >= 0) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                  "zstd: input exceeded zstd_max_length (%O) "
+                                  "after %uL bytes on a response with declared "
+                                  "Content-Length %O; aborting to protect the "
+                                  "worker", (off_t) zlcf->max_length,
+                                  ctx->bytes_in,
+                                  ctx->pledged_size);
+                } else {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                  "zstd: input exceeded zstd_max_length (%O) "
+                                  "after %uL bytes on a response with no "
+                                  "Content-Length; aborting to protect the "
+                                  "worker", (off_t) zlcf->max_length,
+                                  ctx->bytes_in);
+                }
                 goto failed;
             }
 
@@ -4949,6 +4981,45 @@ ngx_http_zstd_predicate_is_direct_header_or_cookie(const ngx_str_t *v)
 }
 
 
+static void
+ngx_http_zstd_validate_bypass_vary(ngx_conf_t *cf,
+    ngx_http_zstd_loc_conf_t *conf)
+{
+    ngx_http_complex_value_t  *cv;
+    ngx_uint_t                 i;
+
+    /* Warn for either half of a cache-vary contract configured alone. */
+    if (conf->bypass_vary.len && conf->bypass == NULL) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "\"zstd_bypass_vary\" is set without a "
+                           "\"zstd_bypass\" predicate; it adds a \"Vary: %V\" "
+                           "field no response varies on. Add a "
+                           "\"zstd_bypass\" directive or remove "
+                           "\"zstd_bypass_vary\"", &conf->bypass_vary);
+    }
+
+    if (conf->bypass == NULL || conf->bypass_vary.len != 0) {
+        return;
+    }
+
+    cv = conf->bypass->elts;
+
+    for (i = 0; i < conf->bypass->nelts; i++) {
+        if (ngx_http_zstd_predicate_is_direct_header_or_cookie(&cv[i].value)) {
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "\"zstd_bypass\" predicate \"%V\" reads "
+                               "a request header or cookie directly "
+                               "without a \"zstd_bypass_vary\"; a shared "
+                               "cache may mix identity and compressed "
+                               "responses under the same key. Add a "
+                               "\"zstd_bypass_vary\" directive naming the "
+                               "header this varies on", &cv[i].value);
+            return;
+        }
+    }
+}
+
+
 static char *
 ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -5005,57 +5076,8 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_ptr_value(conf->dcz_dicts, prev->dcz_dicts, NULL);
     ngx_conf_merge_value(conf->dcz_assume_secure, prev->dcz_assume_secure, 0);
 
-    /*
-     * zstd_bypass_vary only makes sense alongside a zstd_bypass predicate: it
-     * names the request header the bypass decision varies on so shared caches
-     * key correctly. Set on its own it just emits a Vary field no response
-     * actually varies on (harmless over-varying). Warn so the misconfig is
-     * visible rather than silently degrading cache hit rate.
-     */
-    if (conf->bypass_vary.len && conf->bypass == NULL) {
-        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                           "\"zstd_bypass_vary\" is set without a "
-                           "\"zstd_bypass\" predicate; it adds a \"Vary: %V\" "
-                           "field no response varies on. Add a "
-                           "\"zstd_bypass\" directive or remove "
-                           "\"zstd_bypass_vary\"", &conf->bypass_vary);
-    }
-
-    /*
-     * Inverse of the check above: a zstd_bypass predicate that reads a
-     * request header or cookie DIRECTLY (e.g.
-     * "zstd_bypass $http_x_no_compression;") without a matching
-     * zstd_bypass_vary lets a shared cache mix an identity response
-     * with a compressed one under the same cache key -- a
-     * cache-poisoning / wrong-variant-served hazard. Only the literal
-     * "$http_*" / "$cookie_*" spellings are checked; a map or other
-     * indirection stays an explicit documented operator responsibility
-     * (see ngx_http_zstd_predicate_is_direct_header_or_cookie()).
-     */
-    if (conf->bypass != NULL && conf->bypass_vary.len == 0) {
-        ngx_http_complex_value_t  *cv;
-        ngx_uint_t                 i;
-
-        cv = conf->bypass->elts;
-
-        for (i = 0; i < conf->bypass->nelts; i++) {
-            if (ngx_http_zstd_predicate_is_direct_header_or_cookie(
-                    &cv[i].value))
-            {
-                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                                   "\"zstd_bypass\" predicate \"%V\" reads "
-                                   "a request header or cookie directly "
-                                   "without a \"zstd_bypass_vary\"; a "
-                                   "shared cache may mix identity and "
-                                   "compressed responses under the same "
-                                   "key. Add a \"zstd_bypass_vary\" "
-                                   "directive naming the header this "
-                                   "varies on", &cv[i].value);
-                break;
-            }
-        }
-    }
-
+    /* Validate the paired bypass/cache-vary directives after inheritance. */
+    ngx_http_zstd_validate_bypass_vary(cf, conf);
     if (ngx_http_merge_types(cf, &conf->types_keys, &conf->types,
                              &prev->types_keys, &prev->types,
                              ngx_http_zstd_default_types))

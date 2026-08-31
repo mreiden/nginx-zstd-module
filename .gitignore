@@ -17,6 +17,12 @@ objs/
 # binaries, one dir per flavor-version)
 .build/
 
+# Local analysis and task-runner caches
+.grind-wt/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
 # Test runner working directories (nginx test::nginx servroot)
 ci/t/servroot/
 ci/t/servroot-*/
@@ -56,7 +62,6 @@ ci/fuzz/fuzz_accept_encoding
 ci/fuzz/generated_parser.inc
 ci/fuzz/fuzz_dcz
 ci/fuzz/generated_dcz.inc
-ci/fuzz/generated_static_probe.inc
 ci/fuzz/crash-*
 ci/fuzz/corpus-min/
 ci/fuzz/corpus-dcz-min/

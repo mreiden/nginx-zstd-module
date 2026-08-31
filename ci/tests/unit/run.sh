@@ -4,9 +4,9 @@
 #
 # ci/tests/unit/run.sh -- build and run the pure-function unit tests: the
 # Accept-Encoding parser (src/ngx_http_zstd_common.h) and the .zst
-# frame-header probe (src/ngx_http_zstd_static_module.c).
+# frame-header probe (src/ngx_http_zstd_frame_probe.h).
 #
-#   ci/tests/unit/run.sh            # regenerate both slices, build, run
+#   ci/tests/unit/run.sh            # regenerate parser slice, build, run
 #   ci/tests/unit/run.sh clean      # remove build products
 #   COVERAGE=1 ci/tests/unit/run.sh # also instrument, so ci/tools/coverage.sh
 #                                   # can gcov src/ afterwards
@@ -46,12 +46,14 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DIR/../../.." && pwd)"
 FUZZ_DIR="$ROOT/ci/fuzz"
 BIN="$DIR/test_accept_encoding"
+LEGACY_BIN="$DIR/test_accept_encoding_legacy"
+CHAIN_BIN="$DIR/test_accept_encoding_chain"
 PROBE_BIN="$DIR/test_static_probe"
 
 if [ "${1:-}" = "clean" ]; then
-    rm -f "$BIN" "$PROBE_BIN" "$DIR"/*.o "$DIR"/*.gcda "$DIR"/*.gcno
-    echo "unit test binary removed"
-    exit 0
+	rm -f "$BIN" "$LEGACY_BIN" "$CHAIN_BIN" "$PROBE_BIN" "$DIR"/*.o "$DIR"/*.gcda "$DIR"/*.gcno
+	echo "unit test binary removed"
+	exit 0
 fi
 
 # Regenerate the extracted parser slice so this binary always links the
@@ -67,16 +69,16 @@ CC="${CC:-cc}"
 OWN_CFLAGS=(-g -O1 -Wall -Wextra -Wshadow -Werror)
 
 if [ "${COVERAGE:-0}" = 1 ]; then
-    OWN_CFLAGS+=(--coverage)
-    LINK_EXTRA=(--coverage)
+	OWN_CFLAGS+=(--coverage)
+	LINK_EXTRA=(--coverage)
 else
-    LINK_EXTRA=()
+	LINK_EXTRA=()
 fi
 
 echo "==> Building $BIN with ${CC}"
 # shellcheck disable=SC2086  # $CC may legitimately carry flags (e.g. "gcc -m32")
 $CC "${OWN_CFLAGS[@]}" -I"$FUZZ_DIR" -c "$DIR/test_accept_encoding.c" \
-    -o "$DIR/test_accept_encoding.o"
+	-o "$DIR/test_accept_encoding.o"
 # shellcheck disable=SC2086
 $CC "${LINK_EXTRA[@]}" -o "$BIN" "$DIR/test_accept_encoding.o"
 
@@ -87,20 +89,44 @@ echo "==> Running"
 # failed.
 timeout 60s "$BIN"
 
+echo "==> Building $LEGACY_BIN with ${CC} (nginx 1.22.1 header shape)"
+# The shim omits ngx_table_elt_t.next under this define, so this compilation
+# catches an accidental legacy ->next access as well as exercising the list walk.
+# shellcheck disable=SC2086
+$CC "${OWN_CFLAGS[@]}" -DNGX_ZSTD_LEGACY_SHIM -I"$FUZZ_DIR" \
+	-c "$DIR/test_accept_encoding_legacy.c" -o "$DIR/test_accept_encoding_legacy.o"
+# shellcheck disable=SC2086
+$CC "${LINK_EXTRA[@]}" -o "$LEGACY_BIN" "$DIR/test_accept_encoding_legacy.o"
+
+echo "==> Running nginx 1.22.1-shaped Accept-Encoding checks"
+timeout 60s "$LEGACY_BIN"
+
+echo "==> Building $CHAIN_BIN with ${CC} (nginx 1.23+ chained headers)"
+# This reuses the legacy fixture with the modern shim shape, proving the
+# ordered duplicate-field contract in both nginx storage layouts.
+# shellcheck disable=SC2086
+$CC "${OWN_CFLAGS[@]}" -I"$FUZZ_DIR" \
+	-c "$DIR/test_accept_encoding_legacy.c" -o "$DIR/test_accept_encoding_chain.o"
+# shellcheck disable=SC2086
+$CC "${LINK_EXTRA[@]}" -o "$CHAIN_BIN" "$DIR/test_accept_encoding_chain.o"
+
+echo "==> Running nginx 1.23+-shaped Accept-Encoding checks"
+timeout 60s "$CHAIN_BIN"
+
 # ---------------------------------------------------------------------------
-# The .zst frame-header probe (src/ngx_http_zstd_static_module.c:
-# ngx_http_zstd_static_probe_frame). Same shape as the parser suite above:
-# extract the shipped function body first, so this binary can never link a
+# The .zst frame-header probe (src/ngx_http_zstd_frame_probe.h:
+# ngx_http_zstd_static_probe_frame). Unlike the parser suite above there
+# is no extraction step: the probe lives in its own shipped header (#270)
+# and the TU includes it directly, so the binary can never link a
 # hand-copied drifted version. The probe is pure arithmetic over a fixed
 # 18-byte buffer -- no nginx tree, no libzstd, no filesystem -- so it belongs
 # in this cheapest layer too.
 # ---------------------------------------------------------------------------
-bash "$FUZZ_DIR/extract_static_probe.sh"
 
 echo "==> Building $PROBE_BIN with ${CC}"
 # shellcheck disable=SC2086
-$CC "${OWN_CFLAGS[@]}" -I"$FUZZ_DIR" -c "$DIR/test_static_probe.c" \
-    -o "$DIR/test_static_probe.o"
+$CC "${OWN_CFLAGS[@]}" -c "$DIR/test_static_probe.c" \
+	-o "$DIR/test_static_probe.o"
 # shellcheck disable=SC2086
 $CC "${LINK_EXTRA[@]}" -o "$PROBE_BIN" "$DIR/test_static_probe.o"
 

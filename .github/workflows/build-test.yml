@@ -69,6 +69,13 @@ jobs:
       nginx_version: ${{ steps.v.outputs.nginx_version }}
       matrix: ${{ steps.v.outputs.matrix }}
     steps:
+      # `vars.POOL` is unavailable in forks; curl is needed by the very next
+      # step, before any job-specific package installation can run.
+      - name: Install bootstrap dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl
+
       - name: Resolve latest mainline nginx
         id: v
         run: |
@@ -99,6 +106,12 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
+
+      # actionlint is downloaded in the next step, so install curl before it.
+      - name: Install bootstrap dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl
 
       # Lint the workflow files themselves. actionlint validates GitHub
       # Actions expression contexts (e.g. "env is not allowed in a job
@@ -164,6 +177,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            curl \
+            git \
             gcc-multilib \
             libpcre2-dev \
             zlib1g-dev \
@@ -171,6 +186,7 @@ jobs:
             cppcheck \
             clang-tools \
             python3 \
+            python3-yaml \
             nginx-dev
 
       - name: Validate tool scripts (syntax only)
@@ -195,11 +211,11 @@ jobs:
 
       # Cheapest test layer over the real pure decision functions -- the
       # Accept-Encoding parser and the .zst frame-header probe: no nginx
-      # build tree, no network, sub-second. Regenerates and links the
-      # shipped src/ngx_http_zstd_common.h and
-      # src/ngx_http_zstd_static_module.c via ci/fuzz/extract_parser.sh and
-      # ci/fuzz/extract_static_probe.sh (see ci/tests/unit/run.sh header) so
-      # a stale copy can never pass.
+      # build tree, no network, sub-second. Links the shipped
+      # src/ngx_http_zstd_common.h via ci/fuzz/extract_parser.sh, and the
+      # frame probe by including src/ngx_http_zstd_frame_probe.h directly
+      # (#270 -- the probe's authoritative copy is a header now, so there
+      # is no extraction left to go stale).
       - name: Pure-function unit tests (Accept-Encoding parser + frame probe)
         run: |
           bash "$GITHUB_WORKSPACE/ci/tests/unit/run.sh"
@@ -213,11 +229,25 @@ jobs:
       - name: README/SECURITY/CONTRIBUTING vs live workflows (F7 regression)
         run: bash "$GITHUB_WORKSPACE"/ci/tools/test_docs_ci_drift.sh
 
+      - name: Fork-runner dependency bootstrap regression
+        run: bash "$GITHUB_WORKSPACE"/ci/tools/test_ci_dependency_bootstrap.sh
+
+      - name: Scanner selectors and fuzz-boundary regressions
+        run: bash "$GITHUB_WORKSPACE"/ci/tools/test_ci_scanner_fuzz_boundaries.sh
+
+      - name: Soak schedule and max-length diagnostic contracts
+        run: |
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_soak_schedule_unit.sh
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_max_length_diagnostics.sh
+
       # Audit sha e289021 F2/F3 regression coverage: exercises ci-build.sh's
       # mv-guard and provenance checks directly (offline cases + one live
       # clean-root angie build).
       - name: ci-build.sh clean-root + provenance regressions (F2/F3)
         run: bash "$GITHUB_WORKSPACE"/ci/tools/test_ci_build_provenance.sh
+
+      - name: Persistent build-input invalidation regressions
+        run: bash "$GITHUB_WORKSPACE"/ci/tools/test_build_input_manifest.sh
 
       - name: nginx tarball PGP verifier controls
         run: bash "$GITHUB_WORKSPACE"/ci/tools/test_verify_nginx_tarball.sh
@@ -397,9 +427,9 @@ jobs:
       - name: static frame-header probe unit fixture
         run: |
           # ngx_http_zstd_static_probe_frame(): pure frame-header arithmetic.
-          # Extracts the helper verbatim and checks the reserved descriptor
-          # bit, a passing small frame and the oversized-window verdict without
-          # standing up nginx. Needs only a C compiler.
+          # Includes the authoritative shipped header directly and checks the
+          # reserved descriptor bit, a passing small frame and the oversized-
+          # window verdict without standing up nginx. Needs only a C compiler.
           bash "$GITHUB_WORKSPACE"/ci/tools/test_static_probe_unit.sh
 
       - name: freeCCtxParams six-exit unit fixture (config-time leak-on-error)
@@ -593,6 +623,7 @@ jobs:
             build-essential \
             pkg-config \
             libzstd-dev \
+            gnupg \
             libpcre2-dev \
             zlib1g-dev \
             ccache \
@@ -603,11 +634,15 @@ jobs:
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
           echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
 
+      - name: Hash module build inputs
+        id: build-inputs
+        run: echo "hash=$(bash ci/tools/build-input-hash.sh)" >> "$GITHUB_OUTPUT"
+
       - name: Cache ccache objects
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.ccache
-          key: ccache-${{ runner.os }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ hashFiles('filter/*.c', 'static/*.c', '*.h', 'config') }}
+          key: ccache-${{ runner.os }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ steps.build-inputs.outputs.hash }}
           restore-keys: |
             ccache-${{ runner.os }}-${{ matrix.flavor }}-${{ matrix.version }}-
             ccache-${{ runner.os }}-
@@ -756,6 +791,7 @@ jobs:
             zlib1g-dev \
             python3 \
             python3-requests \
+            gnupg \
             wget \
             zstd
 
@@ -927,7 +963,7 @@ jobs:
             'Acquire::https::Timeout "20";' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config \
+          sudo apt-get install -y build-essential gnupg pkg-config \
             libpcre2-dev zlib1g-dev wget cmake python3 \
             python3-requests zstd
 
@@ -1133,7 +1169,7 @@ jobs:
             'Acquire::https::Timeout "20";' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libzstd-dev \
+          sudo apt-get install -y build-essential gnupg pkg-config libzstd-dev \
             libpcre2-dev zlib1g-dev wget binutils
 
       - name: Cache nginx source tarball
@@ -1367,7 +1403,7 @@ jobs:
             'Acquire::https::Timeout "10";' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
           sudo apt-get update
-          sudo apt-get install -y build-essential libzstd-dev \
+          sudo apt-get install -y build-essential git gnupg libzstd-dev \
             libpcre2-dev zlib1g-dev wget curl
 
       - name: Cache nginx source tarball
@@ -1517,7 +1553,7 @@ jobs:
             'Acquire::https::Timeout "20";' \
             | sudo tee /etc/apt/apt.conf.d/99-ci-net > /dev/null
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libzstd-dev \
+          sudo apt-get install -y build-essential gnupg pkg-config libzstd-dev \
             libpcre2-dev zlib1g-dev wget
 
       - name: Cache nginx source tarball
@@ -1545,13 +1581,19 @@ jobs:
         run: |
           tar -xzf "nginx-${NGINX_VERSION}.tar.gz"
           cd "nginx-${NGINX_VERSION}"
-          SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
+          # Recovery is required for the Test::Nginx lane below: upstream
+          # nginx debug logging has known UBSan findings, and a fatal trap
+          # kills its listener before the suite can finish. Reports remain
+          # complete and are graded by module frames after both suites exit.
+          SAN="-fsanitize=address,undefined -fsanitize-recover=undefined -fno-omit-frame-pointer -g3 -O1"
           ./configure \
             --with-compat \
             --with-debug \
             --with-cc-opt="-DZSTD_STATIC_LINKING_ONLY $SAN $(pkg-config --cflags libzstd zlib libpcre2-8)" \
             --with-ld-opt="$SAN $(pkg-config --libs libzstd zlib libpcre2-8)" \
             --with-http_sub_module \
+            --with-http_auth_request_module \
+            --with-http_gzip_static_module \
             --add-module="$GITHUB_WORKSPACE"
           make -j"$(nproc)"
           if grep -q 'NGX_HTTP_ZSTD_HAVE_LIBCRYPTO' objs/ngx_auto_config.h; then
@@ -2068,49 +2110,38 @@ jobs:
       - name: Run Perl suites under ASAN+UBSAN
         # Put the static-file / magic-probe / conditional / HEAD paths (covered
         # only by these Perl suites, audit CI7) through ASan/UBSan. Functional
-        # pass/fail is already gated by the non-ASan `tests` job, so here we
-        # DON'T gate on test results: nginx core
-        # emits benign sanitizer aborts on some Test::Nginx request paths
-        # unrelated to this module. Run non-halting, write ASan reports to
-        # files, and fail ONLY if a sanitizer report names this module's
-        # sources (ngx_http_zstd). detect_leaks=0 because nginx does not free
-        # every allocation at exit by design.
+        # pass/fail is also gated here: a bailout or incomplete TAP stream is
+        # not sanitizer coverage. Upstream nginx core has known UBSan reports
+        # on debug-log paths, so keep recovery enabled, parse complete reports,
+        # and fail when any report contains a zstd-module frame. detect_leaks=0
+        # because nginx does not free every allocation at exit by design.
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=0:abort_on_error=0:exitcode=0:log_path=/tmp/asan-zstd
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0:log_path=/tmp/ubsan-zstd
           RUN_ID: ${{ github.run_id }}
           JOB_NAME: ${{ github.job }}
         run: |
           export PERL5LIB="$HOME/perl5/lib/perl5:${PERL5LIB:-}"
-          rm -f /tmp/asan-zstd.*
+          ci/tools/test_sanitizer_suite_verdict.sh
+          rm -f /tmp/asan-zstd.* /tmp/ubsan-zstd.*
           cd "$GITHUB_WORKSPACE"
           export TEST_NGINX_SERVROOT="/tmp/nginx-servroot-asan-${RUN_ID}-${JOB_NAME}"
           mkdir -p "$TEST_NGINX_SERVROOT"
-          perl ci/t/00-filter.t > ci/t/filter-asan.log 2>&1 || true
+          filter_status=0
+          perl ci/t/00-filter.t > ci/t/filter-asan.log 2>&1 || filter_status=$?
           touch -d @1541504307 "$GITHUB_WORKSPACE/ci/t/suite/test" "$GITHUB_WORKSPACE/ci/t/suite/test.zst"
           export TEST_NGINX_SERVROOT="$GITHUB_WORKSPACE/ci/t/servroot-static-${RUN_ID}-${JOB_NAME}"
           mkdir -p "$TEST_NGINX_SERVROOT"
-          perl ci/t/01-static.t > ci/t/static-asan.log 2>&1 || true
+          static_status=0
+          perl ci/t/01-static.t > ci/t/static-asan.log 2>&1 || static_status=$?
 
-          # NOTE (A29-F7, deferred): this lane still cannot tell "no
-          # sanitizer report" from "the suite never ran". A TAP/executed-
-          # count gate was implemented and DID work -- and immediately
-          # went red here, because nginx under ASan stops accepting on
-          # 127.0.0.1:2024 partway through: 00-filter.t bails at TEST 39
-          # and 01-static.t executed 22 of its 774 assertions
-          # (run 33229149473). That is a real, PRE-EXISTING defect this
-          # lane has been masking via `|| true`, not a gate bug. Fixing
-          # the bind failure is a prerequisite for landing the gate, so
-          # the gate is held back rather than shipped red.
-          # Gate strictly on sanitizer reports attributable to this module.
-          if cat /tmp/asan-zstd.* ci/t/filter-asan.log ci/t/static-asan.log 2>/dev/null \
-               | grep -nE 'ngx_http_zstd' \
-               | grep -iE 'runtime error|AddressSanitizer|Sanitizer|overflow|use-after'; then
-            echo "❌ sanitizer report attributable to the zstd module:"
-            cat /tmp/asan-zstd.* 2>/dev/null | grep -B2 -A15 ngx_http_zstd || true
-            exit 1
-          fi
-          echo "✓ no ASAN/UBSAN report attributable to the zstd module"
+          python3 ci/tools/sanitizer_suite_verdict.py \
+            --suite "00-filter.t:ci/t/filter-asan.log:$filter_status" \
+            --suite "01-static.t:ci/t/static-asan.log:$static_status" \
+            --sanitizer-log '/tmp/asan-zstd.*' \
+            --sanitizer-log '/tmp/ubsan-zstd.*' \
+            --sanitizer-log 'ci/t/filter-asan.log' \
+            --sanitizer-log 'ci/t/static-asan.log'
 
       - name: Run smoke tests under ASAN+UBSAN
         # Leak gating here is NOT free: every harness below starts nginx and
@@ -2136,7 +2167,8 @@ jobs:
           # ptrace preflight is only a heuristic and can false-warn before the
           # real stop-the-world check; ci/tools/lsan_log_verdict.sh separates
           # that warning from an actual attach failure.
-          LSAN_OPTIONS: suppressions=${{ github.workspace }}/lsan.suppress:print_suppressions=0:verbosity=1
+          LSAN_OPTIONS: >-
+            suppressions=${{ github.workspace }}/ci/suppressions/lsan.suppress:print_suppressions=0:verbosity=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
           cd "$GITHUB_WORKSPACE"
