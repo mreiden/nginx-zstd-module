@@ -214,7 +214,7 @@ Legend: ✅ done · 🔜 queued · 🔎 needs inspection · ➖ n/a
 
 ## Skipped (standalone-repo CI/tooling, no compression analogue)
 
-#151, #152, #156, #161, #169, #180, #183, #187, #190, #191, #192 — benchmark
+Rows #151, #152, #156, #161, #169, #180, #183, #187, #190, #191, #192 — benchmark
 harnesses, testkit vendoring, CI trust-anchoring, markdownlint, and
 test-proofs that live in the standalone repo's `ci/` tree. The compression
 module carries its own `compression.yml` and `compression/t/` suites; these
@@ -249,7 +249,7 @@ standalone PR (ours included where they round-tripped).
 | 242 | UBSan ignorelist attempt | ➖ closed unmerged | ➖ | validates our warn-level witness approach |
 | 243 | (ours, parent CI) artifact pins | ➖ parent-only | ➖ | |
 | 244 | docs: directive gaps | ✅ 914d2c6 (audit: no gaps; no-transform doc added) | ➖ | |
-| 245 | A29 CI gates (CodeQL scope, TAP floor, dcz alloc test) | ➖ N/A | ➖ | no CodeQL job; our perl suites propagate exit codes (no `|| true`) |
+| 245 | A29 CI gates (CodeQL scope, TAP floor, dcz alloc test) | ➖ N/A | ➖ | no CodeQL job; our perl suites propagate exit codes (no `\|\| true`) |
 | 246 | fuzz regression naming contract | 🔜 minor | ➖ | when fuzz regressions/ gains entries |
 | 247/248 | Windows + arm64 smokes | 🔜 optional | 🔜 | free arm64 runners make it cheap |
 | 249 | CPAN lock for Test::Nginx | ✅ 82bdd9b | YES 9bf378f | + LC_ALL=C sort fix, LF gitattribute |
