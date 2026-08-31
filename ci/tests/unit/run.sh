@@ -4,9 +4,9 @@
 #
 # ci/tests/unit/run.sh -- build and run the pure-function unit tests: the
 # Accept-Encoding parser (src/ngx_http_zstd_common.h) and the .zst
-# frame-header probe (src/ngx_http_zstd_static_module.c).
+# frame-header probe (src/ngx_http_zstd_frame_probe.h).
 #
-#   ci/tests/unit/run.sh            # regenerate both slices, build, run
+#   ci/tests/unit/run.sh            # regenerate parser slice, build, run
 #   ci/tests/unit/run.sh clean      # remove build products
 #   COVERAGE=1 ci/tests/unit/run.sh # also instrument, so ci/tools/coverage.sh
 #                                   # can gcov src/ afterwards
