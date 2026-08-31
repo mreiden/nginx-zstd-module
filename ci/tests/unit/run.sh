@@ -4,9 +4,9 @@
 #
 # ci/tests/unit/run.sh -- build and run the pure-function unit tests: the
 # Accept-Encoding parser (src/ngx_http_zstd_common.h) and the .zst
-# frame-header probe (src/ngx_http_zstd_static_module.c).
+# frame-header probe (src/ngx_http_zstd_frame_probe.h).
 #
-#   ci/tests/unit/run.sh            # regenerate both slices, build, run
+#   ci/tests/unit/run.sh            # regenerate parser slice, build, run
 #   ci/tests/unit/run.sh clean      # remove build products
 #   COVERAGE=1 ci/tests/unit/run.sh # also instrument, so ci/tools/coverage.sh
 #                                   # can gcov src/ afterwards
@@ -114,18 +114,18 @@ echo "==> Running nginx 1.23+-shaped Accept-Encoding checks"
 timeout 60s "$CHAIN_BIN"
 
 # ---------------------------------------------------------------------------
-# The .zst frame-header probe (src/ngx_http_zstd_static_module.c:
-# ngx_http_zstd_static_probe_frame). Same shape as the parser suite above:
-# extract the shipped function body first, so this binary can never link a
+# The .zst frame-header probe (src/ngx_http_zstd_frame_probe.h:
+# ngx_http_zstd_static_probe_frame). Unlike the parser suite above there
+# is no extraction step: the probe lives in its own shipped header (#270)
+# and the TU includes it directly, so the binary can never link a
 # hand-copied drifted version. The probe is pure arithmetic over a fixed
 # 18-byte buffer -- no nginx tree, no libzstd, no filesystem -- so it belongs
 # in this cheapest layer too.
 # ---------------------------------------------------------------------------
-bash "$FUZZ_DIR/extract_static_probe.sh"
 
 echo "==> Building $PROBE_BIN with ${CC}"
 # shellcheck disable=SC2086
-$CC "${OWN_CFLAGS[@]}" -I"$FUZZ_DIR" -c "$DIR/test_static_probe.c" \
+$CC "${OWN_CFLAGS[@]}" -c "$DIR/test_static_probe.c" \
 	-o "$DIR/test_static_probe.o"
 # shellcheck disable=SC2086
 $CC "${LINK_EXTRA[@]}" -o "$PROBE_BIN" "$DIR/test_static_probe.o"

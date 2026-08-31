@@ -15,32 +15,8 @@ typedef unsigned char  u_char;
 
 #define ngx_memcpy  memcpy
 
-#define ZSTD_MAGICNUMBER              0xFD2FB528U
-#define ZSTD_MAGIC_SKIPPABLE_START    0x184D2A50U
-#define ZSTD_MAGIC_SKIPPABLE_MASK     0xFFFFFFF0U
-
-#define NGX_HTTP_ZSTD_STATIC_MAX_WINDOW  (8u * 1024u * 1024u)
-
-#if defined(__has_include)
-#if __has_include("generated_static_probe.inc")
-#include "generated_static_probe.inc"
-#else
-#define NGX_HTTP_ZSTD_STATIC_FRAME_OK          0
-#define NGX_HTTP_ZSTD_STATIC_FRAME_WINDOW_BIG  3
-#define NGX_HTTP_ZSTD_STATIC_FRAME_RESERVED    5
-static ngx_int_t
-ngx_http_zstd_static_probe_frame(const u_char *hdr, size_t n, uint64_t *window)
-{
-    (void) hdr;
-    (void) n;
-    (void) window;
-    fprintf(stderr, "FAIL: generated_static_probe.inc is missing\n");
-    return -1;
-}
-#endif
-#else
-#include "generated_static_probe.inc"
-#endif
+/* The shipped probe itself (#270) -- no generated extraction. */
+#include "../../src/ngx_http_zstd_frame_probe.h"
 
 static int failures;
 
