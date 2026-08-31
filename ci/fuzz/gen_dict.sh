@@ -38,10 +38,10 @@ DICT="$DIR/fuzz.dict"
 # would faithfully preserve the CR bytes on the lines it rewrites
 # around. Refuse CR up front, in both modes, with the real diagnosis.
 if [ -f "$DICT" ] && grep -q $'\r' "$DICT"; then
-    echo "✗ gen_dict: $DICT contains CRLF line endings. The dictionary" \
-        "is byte-exact; restore the LF version (git checkout with its" \
-        "-text attribute honored) before regenerating or checking." >&2
-    exit 1
+	echo "✗ gen_dict: $DICT contains CRLF line endings. The dictionary" \
+		"is byte-exact; restore the LF version (git checkout with its" \
+		"-text attribute honored) before regenerating or checking." >&2
+	exit 1
 fi
 
 START_MARK="# BEGIN generated coding tokens (ci/fuzz/gen_dict.sh)"
