@@ -625,3 +625,56 @@ Accept-Encoding: gzip
 no-transform fixture body: repeated compressible text
 --- no_error_log
 [error]
+
+
+=== TEST 20: a quoted extension value containing commas is NOT split (#274)
+# x=",no-transform,y" -- the commas belong to the quoted string; the
+# old scan split there and fabricated a matching segment out of the
+# quoted text, a false compression opt-out
+--- config
+    location /origin/ {
+        compression off;
+        add_header Cache-Control "public, x=\",no-transform,y\"";
+        default_type text/plain;
+        return 200 "no-transform fixture body: repeated compressible text\n";
+    }
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        proxy_pass http://127.0.0.1:$server_port/origin/;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 21: a real no-transform AFTER a comma-carrying quoted value matches
+# the quote-aware scan must resume at the genuine segment boundary
+--- config
+    location /origin/ {
+        compression off;
+        add_header Cache-Control "x=\"a,b\", no-transform";
+        default_type text/plain;
+        return 200 "no-transform fixture body: repeated compressible text\n";
+    }
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        proxy_pass http://127.0.0.1:$server_port/origin/;
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body
+no-transform fixture body: repeated compressible text
+--- no_error_log
+[error]

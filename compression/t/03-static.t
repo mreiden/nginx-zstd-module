@@ -62,6 +62,11 @@ our $skip_dio    = $skip_ok . ("\x5A" x 600);
 # otherwise-valid 8 MB window byte: the probe must reject on the bit
 # BEFORE trusting anything else in the header (upstream #252)
 our $reserved    = $magic . "\x08\x68";
+# the skip-walk BOUND (parent #273): exactly MAX_SKIP_FRAMES (4) leading
+# skippable frames before a valid frame is the documented boundary and
+# must serve; a fifth is the hard decline
+our $skip4x4_ok  = ($skip4 x 4) . $win8m_desc;
+our $skip5_deny  = ($skip4 x 5) . $win8m_desc;
 
 # 8 KB of randomness for the directio blocks (compressed output stays
 # ~8 KB, comfortably over the directio threshold)
@@ -1140,5 +1145,52 @@ $::src
 --- error_log eval
 [qr/65536-byte aligned probe on directio file/,
  qr/declares a 134217728-byte decompression window/]
+--- no_error_log
+[alert]
+
+
+=== TEST 42: exactly FOUR leading skippable frames serve (#273)
+# the walk's own comment promises "4 is generous headroom"; the old
+# bound declined the frame AFTER the fourth skip one probe early
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::skip4x4_ok ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- response_body eval
+$::skip4x4_ok
+--- no_error_log
+[error]
+
+
+=== TEST 43: a FIFTH leading skippable frame is still the hard decline
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::skip5_deny ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- error_log
+more than 4 leading skippable frames
 --- no_error_log
 [alert]

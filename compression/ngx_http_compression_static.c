@@ -768,7 +768,16 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
      */
     for (frames = 0; ; frames++) {
 
-        if (frames >= NGX_HTTP_COMPRESSION_STATIC_MAX_SKIP_FRAMES) {
+        /*
+         * `>` not `>=` (parent #273): `frames` counts ITERATIONS, and
+         * iteration N probes the frame after N prior skips — so the
+         * bound must permit iteration MAX (the frame after exactly MAX
+         * skips, the documented boundary) and decline only when a
+         * MAX+1th skippable frame actually appeared. The old `>=`
+         * declined a valid file with exactly four leading skippable
+         * frames one probe early.
+         */
+        if (frames > NGX_HTTP_COMPRESSION_STATIC_MAX_SKIP_FRAMES) {
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" has more than %ui "
                           "leading skippable frames — declining rather "
