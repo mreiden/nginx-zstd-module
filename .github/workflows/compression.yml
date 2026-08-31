@@ -508,19 +508,12 @@ jobs:
           make -j"$(nproc)"
 
       - name: Build the prober
-        # INTERIM working-copy patch, not a fork: OpenSSL 3.0 (this
-        # runner image) lacks the ALPN-refusal reason macro the prober
-        # compares against; the guarded protocol-arithmetic definition
-        # is upstream as nginx-module-testkit#235 -- drop this step's
-        # patch when the submodule pin can bump past it. Idempotence
-        # guard included so a cached workspace cannot double-insert.
+        # OpenSSL-3.0 compatibility now comes from the submodule itself
+        # (testkit #235: openssl_compat.h's guarded protocol-arithmetic
+        # define, in the pin since 61c6906) -- no working-copy patch.
         run: |
           set -euo pipefail
           cd ci/t/harness
-          if ! grep -q "SSL_AD_REASON_OFFSET + TLS1_AD_NO_APPLICATION_PROTOCOL" \
-               ci/prober/http.c; then
-            python3 -c "p='ci/prober/http.c'; s=open(p).read(); a='#include <openssl/ssl.h>\n'; g='\n#ifndef SSL_R_TLSV1_ALERT_NO_APPLICATION_PROTOCOL\n#define SSL_R_TLSV1_ALERT_NO_APPLICATION_PROTOCOL (SSL_AD_REASON_OFFSET + TLS1_AD_NO_APPLICATION_PROTOCOL)\n#endif\n'; assert s.count(a)==1, 'anchor not unique'; open(p,'w').write(s.replace(a,a+g))"
-          fi
           bash ci/prober/build.sh
 
       - name: Run scenarios (staged tree must produce real assertions)
