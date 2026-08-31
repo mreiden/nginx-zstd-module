@@ -1089,3 +1089,35 @@ $::src
 reserved Frame_Header_Descriptor bit 0x08
 --- no_error_log
 [alert]
+
+
+=== TEST 41: directio_alignment above 64k is CLAMPED for the probe (#208)
+# The probe reads a frame header, not the body: an unbounded
+# directio_alignment must not scale an 18-byte check into a
+# multi-megabyte aligned allocation and O_DIRECT read per probed
+# request. The witness names the size: 65536, not 4194304. The window
+# check still fires through the clamped geometry.
+--- log_level: debug
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::bigwin8k ] ]
+--- config
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        directio 512;
+        directio_alignment 4m;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: zstd
+--- raw_response_headers_unlike: Content-Encoding
+--- response_body eval
+$::src
+--- error_log eval
+[qr/65536-byte aligned probe on directio file/,
+ qr/declares a 134217728-byte decompression window/]
+--- no_error_log
+[alert]

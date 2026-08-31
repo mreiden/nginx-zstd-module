@@ -165,6 +165,29 @@ ngx_module_t  ngx_http_compression_static_module = {
 #define NGX_HTTP_COMPRESSION_STATIC_DIO_PROBE   4096
 
 /*
+ * CEILING for the probe alignment (parent #208). The probe reads a
+ * frame HEADER (<= 18 bytes); it is not the body copy, and it does not
+ * need the operator's bulk-I/O buffer size. "directio_alignment" has no
+ * upper bound in core and governs the copy filter's body buffer, where
+ * a large value is a throughput choice; O_DIRECT LEGALITY is a property
+ * of the device's logical block size (512 or 4096 in practice). 64 KB
+ * is a multiple of every logical block size a Linux/BSD block device
+ * reports, so the capped value stays O_DIRECT-legal, and the cap stops
+ * an unbounded directive from turning an 18-byte header check into a
+ * multi-megabyte aligned allocation and read on every probed request.
+ */
+#define NGX_HTTP_COMPRESSION_STATIC_DIO_PROBE_MAX  (64 * 1024)
+
+/*
+ * Largest byte count the directio probe can ever ask for: PROBE_MAX
+ * doubled to the two-block read. Fixed now that the alignment is
+ * capped, so a worker-lifetime scratch buffer can be sized against a
+ * known ceiling (parent #210).
+ */
+#define NGX_HTTP_COMPRESSION_STATIC_DIO_SCRATCH_MAX  \
+    (NGX_HTTP_COMPRESSION_STATIC_DIO_PROBE_MAX * 2)
+
+/*
  * The frame probe runs on Win32 too (parent #162) and on any POSIX
  * build with pread(2); a POSIX build without pread skips it (a
  * build-time tripwire — every modern target has pread). Gated so the
@@ -547,6 +570,97 @@ ngx_http_compression_static_pread(ngx_fd_t fd, u_char *buf, size_t size,
 #endif /* NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE */
 
 
+#if (NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE)
+
+/*
+ * Worker-lifetime scratch buffer for the directio probe (parent #210):
+ * the aligned read exists only to inspect a frame header and every byte
+ * is discarded when the probe returns, so one lazily-grown buffer
+ * serves every directio probe this worker ever runs instead of an
+ * aligned r->pool allocation per hit. Reuse is safe because the probe
+ * is synchronous inside one content-phase handler invocation (direct
+ * pread/ReadFile, never a thread pool), and `busy` still guards that
+ * invariant explicitly: an overlapping caller falls back to its own
+ * pool-scoped allocation rather than corrupting the shared buffer.
+ * File-scope static = per OS process; reloads fork fresh workers, and
+ * the cycle-pool allocation dies with the process.
+ */
+static u_char     *ngx_http_compression_static_dio_scratch;
+static size_t      ngx_http_compression_static_dio_scratch_cap;
+static size_t      ngx_http_compression_static_dio_scratch_align;
+static ngx_uint_t  ngx_http_compression_static_dio_scratch_busy;
+
+static u_char *
+ngx_http_compression_static_dio_buf(ngx_pool_t *pool, size_t want,
+    size_t align)
+{
+    u_char  *p;
+
+    if (ngx_http_compression_static_dio_scratch_busy) {
+        return ngx_pmemalign(pool, want, align);
+    }
+
+    if (ngx_http_compression_static_dio_scratch_cap < want
+        || ngx_http_compression_static_dio_scratch_align < align)
+    {
+        p = ngx_pmemalign((ngx_pool_t *) ngx_cycle->pool, want, align);
+        if (p == NULL) {
+            return ngx_pmemalign(pool, want, align);
+        }
+
+        ngx_http_compression_static_dio_scratch = p;
+        ngx_http_compression_static_dio_scratch_cap = want;
+        ngx_http_compression_static_dio_scratch_align = align;
+    }
+
+    ngx_http_compression_static_dio_scratch_busy = 1;
+
+    return ngx_http_compression_static_dio_scratch;
+}
+
+
+static void
+ngx_http_compression_static_dio_buf_release(void)
+{
+    ngx_http_compression_static_dio_scratch_busy = 0;
+}
+
+
+/*
+ * Can the previous read's buffer serve this iteration without another
+ * read (parent #233 generalized by #261)? True when the block already
+ * in `hdr` (read at have_base, n bytes) covers [pos, pos+need). Under
+ * directio the rounded-down base can repeat across the skip-frame walk;
+ * off it, the enlarged buffered read can retain a canonical 40-byte dcz
+ * prefix plus the following maximum 18-byte frame header. Requiring the
+ * whole possible header (or all bytes remaining in a shorter file)
+ * means a partial suffix still takes the established fresh-read path.
+ */
+static ngx_uint_t
+ngx_http_compression_static_probe_reuse(off_t pos, off_t have_base,
+    ssize_t n, size_t need, size_t *frame_off, off_t *base)
+{
+    uint64_t  offset;
+
+    if (n <= 0 || pos < have_base) {
+        return 0;
+    }
+
+    offset = (uint64_t) (pos - have_base);
+
+    if (offset > (uint64_t) n || (uint64_t) n - offset < need) {
+        return 0;
+    }
+
+    *frame_off = (size_t) offset;
+    *base = have_base;
+
+    return 1;
+}
+
+#endif /* NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE */
+
+
 /*
  * The parent zstd_static probe (ported): magic sanity (a truncated /
  * half-downloaded / mistakenly-renamed file must not be served as zstd)
@@ -566,28 +680,46 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
     ngx_str_t *path)
 {
 #if (NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE)
-    u_char      hdrbuf[18];
+    /*
+     * 58 bytes buffered (parent #261): a canonical 40-byte dcz
+     * skippable prefix plus the largest possible 18-byte frame header,
+     * so the common two-frame shape reuses ONE read. Short files return
+     * fewer bytes; each parse path checks it got what its layout needs.
+     */
+    u_char      hdrbuf[58];
     u_char     *hdr, *frame;
-    size_t      want, align, frame_off, avail;
+    size_t      want, align, frame_off, avail, need;
     ssize_t     n;
     uint64_t    window, skip;
-    ngx_uint_t  frames;
-    off_t       pos, base;
+    ngx_int_t   probe_rc;
+    ngx_uint_t  frames, scratch, have_block, reuse;
+    off_t       pos, base, have_base;
     ngx_log_t  *log;
 
     log = r->connection->log;
+
+    scratch = 0;
+    have_block = 0;
+    have_base = 0;
+    n = 0;
 
     if (of->size < 4) {
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "compression static: \"%V\" too small to be a zstd "
                       "frame (%O bytes)", path, of->size);
-        return NGX_DECLINED;
+        probe_rc = NGX_DECLINED;
+        goto probe_done;
     }
 
     if (of->is_directio) {
         align = NGX_HTTP_COMPRESSION_STATIC_DIO_PROBE;
         if ((size_t) clcf->directio_alignment > align) {
             align = (size_t) clcf->directio_alignment;
+        }
+
+        /* the #208 ceiling: see NGX_HTTP_COMPRESSION_STATIC_DIO_PROBE_MAX */
+        if (align > NGX_HTTP_COMPRESSION_STATIC_DIO_PROBE_MAX) {
+            align = NGX_HTTP_COMPRESSION_STATIC_DIO_PROBE_MAX;
         }
 
         /*
@@ -603,10 +735,14 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
          */
         want = align * 2;
 
-        hdr = ngx_pmemalign(r->pool, want, align);
+        /* worker-lifetime scratch, pool fallback under overlap (#210);
+         * `scratch` remembers whether THIS call took the shared buffer
+         * so only that call clears the guard at probe_done */
+        hdr = ngx_http_compression_static_dio_buf(r->pool, want, align);
         if (hdr == NULL) {
             return NGX_ERROR;
         }
+        scratch = (hdr == ngx_http_compression_static_dio_scratch);
 
     } else {
         align = 0;
@@ -640,7 +776,8 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                           "frame", path,
                           (ngx_uint_t)
                               NGX_HTTP_COMPRESSION_STATIC_MAX_SKIP_FRAMES);
-            return NGX_DECLINED;
+            probe_rc = NGX_DECLINED;
+            goto probe_done;
         }
 
         if (of->is_directio) {
@@ -652,8 +789,33 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
             base = pos;
         }
 
-        n = ngx_http_compression_static_pread(of->fd, hdr, want, base, log,
-                                              path);
+        /*
+         * Reuse the bytes already in `hdr` when they cover everything
+         * this iteration can parse (parent #233/#261): the whole
+         * possible 18-byte header, or all bytes remaining in a shorter
+         * file, floored at the 4-byte magic. Under directio this
+         * collapses the skip-frame walk's repeated same-block reads;
+         * buffered, the 58-byte first read covers the canonical
+         * dcz-prefix-then-frame shape, dropping its second read.
+         */
+        need = (size_t) ngx_min((off_t) 18,
+                                ngx_max((off_t) 4, of->size - pos));
+
+        reuse = have_block
+                && ngx_http_compression_static_probe_reuse(pos, have_base,
+                                                           n, need,
+                                                           &frame_off,
+                                                           &base);
+
+        if (!reuse) {
+            n = ngx_http_compression_static_pread(of->fd, hdr, want, base,
+                                                  log, path);
+
+            if (n > 0) {
+                have_block = 1;
+                have_base = base;
+            }
+        }
 
         /*
          * Bytes of the block that lie at or after `pos`. A short read
@@ -673,14 +835,16 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                               "on directio file \"%V\" returned %z — "
                               "declining; check directio_alignment against "
                               "the device geometry", align, path, n);
-                return NGX_DECLINED;
+                probe_rc = NGX_DECLINED;
+                goto probe_done;
             }
 
             ngx_log_error(NGX_LOG_CRIT, log, ngx_errno,
                           "compression static: "
                           NGX_HTTP_COMPRESSION_STATIC_PREAD_NAME
                           "(\"%V\", frame header) returned %z", path, n);
-            return NGX_DECLINED;
+            probe_rc = NGX_DECLINED;
+            goto probe_done;
         }
 
         if (of->is_directio) {
@@ -699,13 +863,15 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                           "(leading bytes 0x%02xd%02xd%02xd%02xd)", path,
                           (ngx_uint_t) frame[0], (ngx_uint_t) frame[1],
                           (ngx_uint_t) frame[2], (ngx_uint_t) frame[3]);
-            return NGX_DECLINED;
+            probe_rc = NGX_DECLINED;
+            goto probe_done;
 
         case NGX_HTTP_COMPRESSION_STATIC_FRAME_TRUNCATED:
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" frame header "
                           "truncated", path);
-            return NGX_DECLINED;
+            probe_rc = NGX_DECLINED;
+            goto probe_done;
 
         case NGX_HTTP_COMPRESSION_STATIC_FRAME_WINDOW_BIG:
             ngx_log_error(NGX_LOG_ERR, log, 0,
@@ -715,7 +881,8 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                           "(RFC 8878) — declining so a fallback coding is "
                           "used; recompress with a window log <= 23", path,
                           window);
-            return NGX_DECLINED;
+            probe_rc = NGX_DECLINED;
+            goto probe_done;
 
         case NGX_HTTP_COMPRESSION_STATIC_FRAME_RESERVED:
             ngx_log_error(NGX_LOG_ERR, log, 0,
@@ -723,7 +890,8 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                           "reserved Frame_Header_Descriptor bit 0x08 "
                           "(RFC 8878) — declining so a fallback coding is "
                           "used", path);
-            return NGX_DECLINED;
+            probe_rc = NGX_DECLINED;
+            goto probe_done;
 
         case NGX_HTTP_COMPRESSION_STATIC_FRAME_SKIP:
 
@@ -742,7 +910,8 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                 ngx_log_error(NGX_LOG_ERR, log, 0,
                               "compression static: \"%V\" skippable frame "
                               "header runs past end of file", path);
-                return NGX_DECLINED;
+                probe_rc = NGX_DECLINED;
+                goto probe_done;
             }
 
             if (skip > (uint64_t) of->size - (uint64_t) pos - 8) {
@@ -750,7 +919,8 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                               "compression static: \"%V\" skippable frame "
                               "declares a %uL-byte skip past end of file",
                               path, skip);
-                return NGX_DECLINED;
+                probe_rc = NGX_DECLINED;
+                goto probe_done;
             }
 
             pos += (off_t) 8 + (off_t) skip;
@@ -763,6 +933,22 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
 
         break;
     }
+
+    probe_rc = NGX_OK;
+
+probe_done:
+
+    /*
+     * Single release point for every exit above (parent #210): clears
+     * the scratch reuse guard only when THIS call set it -- a pool-
+     * fallback call never touched it and must not clear it out from
+     * under a genuinely concurrent caller.
+     */
+    if (scratch) {
+        ngx_http_compression_static_dio_buf_release();
+    }
+
+    return probe_rc;
 
 #else
     (void) r; (void) of; (void) clcf; (void) path;
@@ -1094,14 +1280,26 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
             return ngx_http_send_header(r);
         }
 
-        b = ngx_calloc_buf(r->pool);
-        if (b == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
+        /*
+         * One ngx_pcalloc() for the ngx_buf_t and its ngx_file_t
+         * (parent #210): the two objects share this response's
+         * lifetime and ownership, so the split allocation bought
+         * nothing. Zero-init, alignment and failure behavior are
+         * unchanged — either both members exist, zeroed, or neither.
+         */
+        {
+            struct {
+                ngx_buf_t   buf;
+                ngx_file_t  file;
+            } *wrap;
 
-        b->file = ngx_pcalloc(r->pool, sizeof(ngx_file_t));
-        if (b->file == NULL) {
-            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            wrap = ngx_pcalloc(r->pool, sizeof(*wrap));
+            if (wrap == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            b = &wrap->buf;
+            b->file = &wrap->file;
         }
 
         rc = ngx_http_send_header(r);
