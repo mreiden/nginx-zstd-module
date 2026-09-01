@@ -177,6 +177,21 @@ load_module modules/ngx_http_zstd_static_module.so;
 
 * Both `ngx_http_zstd_filter_module` and `ngx_http_zstd_static_module` are compiled together.
 * If you are using a custom zstd installation, set `ZSTD_INC` (path to `zstd.h`) and `ZSTD_LIB` (path to the library) before running `configure`. If unset, the system-installed zstd is used.
+* **This plain `./configure` line does not enable `-DZSTD_STATIC_LINKING_ONLY`.**
+  With no `ZSTD_INC`/`ZSTD_LIB` set, `auto/zstd` goes straight to
+  auto-discovery (dynamic linking, then pkg-config), and neither of those
+  paths ever defines the flag — it is only ever added when `ZSTD_INC` and
+  `ZSTD_LIB` are both set *and* they resolve to a static `libzstd.a`
+  (`zstd_static.lib` on MSVC) at that exact location. There is no configure
+  flag that turns it on directly. A build produced by the command above
+  therefore does **not** have the experimental memory-estimator API
+  compiled in: `zstd_max_cctx_memory` will fail `nginx -t` with
+  `"zstd_max_cctx_memory" requires the module to be built with
+  -DZSTD_STATIC_LINKING_ONLY ...`, and the implicit no-budget advisory
+  (see [Directives](#directives)) silently does not run. To get the flag,
+  point `ZSTD_INC`/`ZSTD_LIB` at a static libzstd build before running
+  `configure`; see [`zstd_max_cctx_memory`](#zstd_max_cctx_memory) and
+  [Compatibility](#compatibility) for the full requirement.
 * **Windows:** MSVC builds the modules statically into `nginx.exe`; MinGW-w64
   can also build them as dynamic `.so`-named PE DLLs. The SHA-pinned
   [`ci/tools/build-windows.sh`](ci/tools/build-windows.sh) assembles the MSVC build
@@ -233,10 +248,13 @@ Notes on the libzstd floor — these are enforced in code, not assumed:
   1.4.0 floor above is unaffected and unchanged.
 * **`zstd_max_cctx_memory`** additionally requires the module to be
   built with `-DZSTD_STATIC_LINKING_ONLY` so libzstd's experimental
-  memory-estimator API is available. The project's production and CI
-  builds enable that flag; without it, the directive is rejected at
-  config load with a clear, actionable error rather than silently
-  no-op'd.
+  memory-estimator API is available. This project's own CI opts into
+  that flag by pointing `ZSTD_INC`/`ZSTD_LIB` at a static libzstd (see
+  [Installation](#installation)) — it is **not** the outcome of the
+  plain `./configure --add-dynamic-module=...` command documented
+  above, which auto-discovers a dynamic libzstd and never defines the
+  flag. Without it, the directive is rejected at config load with a
+  clear, actionable error rather than silently no-op'd.
 
 "CI-verified" means the PR or weekly deep workflow builds and runs the full
 test suite against that exact version (see [Testing & CI](#testing--ci)). Other
@@ -407,9 +425,9 @@ zstd_min_length 1024;  # skip compression for responses smaller than 1 KiB
 Sets the maximum response size that will be compressed. The limit is enforced in two places:
 
 * **Before compression starts**, when the response advertises a `Content-Length` larger than the limit: the response is passed through uncompressed (no CPU spent).
-* **During compression**, for chunked/streaming responses with *no* `Content-Length`: the running input total is tracked, and if it exceeds the limit the request is **aborted** (logged as `zstd: input exceeded zstd_max_length ...`). Compression has already begun and the client is mid-stream, so the only safe action is to terminate the response — protecting the worker from an unbounded or runaway upstream is preferred over completing one oversized response.
+* **During compression**, the running input total is tracked unconditionally — regardless of whether the response has a declared `Content-Length` — and if it exceeds the limit the request is **aborted** (logged as `zstd: input exceeded zstd_max_length ...`). This covers a chunked/streaming response with no `Content-Length`, and also a known-length upstream that streams more bytes than it declared. Compression has already begun and the client is mid-stream, so the only safe action is to terminate the response — protecting the worker from an unbounded or runaway upstream is preferred over completing one oversized response.
 
-> **Behaviour on chunked responses:** the no-`Content-Length` case cannot be served uncompressed-instead (the `Content-Encoding: zstd` stream is already in flight), so exceeding the limit there ends the request rather than transparently passing through. Size the limit with headroom for the largest response you legitimately compress on that location. If you routinely serve very large streaming bodies (proxied video, big downloads), prefer simply not enabling `zstd` on those locations.
+> **Behaviour once compression has started:** the case cannot be served uncompressed-instead (the `Content-Encoding: zstd` stream is already in flight), so exceeding the limit here ends the request rather than transparently passing through. Size the limit with headroom for the largest response you legitimately compress on that location. If you routinely serve very large streaming bodies (proxied video, big downloads), prefer simply not enabling `zstd` on those locations.
 
 By default there is no upper limit. You may want to set one if very large responses (e.g. multi-megabyte file downloads) should bypass compression to avoid holding the worker process busy.
 
@@ -723,7 +741,7 @@ location /api/bulk-export {
 **Syntax:** `zstd_max_cctx_memory size;`
 **Default:** `—` (no budget enforced; see [the advisory](#implicit-advisory-when-no-budget-is-set) below)
 **Context:** `http, server, location`
-**Requires:** module built with `-DZSTD_STATIC_LINKING_ONLY` against libzstd ≥ 1.4.0 (the project's production and CI builds do; see [Compatibility](#compatibility)).
+**Requires:** module built with `-DZSTD_STATIC_LINKING_ONLY` against libzstd ≥ 1.4.0. This is **not** the result of the plain `./configure --add-dynamic-module=...` command in [Installation](#installation) — that auto-discovers a dynamic libzstd and never defines the flag. It is only set when `ZSTD_INC`/`ZSTD_LIB` point at a static libzstd build; see [Installation](#installation) and [Compatibility](#compatibility).
 
 Asserts at **config load** that the combined zstd parameters configured
 for the location (`zstd_comp_level`, `zstd_window_log`, `zstd_long`,
@@ -975,11 +993,18 @@ server {
 **Default:** `—`
 **Context:** `http, server, location`
 
-Appends `field-name` to the response `Vary` header on every response from
-the location (both the compressed and the bypassed-identity variant), so a
-shared cache keys on the request header that drives a header/cookie-based
-[`zstd_bypass`](#zstd_bypass). Use it whenever a bypass predicate reads a
-request header or cookie:
+Appends `field-name` to the response `Vary` header on every response for
+which this module actually reaches the `zstd_bypass` decision — both the
+compressed variant and the bypassed-identity variant — so a shared cache
+keys on the request header that drives a header/cookie-based
+[`zstd_bypass`](#zstd_bypass). A response declined earlier by an
+eligibility gate (ineligible status, already encoded, below
+`zstd_min_length`, above `zstd_max_length`, header-only, content type not
+in [`zstd_types`](#zstd_types), or `Cache-Control: no-transform`) never
+reaches that decision: it would be served identity regardless of the
+bypass predicate, so no bypass-driven variance exists to declare and this
+directive adds no `Vary` field to it. Use it whenever a bypass predicate
+reads a request header or cookie:
 
 ```nginx
 server {
@@ -1219,7 +1244,7 @@ When set to `on`, the module emits a `Vary: Accept-Encoding` response header its
 > guaranteed to decode zstd — for example,
 > internal service-to-service calls where you control both ends.
 
-> **Magic-number validation.** Before serving a `.zst`, the module reads the first bytes of the file (one `pread(2)` at offset 0) and verifies they are the zstd frame magic (`ZSTD_MAGICNUMBER` `0xFD2FB528`) or a skippable-frame magic (`ZSTD_MAGIC_SKIPPABLE_*`). On mismatch — a truncated download, mistaken rename (`cp foo.txt foo.zst`), or any other non-zstd content — the handler logs `zstd static: "..." is not a zstd frame (leading bytes 0x...)` and **declines**; nginx then falls back to serving the uncompressed original, or returns 404 if no original is present. Without this, the client would receive a body labelled `Content-Encoding: zstd` that it cannot decode. The read is offset-explicit so it never disturbs the file position of the `open_file_cache` descriptor shared with other in-flight requests: `pread(2)` on POSIX, `ngx_read_file()` (a `ReadFile()` with an `OVERLAPPED` offset) on Win32. The verdict logic is a single shared function, so both platforms accept and reject exactly the same files. The probe is compiled out only on a POSIX build whose `configure` found no `pread(2)`, rather than degraded to a `read`+`lseek` pair that would corrupt those concurrent requests.
+> **Magic-number validation.** Before serving a `.zst`, the module reads the first bytes of the file (one `pread(2)` at offset 0) and verifies they are the zstd frame magic (`ZSTD_MAGICNUMBER` `0xFD2FB528`) or a skippable-frame magic (`ZSTD_MAGIC_SKIPPABLE_*`). On mismatch — a truncated download, mistaken rename (`cp foo.txt foo.zst`), or any other non-zstd content — the handler logs `zstd static: "..." is not a zstd frame (leading bytes 0x...)` and **declines**; nginx then falls back to serving the uncompressed original, or returns 404 if no original is present. Malformed verdicts are memoized per worker by exact path, file identity, size, and mtime in a bounded 64-entry cache, so an unchanged broken sidecar logs once while its verdict remains resident instead of on every request; a replaced file or changed path, size, or mtime is probed again, and round-robin eviction permits a later re-probe. Without this, the client would receive a body labelled `Content-Encoding: zstd` that it cannot decode. The read is offset-explicit so it never disturbs the file position of the `open_file_cache` descriptor shared with other in-flight requests: `pread(2)` on POSIX, `ngx_read_file()` (a `ReadFile()` with an `OVERLAPPED` offset) on Win32. The verdict logic is a single shared function, so both platforms accept and reject exactly the same files. The probe is compiled out only on a POSIX build whose `configure` found no `pread(2)`, rather than degraded to a `read`+`lseek` pair that would corrupt those concurrent requests.
 >
 > **Declared-window validation.** The same probe parses the frame header (RFC 8878) and **declines any `.zst` whose leading frame declares a decompression window above 8 MB** — the limit browsers enforce for `Content-Encoding: zstd`; Firefox (`NS_ERROR_INVALID_CONTENT_ENCODING`) and Chromium (`ERR_CONTENT_DECODING_FAILED`) reject such frames before decoding a single byte. The scope is exactly the leading frame: a skippable leading frame is exempt, and in a (pathological, no common tooling emits one) concatenation of regular frames only the first is inspected — a regular frame's header does not declare its compressed length, so walking the sequence would mean decoding every block header in every frame. `zstd -t --memory=8MB` remains the complete pre-deploy check. This traps a nasty build-pipeline failure mode: streaming encoders that are not told the input size stamp the *compression level's* default window into every frame header, so a Node-based bundler can emit a 90 KB asset declaring a 128 MB window — the file decodes fine with the `zstd` CLI and serves byte-identically through nginx, yet fails in every browser. On decline the error log names the file and its declared window, and the request falls through to the zstd filter / `gzip_static` / identity, so the site keeps working while the build gets fixed (recompress with a window log ≤ 23; verify a build with `zstd -t --memory=8MB *.zst`). Single-segment frames are checked against their declared content size, which is their window.
 
