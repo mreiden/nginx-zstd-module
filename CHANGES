@@ -2,6 +2,16 @@ Changes with http-zstd
 
 Unreleased
 
+    *) Bugfix: "$zstd_ratio" is now exact for the whole 64-bit range of
+       byte counts. The previous form scaled the input count before
+       dividing, so a large enough response overflowed the intermediate
+       and reported a wrong ratio -- for bytes_in near UINT64_MAX it
+       logged 0.000 where the true ratio was 0.999. The variable is now
+       produced by exact integer long division that extracts each of the
+       three fractional digits without an intermediate that can wrap,
+       and is correct for expanding streams as well as shrinking ones.
+       Log output only; no response bytes change.
+
     *) Tests: removed the standalone dcz CDict-vs-refPrefix equivalence
        probes. They were one-off investigation tools, not production-helper
        regression tests, and keeping them under ci/tools made the dcz test
@@ -41,6 +51,19 @@ Unreleased
        hashed as always. The directive is order-enforced like
        zstd_dict_strict_path: declaring it after a literal-carrying
        zstd_dcz_dict_file is a config-load error.
+
+    *) Bugfix: on 32-bit (ILP32) builds with large-file support, the
+       pledged response length used to size the first output buffer was
+       narrowed to size_t before ZSTD_compressBound(), truncating a
+       declared length above 4 GiB modulo 2^32 -- a 4 GiB body pledged as
+       4 GiB + 389 bytes was sized for 389 bytes. The length is now
+       checked for representability, and against libzstd's own
+       width-dependent input ceiling, at full off_t width before any
+       narrowing; a length that fails either check keeps the configured
+       buffer size instead of shrinking. Lengths that are representable
+       still take the first-buffer sizing unchanged, on every width. LP64
+       builds, where off_t and size_t are the same width, were never
+       affected.
 
     *) Bugfix: per-request byte counters for $zstd_bytes_in and
        $zstd_bytes_out wrapped on 32-bit (ILP32) systems for responses

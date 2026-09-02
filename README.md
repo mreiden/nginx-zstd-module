@@ -13,7 +13,7 @@
 
 # zstd-nginx-module
 
-An nginx module for [Zstandard (zstd)](https://facebook.github.io/zstd/) compression. Zstandard typically achieves better compression ratios than gzip at comparable or faster speeds, making it a good choice for reducing transmitted response sizes.
+An nginx module for [Zstandard (zstd)](https://facebook.github.io/zstd/) compression. Zstandard typically achieves substantially better compression ratios than gzip, making it a good choice for reducing transmitted response sizes. Throughput depends on the level and payload: at the low levels recommended for web traffic, zstd trades some encode speed for that ratio -- see the [measured benchmark table](#benchmarks) rather than assuming a general speed win.
 
 This is a hardened fork: every PR is exercised against **nginx mainline**, the filter/static suites and runtime regressions run under **ASAN/UBSAN**, flawfinder/semgrep/clang-tidy run on every change, and a weekly deep pass fuzzes both parser targets and additionally covers **nginx stable** and **[Angie](https://angie.software/)** (see [Testing & CI](#testing--ci)).
 
@@ -1244,9 +1244,9 @@ When set to `on`, the module emits a `Vary: Accept-Encoding` response header its
 > guaranteed to decode zstd — for example,
 > internal service-to-service calls where you control both ends.
 
-> **Magic-number validation.** Before serving a `.zst`, the module reads the first bytes of the file (one `pread(2)` at offset 0) and verifies they are the zstd frame magic (`ZSTD_MAGICNUMBER` `0xFD2FB528`) or a skippable-frame magic (`ZSTD_MAGIC_SKIPPABLE_*`). On mismatch — a truncated download, mistaken rename (`cp foo.txt foo.zst`), or any other non-zstd content — the handler logs `zstd static: "..." is not a zstd frame (leading bytes 0x...)` and **declines**; nginx then falls back to serving the uncompressed original, or returns 404 if no original is present. Malformed verdicts are memoized per worker by exact path, file identity, size, and mtime in a bounded 64-entry cache, so an unchanged broken sidecar logs once while its verdict remains resident instead of on every request; a replaced file or changed path, size, or mtime is probed again, and round-robin eviction permits a later re-probe. Without this, the client would receive a body labelled `Content-Encoding: zstd` that it cannot decode. The read is offset-explicit so it never disturbs the file position of the `open_file_cache` descriptor shared with other in-flight requests: `pread(2)` on POSIX, `ngx_read_file()` (a `ReadFile()` with an `OVERLAPPED` offset) on Win32. The verdict logic is a single shared function, so both platforms accept and reject exactly the same files. The probe is compiled out only on a POSIX build whose `configure` found no `pread(2)`, rather than degraded to a `read`+`lseek` pair that would corrupt those concurrent requests.
+> **Magic-number validation.** Before serving a `.zst`, the module reads the frame header prefix (up to 58 bytes: a canonical 40-byte dcz skippable prefix plus room for the following 18-byte maximum frame header, one offset-explicit read per distinct offset) and verifies each frame it walks starts with the zstd frame magic (`ZSTD_MAGICNUMBER` `0xFD2FB528`) or a skippable-frame magic (`ZSTD_MAGIC_SKIPPABLE_*`). The module walks a bounded chain of up to 4 leading skippable frames — enough for a dcz-style prefix plus an extra marker frame — before requiring the frame that follows to be a regular one; a 5th leading skippable frame is a hard decline rather than a longer search, so the walk cannot be turned into an unbounded scan. On any mismatch — a truncated download, mistaken rename (`cp foo.txt foo.zst`), non-zstd content, or an over-long skippable chain — the handler logs `zstd static: "..." is not a zstd frame (leading bytes 0x...)` (or the matching skippable-chain-length error) and **declines**; nginx then falls back to serving the uncompressed original, or returns 404 if no original is present. Malformed verdicts are memoized per worker by exact path, file identity, size, and mtime in a bounded 64-entry cache, so an unchanged broken sidecar logs once while its verdict remains resident instead of on every request; a replaced file or changed path, size, or mtime is probed again, and round-robin eviction permits a later re-probe. Without this, the client would receive a body labelled `Content-Encoding: zstd` that it cannot decode. Each read is offset-explicit so it never disturbs the file position of the `open_file_cache` descriptor shared with other in-flight requests: `pread(2)` on POSIX, `ngx_read_file()` (a `ReadFile()` with an `OVERLAPPED` offset) on Win32. The verdict logic is a single shared function, so both platforms accept and reject exactly the same files. The probe is compiled out only on a POSIX build whose `configure` found no `pread(2)`, rather than degraded to a `read`+`lseek` pair that would corrupt those concurrent requests.
 >
-> **Declared-window validation.** The same probe parses the frame header (RFC 8878) and **declines any `.zst` whose leading frame declares a decompression window above 8 MB** — the limit browsers enforce for `Content-Encoding: zstd`; Firefox (`NS_ERROR_INVALID_CONTENT_ENCODING`) and Chromium (`ERR_CONTENT_DECODING_FAILED`) reject such frames before decoding a single byte. The scope is exactly the leading frame: a skippable leading frame is exempt, and in a (pathological, no common tooling emits one) concatenation of regular frames only the first is inspected — a regular frame's header does not declare its compressed length, so walking the sequence would mean decoding every block header in every frame. `zstd -t --memory=8MB` remains the complete pre-deploy check. This traps a nasty build-pipeline failure mode: streaming encoders that are not told the input size stamp the *compression level's* default window into every frame header, so a Node-based bundler can emit a 90 KB asset declaring a 128 MB window — the file decodes fine with the `zstd` CLI and serves byte-identically through nginx, yet fails in every browser. On decline the error log names the file and its declared window, and the request falls through to the zstd filter / `gzip_static` / identity, so the site keeps working while the build gets fixed (recompress with a window log ≤ 23; verify a build with `zstd -t --memory=8MB *.zst`). Single-segment frames are checked against their declared content size, which is their window.
+> **Declared-window validation.** The same probe parses the frame header (RFC 8878) and **declines any `.zst` whose first regular frame — the one reached after walking the bounded leading-skippable-frame chain above — declares a decompression window above 8 MB** — the limit browsers enforce for `Content-Encoding: zstd`; Firefox (`NS_ERROR_INVALID_CONTENT_ENCODING`) and Chromium (`ERR_CONTENT_DECODING_FAILED`) reject such frames before decoding a single byte. The scope is exactly that first regular frame: leading skippable frames within the bound are stepped over rather than inspected for a window, and in a (pathological, no common tooling emits one) concatenation of regular frames only the first is inspected — a regular frame's header does not declare its compressed length, so walking the sequence would mean decoding every block header in every frame. `zstd -t --memory=8MB` remains the complete pre-deploy check. This traps a nasty build-pipeline failure mode: streaming encoders that are not told the input size stamp the *compression level's* default window into every frame header, so a Node-based bundler can emit a 90 KB asset declaring a 128 MB window — the file decodes fine with the `zstd` CLI and serves byte-identically through nginx, yet fails in every browser. On decline the error log names the file and its declared window, and the request falls through to the zstd filter / `gzip_static` / identity, so the site keeps working while the build gets fixed (recompress with a window log ≤ 23; verify a build with `zstd -t --memory=8MB *.zst`). Single-segment frames are checked against their declared content size, which is their window.
 
 **Example:**
 
@@ -1467,12 +1467,16 @@ setup and the `git ls-files` trap: [CONTRIBUTING.md](CONTRIBUTING.md).
 Reproduce with `python3 ci/tools/benchmark.py` (drives the `zstd`/`gzip`
 CLIs linked against the same libzstd/zlib on the machine that runs it).
 Compression **ratio** for a given library/input/settings combination is
-stable across runs and machines; **throughput** is not — it scales with
-CPU and varies run to run, so treat any MB/s figure as a rough range,
-not a point value. These numbers come from the CLI codecs directly:
-they exclude nginx's own filter, context, buffering, and flush
-overhead, so they are not a measurement of module throughput. Figures
-below: **libzstd 1.5.5**, single core, `--repeat 3`, best wall-time.
+stable across runs and machines, but not necessarily across libzstd
+versions — encoder heuristics change between releases while staying
+format-compatible, so expect the ratios below to shift somewhat on the
+recommended 1.5.7 rather than the 1.5.5 measured here. **Throughput** is
+not stable at all: it scales with CPU and varies run to run, so treat
+any MB/s figure as a rough range, not a point value. These numbers come
+from the CLI codecs directly: they exclude nginx's own filter, context,
+buffering, and flush overhead, so they are not a measurement of module
+throughput. Figures below: **libzstd 1.5.5**, single core, `--repeat 3`,
+best wall-time.
 
 For nginx request-path measurements, `ci/tools/ab_bench.py` keeps its existing
 plain-zstd workload by default and accepts `--workload dcz` for a focused RFC
@@ -1537,8 +1541,10 @@ What changed is the module's per-response *overhead* inside nginx:
   churn under load — not as a different ratio or a different CLI MB/s
   figure. The trade is a higher per-request memory floor (~256 KB);
   see [`zstd_buffers`](#zstd_buffers).
-* **`$zstd_ratio` now computes with a single division** instead of two
-  — a log-path micro-cost, no effect on the response itself.
+* **`$zstd_ratio` is computed by exact integer long division**, so it
+  stays correct for byte counts near the 64-bit range and for streams
+  that expand rather than shrink — a log-path cost only, no effect on
+  the response itself.
 * **`zstd_long` (off by default)** can materially improve ratio on
   large, internally repetitive bodies that exceed the match window —
   but only when explicitly enabled, and the gain is workload-specific,
