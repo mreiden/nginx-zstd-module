@@ -59,21 +59,18 @@ if test -n "$ngx_module_link"; then
 
     if [ "$ngx_module_link" != DYNAMIC ]; then
         # ngx_module_order only works for dynamic modules; static
-        # builds re-order HTTP_FILTER_MODULES by hand (parent
-        # pattern, token-exact to avoid substring corruption).
-        if [ "$HTTP_GZIP" = YES ]; then
-            next=ngx_http_gzip_filter_module
-        elif echo " $HTTP_FILTER_MODULES " | grep pagespeed_etag_filter >/dev/null; then
-            next=ngx_pagespeed_etag_filter
-        else
-            next=ngx_http_range_header_filter_module
-        fi
-
-        # The reorder helper is the parent filter's, shared verbatim
-        # (#286): it refuses an absent anchor and verifies the final
-        # order, so a core filter-chain rename fails the build loudly
-        # instead of leaving this filter mis-ordered.
+        # builds re-order HTTP_FILTER_MODULES by hand. The anchor
+        # selector and the reorder helper are the parent filter's,
+        # shared verbatim (#286/#303), with one layer of our own on
+        # top (auto/reorder.sh): anchor after the parent's standalone
+        # zstd filter when it is built alongside, so this module runs
+        # first among the compressors and supersedes them. The helper
+        # refuses an absent anchor and verifies the final order, so a
+        # core filter-chain rename fails the build loudly instead of
+        # leaving this filter mis-ordered.
         . "$ngx_addon_dir/../filter/reorder-static.sh"
+        . "$ngx_addon_dir/auto/reorder.sh"
+        next=`ngx_http_compression_static_next`
         ngx_http_zstd_reorder_static_filter || exit 1
     fi
 

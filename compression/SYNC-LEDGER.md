@@ -309,5 +309,5 @@ mreiden/ngx_brotli commits.
 | 297 | gitattributes: byte-exact rules → fuzz fixture dirs | ✅ via sync (union with ours) | ✅ earlier | |
 | 298–300, 302, 304, 305, 307 | CI sweeps, refPrefix cost bench, docs | ➖ N/A | ➖ | |
 | 301/308 | (ours) start without an http block | ✅ merged fe5db23; compression already passed | ➖ | binary gate test_no_http_block.sh |
-| 303 | static/dynamic order agreement; anchor match | ✅ 92fee0b (padding only) | YES 6cbbe05 | anchor POLICY stays ours: his brotli-anchor preference is wrong for a filter that replaces one |
+| 303 | static/dynamic order agreement; anchor match | ✅ 92fee0b padding, then the shared selector adopted (CodeRabbit on #117) | YES 6cbbe05 (fork stays standalone) | registration order is chain order REVERSED, so anchoring after the last compressor makes this filter run FIRST and supersede a co-built standalone zstd/brotli; auto/reorder.sh layers a zstd-filter anchor over his selector; tools/test_static_filter_order.sh pins five shapes |
 | 306 | harness pin "bump" to 9864052 | ⚠ NOT taken | ➖ | a rewind: 9864052 predates #235 (testkit main is linear); the gitlink is held forward at b4d8ca9 in 6730af6; repair = our #309 (OPEN) |
