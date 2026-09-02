@@ -1194,3 +1194,45 @@ $::src
 more than 4 leading skippable frames
 --- no_error_log
 [alert]
+
+
+=== TEST 44: a malformed sidecar's verdict is memoized per path and identity
+# One SSI page includes the same malformed .zst three times: three
+# static-handler subrequests in one worker, in one deterministic order.
+# The first is probed and logged; the next two take the cycle-owned
+# verdict cache (parent #287) instead of re-reading and re-logging a
+# file that cannot have changed. The exact-count grep is the assertion:
+# without the cache there are three probe lines and no cached ones.
+--- log_level: debug
+--- user_files
+>>> page/memo.shtml
+<!--#include virtual="/st/memo.txt" --><!--#include virtual="/st/memo.txt" --><!--#include virtual="/st/memo.txt" -->
+>>> st/memo.txt
+identity fallback
+>>> st/memo.txt.zst
+HELO malformed sidecar
+--- config
+    location /page/ {
+        ssi on;
+        default_type text/html;
+        root html;
+    }
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        root html;
+    }
+--- request
+GET /page/memo.shtml
+--- more_headers
+Accept-Encoding: zstd
+--- response_body_like eval
+qr/^(?:identity fallback\n){3}\s*$/
+--- grep_error_log eval
+qr/(?:is not a zstd frame|cached malformed verdict)/
+--- grep_error_log_out
+is not a zstd frame
+cached malformed verdict
+cached malformed verdict
+--- no_error_log
+[alert]

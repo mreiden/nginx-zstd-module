@@ -60,6 +60,18 @@ typedef struct {
 } ngx_http_compression_static_conf_t;
 
 
+#define NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS  64
+
+typedef struct {
+    ngx_file_uniq_t  uniq;
+    time_t           mtime;
+    off_t            size;
+    size_t           len;
+    ngx_uint_t       valid;
+    u_char           path[NGX_MAX_PATH];
+} ngx_http_compression_static_bad_t;
+
+
 typedef struct {
     /*
      * "Could this cycle ever serve a sidecar" latch (parent #182), set at
@@ -87,6 +99,21 @@ typedef struct {
     size_t         dio_scratch_cap;
     size_t         dio_scratch_align;
     ngx_uint_t     dio_scratch_busy;
+
+    /*
+     * Bounded worker-local memo of MALFORMED sidecar verdicts (parent
+     * #287): a broken generated asset otherwise pays the same probe
+     * read and the same NGX_LOG_ERR on every request. Exact path plus
+     * file identity, size and mtime form the key, so a replaced or
+     * edited file is probed afresh; round-robin eviction lets a
+     * later re-probe through. Only deterministic verdicts (format,
+     * geometry, window) are remembered -- a read error is transient
+     * and must be retried. Cycle-owned like the scratch above: a new
+     * cycle starts from a pcalloc'd conf, nothing to reset.
+     */
+    ngx_http_compression_static_bad_t
+                   bad[NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS];
+    ngx_uint_t     bad_next;
 } ngx_http_compression_static_main_conf_t;
 
 
@@ -457,6 +484,59 @@ ngx_http_compression_static_dio_buf_release(
 }
 
 
+static ngx_uint_t
+ngx_http_compression_static_bad_cached(
+    ngx_http_compression_static_main_conf_t *smcf, ngx_str_t *path,
+    ngx_open_file_info_t *of)
+{
+    ngx_uint_t                          i;
+    ngx_http_compression_static_bad_t  *e;
+
+    if (path->len >= NGX_MAX_PATH) {
+        return 0;
+    }
+
+    for (i = 0; i < NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS; i++) {
+        e = &smcf->bad[i];
+
+        if (e->valid && e->uniq == of->uniq && e->mtime == of->mtime
+            && e->size == of->size && e->len == path->len
+            && ngx_memcmp(e->path, path->data, path->len) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static void
+ngx_http_compression_static_bad_remember(
+    ngx_http_compression_static_main_conf_t *smcf, ngx_str_t *path,
+    ngx_open_file_info_t *of)
+{
+    ngx_http_compression_static_bad_t  *e;
+
+    if (path->len >= NGX_MAX_PATH) {
+        return;
+    }
+
+    e = &smcf->bad[smcf->bad_next];
+    e->uniq = of->uniq;
+    e->mtime = of->mtime;
+    e->size = of->size;
+    e->len = path->len;
+    ngx_memcpy(e->path, path->data, path->len);
+    e->valid = 1;
+
+    smcf->bad_next++;
+    if (smcf->bad_next == NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS) {
+        smcf->bad_next = 0;
+    }
+}
+
+
 #endif /* NGX_HTTP_COMPRESSION_STATIC_HAVE_PROBE */
 
 
@@ -491,7 +571,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
     ssize_t     n;
     uint64_t    window, skip;
     ngx_int_t   probe_rc;
-    ngx_uint_t  frames, scratch, have_block, reuse;
+    ngx_uint_t  frames, scratch, have_block, reuse, malformed;
     off_t       pos, base, have_base;
     ngx_log_t  *log;
 
@@ -505,12 +585,21 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
     scratch = 0;
     have_block = 0;
     have_base = 0;
+    malformed = 0;
     n = 0;
+
+    if (ngx_http_compression_static_bad_cached(smcf, path, of)) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
+                       "compression static: cached malformed verdict for "
+                       "\"%V\"", path);
+        return NGX_DECLINED;
+    }
 
     if (of->size < 4) {
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "compression static: \"%V\" too small to be a zstd "
                       "frame (%O bytes)", path, of->size);
+        malformed = 1;
         probe_rc = NGX_DECLINED;
         goto probe_done;
     }
@@ -590,6 +679,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                           "frame", path,
                           (ngx_uint_t)
                               NGX_HTTP_ZSTD_STATIC_MAX_SKIP_FRAMES);
+            malformed = 1;
             probe_rc = NGX_DECLINED;
             goto probe_done;
         }
@@ -675,8 +765,9 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" is not a zstd frame "
                           "(leading bytes 0x%02xd%02xd%02xd%02xd)", path,
-                          (ngx_uint_t) frame[0], (ngx_uint_t) frame[1],
-                          (ngx_uint_t) frame[2], (ngx_uint_t) frame[3]);
+                          (unsigned) frame[0], (unsigned) frame[1],
+                          (unsigned) frame[2], (unsigned) frame[3]);
+            malformed = 1;
             probe_rc = NGX_DECLINED;
             goto probe_done;
 
@@ -684,6 +775,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
             ngx_log_error(NGX_LOG_ERR, log, 0,
                           "compression static: \"%V\" frame header "
                           "truncated", path);
+            malformed = 1;
             probe_rc = NGX_DECLINED;
             goto probe_done;
 
@@ -695,6 +787,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                           "(RFC 8878) — declining so a fallback coding is "
                           "used; recompress with a window log <= 23", path,
                           window);
+            malformed = 1;
             probe_rc = NGX_DECLINED;
             goto probe_done;
 
@@ -704,6 +797,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                           "reserved Frame_Header_Descriptor bit 0x08 "
                           "(RFC 8878) — declining so a fallback coding is "
                           "used", path);
+            malformed = 1;
             probe_rc = NGX_DECLINED;
             goto probe_done;
 
@@ -724,6 +818,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                 ngx_log_error(NGX_LOG_ERR, log, 0,
                               "compression static: \"%V\" skippable frame "
                               "header runs past end of file", path);
+                malformed = 1;
                 probe_rc = NGX_DECLINED;
                 goto probe_done;
             }
@@ -733,6 +828,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                               "compression static: \"%V\" skippable frame "
                               "declares a %uL-byte skip past end of file",
                               path, skip);
+                malformed = 1;
                 probe_rc = NGX_DECLINED;
                 goto probe_done;
             }
@@ -760,6 +856,10 @@ probe_done:
      */
     if (scratch) {
         ngx_http_compression_static_dio_buf_release(smcf);
+    }
+
+    if (probe_rc == NGX_DECLINED && malformed) {
+        ngx_http_compression_static_bad_remember(smcf, path, of);
     }
 
     return probe_rc;
