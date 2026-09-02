@@ -150,6 +150,9 @@ jobs:
       - name: Ratio scaling unit oracle (overflow-safe $compression_ratio)
         run: bash compression/tools/test_ratio_scaling_unit.sh
 
+      - name: max_length abort diagnostics contract (declared vs unknown length)
+        run: bash compression/tools/test_max_length_diagnostics.sh
+
   gzipless:
     name: Build without the gzip module (no compat)
     runs-on: ubuntu-latest

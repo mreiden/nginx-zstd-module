@@ -82,6 +82,16 @@ typedef struct {
     ssize_t                          max_length;
 
     /*
+     * The upstream-declared body length at election time, -1 when
+     * none (parent #283). Captured here because the header filter
+     * clears headers_out.content_length before the body streams, so
+     * the running-cap abort below could no longer tell a misdeclaring
+     * upstream ("declared 4 KB, streamed 40 MB") from a chunked one --
+     * and logged "no Content-Length" for both.
+     */
+    off_t                            pledged_size;
+
+    /*
      * PHASE1b: the elected dictionary variant's wire prologue,
      * prepared at election time and emitted ahead of the first
      * encoder byte (40 bytes dcz, 36 dcb; 0 = base coding).
@@ -1572,6 +1582,65 @@ ngx_http_compression_set_bypass_vary(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
+/*
+ * The two halves of the bypass cache-vary contract, checked after the
+ * merge (parent #283's extraction; behaviour unchanged):
+ *
+ * compression_bypass_vary only makes sense beside a bypass predicate: it
+ * names the request header the bypass decision varies on so shared
+ * caches key correctly. Alone it just emits a Vary field no response
+ * varies on — harmless over-varying, but warn so the misconfig is
+ * visible rather than silently degrading hit rate.
+ *
+ * Inverse (#185): a compression_bypass predicate that reads a request
+ * header or cookie DIRECTLY (e.g. "compression_bypass
+ * $http_x_no_compression;") without a matching compression_bypass_vary
+ * lets a shared cache mix an identity response with a compressed one
+ * under the same key — a cache-poisoning / wrong-variant-served hazard.
+ * Only the literal "$http_*" / "$cookie_*" spellings are checked; a map
+ * or other indirection stays a documented operator responsibility (see
+ * ngx_http_compression_predicate_is_direct_header_or_cookie()).
+ */
+static void
+ngx_http_compression_validate_bypass_vary(ngx_conf_t *cf,
+    ngx_http_compression_conf_t *conf)
+{
+    ngx_uint_t                 i;
+    ngx_http_complex_value_t  *cv;
+
+    if (conf->bypass_vary.len && conf->bypass == NULL) {
+        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                           "\"compression_bypass_vary\" is set without a "
+                           "\"compression_bypass\" predicate; it adds a "
+                           "\"Vary: %V\" field no response actually varies "
+                           "on", &conf->bypass_vary);
+    }
+
+    if (conf->bypass == NULL || conf->bypass_vary.len != 0) {
+        return;
+    }
+
+    cv = conf->bypass->elts;
+
+    for (i = 0; i < conf->bypass->nelts; i++) {
+        if (ngx_http_compression_predicate_is_direct_header_or_cookie(
+                &cv[i].value))
+        {
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "\"compression_bypass\" predicate \"%V\" "
+                               "reads a request header or cookie directly "
+                               "without a \"compression_bypass_vary\"; a "
+                               "shared cache may mix identity and "
+                               "compressed responses under the same key. "
+                               "Add a \"compression_bypass_vary\" directive "
+                               "naming the header this varies on",
+                               &cv[i].value);
+            return;
+        }
+    }
+}
+
+
 static char *
 ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -1591,56 +1660,7 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->bypass_vary, prev->bypass_vary, "");
     ngx_conf_merge_value(conf->dict_assume_secure, prev->dict_assume_secure, 0);
 
-    /*
-     * compression_bypass_vary only makes sense beside a bypass
-     * predicate: it names the request header the bypass decision
-     * varies on so shared caches key correctly. Alone it just emits a
-     * Vary field no response varies on — harmless over-varying, but
-     * warn so the misconfig is visible rather than silently degrading
-     * hit rate (parent zstd_bypass_vary parity).
-     */
-    if (conf->bypass_vary.len && conf->bypass == NULL) {
-        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                           "\"compression_bypass_vary\" is set without a "
-                           "\"compression_bypass\" predicate; it adds a "
-                           "\"Vary: %V\" field no response actually varies "
-                           "on", &conf->bypass_vary);
-    }
-
-    /*
-     * Inverse check (#185): a compression_bypass predicate that reads a
-     * request header or cookie DIRECTLY (e.g.
-     * "compression_bypass $http_x_no_compression;") without a matching
-     * compression_bypass_vary lets a shared cache mix an identity
-     * response with a compressed one under the same key — a
-     * cache-poisoning / wrong-variant-served hazard. Only the literal
-     * "$http_*" / "$cookie_*" spellings are checked; a map or other
-     * indirection stays a documented operator responsibility (see
-     * ngx_http_compression_predicate_is_direct_header_or_cookie()).
-     */
-    if (conf->bypass != NULL && conf->bypass_vary.len == 0) {
-        ngx_http_complex_value_t  *cv;
-
-        cv = conf->bypass->elts;
-
-        for (i = 0; i < conf->bypass->nelts; i++) {
-            if (ngx_http_compression_predicate_is_direct_header_or_cookie(
-                    &cv[i].value))
-            {
-                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                                   "\"compression_bypass\" predicate \"%V\" "
-                                   "reads a request header or cookie "
-                                   "directly without a "
-                                   "\"compression_bypass_vary\"; a shared "
-                                   "cache may mix identity and compressed "
-                                   "responses under the same key. Add a "
-                                   "\"compression_bypass_vary\" directive "
-                                   "naming the header this varies on",
-                                   &cv[i].value);
-                break;
-            }
-        }
-    }
+    ngx_http_compression_validate_bypass_vary(cf, conf);
 
     /* default cap 32 in-flight bufs (core gzip's number), size 0 =
      * backend-recommended */
@@ -2375,6 +2395,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
 
     ctx->backend = elected;
     ctx->last_in = &ctx->in;    /* empty chain: tail is the head slot */
+    ctx->pledged_size = r->headers_out.content_length_n;
     ctx->out_size = elected->out_size(r->headers_out.content_length_n);
 
     /* operator geometry: an explicit compression_buffers size beats
@@ -2938,12 +2959,31 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 if (ctx->max_length != NGX_CONF_UNSET
                     && (off_t) ctx->bytes_in > (off_t) ctx->max_length)
                 {
-                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                                  "compression: input exceeded "
-                                  "compression_max_length (%O) on a "
-                                  "response with no Content-Length; "
-                                  "aborting to protect the worker",
-                                  (off_t) ctx->max_length);
+                    /*
+                     * Name the shape truthfully (parent #283): a
+                     * declared length that the stream then overran
+                     * is a misdeclaring upstream, not a chunked one,
+                     * and the operator's remedy differs.
+                     */
+                    if (ctx->pledged_size >= 0) {
+                        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                      "compression: input exceeded "
+                                      "compression_max_length (%O) after "
+                                      "%uL bytes on a response with "
+                                      "declared Content-Length %O; "
+                                      "aborting to protect the worker",
+                                      (off_t) ctx->max_length,
+                                      ctx->bytes_in, ctx->pledged_size);
+                    } else {
+                        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                      "compression: input exceeded "
+                                      "compression_max_length (%O) after "
+                                      "%uL bytes on a response with no "
+                                      "Content-Length; aborting to protect "
+                                      "the worker",
+                                      (off_t) ctx->max_length,
+                                      ctx->bytes_in);
+                    }
                     return NGX_ERROR;
                 }
             }
