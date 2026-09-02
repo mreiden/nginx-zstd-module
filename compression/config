@@ -63,7 +63,7 @@ if test -n "$ngx_module_link"; then
         # pattern, token-exact to avoid substring corruption).
         if [ "$HTTP_GZIP" = YES ]; then
             next=ngx_http_gzip_filter_module
-        elif echo $HTTP_FILTER_MODULES | grep pagespeed_etag_filter >/dev/null; then
+        elif echo " $HTTP_FILTER_MODULES " | grep pagespeed_etag_filter >/dev/null; then
             next=ngx_pagespeed_etag_filter
         else
             next=ngx_http_range_header_filter_module
