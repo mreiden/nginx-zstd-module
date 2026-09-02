@@ -147,6 +147,9 @@ jobs:
         # cursor drain order is not wire-testable (round 5 blocker).
         run: bash compression/tools/test_input_chain_cursor_unit.sh
 
+      - name: Ratio scaling unit oracle (overflow-safe $compression_ratio)
+        run: bash compression/tools/test_ratio_scaling_unit.sh
+
   gzipless:
     name: Build without the gzip module (no compat)
     runs-on: ubuntu-latest
