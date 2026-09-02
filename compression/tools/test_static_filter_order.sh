@@ -63,10 +63,20 @@ HTTP_FILTER_MODULES='ngx_http_range_header_filter_module'
 expect_anchor ngx_http_range_header_filter_module
 expect_order
 
-# 5. A name that merely CONTAINS the zstd filter's name must not match.
+# 5. A name that merely CONTAINS the zstd filter's name must fool neither
+#    the selector nor the reorder: the anchor stays gzip, the filter lands
+#    directly after gzip, and the look-alike survives untouched.
 HTTP_FILTER_MODULES='ngx_http_gzip_filter_module ngx_http_zstd_filter_module_extra ngx_http_range_header_filter_module'
 HTTP_GZIP=YES
 expect_anchor ngx_http_gzip_filter_module
+expect_order
+case " $HTTP_FILTER_MODULES " in
+    *" ngx_http_zstd_filter_module_extra "*) ;;
+    *)
+        echo "FAIL: reorder mangled the look-alike module: $HTTP_FILTER_MODULES" >&2
+        exit 1
+    ;;
+esac
 
 # Fail-closed control: an absent anchor must stop the build.
 HTTP_FILTER_MODULES='ngx_http_range_header_filter_module'
