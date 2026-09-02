@@ -14,7 +14,9 @@
  * and everything below resolves. Outside nginx (the unit fixture),
  * provide before including:
  *     typedef uintptr_t  ngx_uint_t;
- * ngx_inline defaults to plain inline when nginx has not defined it.
+ * When nginx has not defined ngx_inline it expands to nothing: the
+ * definition is already `static`, and an empty fallback keeps a
+ * conforming C89 compile valid, where `inline` is not a keyword.
  * The function body is the filter module's, moved verbatim.
  */
 
@@ -24,7 +26,7 @@
 #include <stdint.h>
 
 #ifndef ngx_inline
-#define ngx_inline  inline
+#define ngx_inline
 #endif
 
 
