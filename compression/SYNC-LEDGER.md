@@ -233,14 +233,14 @@ standalone PR (ours included where they round-tripped).
 | 200 | MINOR/NIT batch (byte counter, Vary dedup, helpers) | ✅ where applicable | ◑ | adopted piecemeal across phase-3 commits |
 | 202 | Vary from usable sidecar, probe before acceptance | ✅ 4561880 | YES 4f59f21-era | round-4 ruling |
 | 207 | $bytes_* via %uL | ✅ by construction | ➖ | variables print %uL (module.c:1247) |
-| 208–213, 233 | perf cluster (probe cap, block reuse, gate hoist) | 🔜 queued | 🔎 | next perf pass |
+| 208–213, 233 | perf cluster (probe cap, block reuse, gate hoist) | ✅ b9d4717 (+cdda5b5 for #261) | ➖ | probe-read pass: 64 KB alignment clamp, cycle-owned scratch, 58-byte read-ahead reuse, probe_done discipline |
 | 214 | Test::Nginx @0.32 pin | ✅ dff9033 → superseded by #249 row | YES 6ecfbf8 | |
-| 215 | chained Accept-Encoding negotiation | 🔜 queued | 🔎 | needs the defer-story design talk first |
+| 215 | chained Accept-Encoding negotiation | ✅ aef9c95 (with #275) | YES 6987f6a | whole-field walk; refusal-only gzip veto via gzip_tested/gzip_ok, absence does not latch |
 | 218 | prove ZSTD_freeCCtxParams exits | ➖ N/A | ➖ | no config-time cctx estimator here (#164/#240 lineage) |
 | 220 | (ours) dict trust-hashes opt-in | ✅ e6d6e1c | YES 127d5f2 | |
 | 222 | dict bypass main-request gate | ✅ f5ed798 | ➖ | his review fixed our subrequest hole |
 | 229 | output-side zero-delta advance guard | WRINKLES | ➖ | input side already guarded (module.c:2550); ob->last provably non-NULL; sanitized CI would trap |
-| 230 | (ours) filterless bypass warning | upstream-pending | ➖ | rebased 98e1967, mergeable |
+| 230 | (ours) filterless bypass warning | ✅ merged upstream | ➖ | |
 | 234–236 | perf leftovers | ◑ partial N/A | ➖ | per earlier survey |
 | 237 | ZSTD_STATIC_LINKING_ONLY out of dynamic ABI | ✅ c73a5f3 (taken further) | ➖ | one accepted import, self-defined TU |
 | 239 | servroot gitignore | ✅ | ➖ | .gitignore analog |
@@ -255,7 +255,7 @@ standalone PR (ours included where they round-tripped).
 | 249 | CPAN lock for Test::Nginx | ✅ 82bdd9b | YES 9bf378f | + LC_ALL=C sort fix, LF gitattribute |
 | 250 | forbid static-only zstd imports | ✅ c3383cc (adapted) | ➖ | asserts the ONE import present + estimators absent |
 | 251 | honor no-transform | ✅ 25257d0 | YES 2bde375 | unified delta: gzip veto; fork keeps standalone semantics |
-| 252 | reserved descriptor bit (still OPEN upstream) | ✅ 06e8288 | ➖ | review posted w/ cross-ref |
+| 252 | reserved descriptor bit | ✅ 06e8288 | ➖ | merged upstream after our review |
 | 253 | fail closed on indeterminate LSan | DEFERRED | DEFERRED | joined to the #192 leak-effort TODO above (detect_leaks=0 today) |
 
 ### Batch: #254–#267 (2026-08-30)
@@ -264,11 +264,50 @@ standalone PR (ours included where they round-tripped).
 |---|---------|-------------|---------|-------|
 | 254 | (ours) no-transform '=' cut | ✅ was ours; compression had it first (25257d0) | YES 2bde375 | merged upstream in <1h |
 | 255/256 | A29 sweep/second-pass CI closes | ➖ N/A | ➖ | his linter estate; #255 retargeted linkage check at objs/nginx (our c3383cc shape) |
-| 257 | probe decomposition (lizard CCN) | ➖ N/A | ➖ | his complexity linter's limit, not ours |
+| 257 | probe decomposition (lizard CCN) | ✅ 13b40fe | ➖ | finished on our side too; superseded by the #278 header adoption |
 | 258 | one-block buf+payload alloc; hex nibble helper | ✅ bebc57d (buf half; hex already our shape) | 🔎 | |
 | 259 | fixed-width frame decodes | ✅ 14106ac | ➖ | LE memcpy + bytewise fallback |
 | 260 | lazy input-chain retention | ✅ 5dd4955 | 🔎 | simpler here (per-link FINISH); drain-order oracle gap joined to deferred-testkit item |
-| 261 | probe read-ahead reuse (58B) | 🔜 with #233 | ➖ | stacks on unported #233's have_block cache; goes with the perf-cluster probe pass (#208/#233/#261 as one unit) |
+| 261 | probe read-ahead reuse (58B) | ✅ cdda5b5 / b9d4717 | ➖ | landed with the probe-read pass |
 | 262 | EVP digest ctx reuse | ✅ 16c65ae (self-contained; header signature owed nothing to his #262 change) | 🔎 | |
 | 263 | shared vary token scanner | ➖ N/A | ➖ | our Vary is by-construction single-line; no scanner pair to dedup |
 | 264–267 | linter work-list/LSan/docs/tarball-verify | ➖ N/A | ➖ | CI estate |
+
+### Batch: #268–#308 (2026-08-31 → 2026-09-02)
+
+phase0 synced through master d45e3b1 (#307) in 6730af6; our own
+upstream PRs in this window are marked (ours). Fork twins reference
+mreiden/ngx_brotli commits.
+
+| # | subject | disposition | brotli? | notes |
+|---|---------|-------------|---------|-------|
+| 268/269 | ci: workflow scheduling, fan-out heuristic | ➖ N/A | ➖ | his runner estate |
+| 270 | (ours) RFC: one authoritative frame probe | ✅ closed 2026-09-02 | ➖ | shape 1 via #278; every review condition met (adoption 9ee9a2b, seam guard #288/#291, claims narrowed); submodule shape shelved until a real third consumer |
+| 271 | ci: relocate sanitizer suppressions | ✅ via sync | ➖ | |
+| 272 | ci: unify persistent build inputs | ➖ N/A | ➖ | build-inputs manifest is his cache key |
+| 273 | static: allow four skipped frames | ✅ 992f363 | ➖ | fail-first: the old `>=` bound logged "more than 4" on exactly four; TESTs 42/43 |
+| 274 | quoted Cache-Control extensions | ✅ 992f363 | YES 1a0b664 | segment end computed once, quote-aware; TESTs 20/21 (07-bypass) |
+| 275 | repeated Accept-Encoding on legacy nginx | ✅ aef9c95 (with #215) | YES 6987f6a | fork gets the true legacy list walk (<1.23); fork audit also closed `br x` and `br;;q=1` (df8e9e1) |
+| 276/277 | ci: zizmor waivers, fork fallback deps | ➖ N/A | ➖ | |
+| 278 | (ours) frame-probe header extraction | ✅ adopted 9ee9a2b | ➖ | −243 lines; probe_reuse byte-identical, probe_frame comments-only diff vs the header |
+| 279 | (ours) gitattributes repair + gen_dict CR gate | ✅ e5c95bc (phase0 mirror came first) | YES 318db21 | union-merged on sync |
+| 280 | harness pin → testkit #235 (61c6906) | ✅ via sync; interim prober patch dropped (ecd0104) | ➖ | |
+| 281/282 | ci: sanitizer-suite verdict, assurance sweep | ➖ N/A | ➖ | |
+| 283 | max-length diagnostics; bypass_vary validator | ✅ 7c3121b | YES af539c5 | declared vs unknown length named truthfully (ctx->pledged_size captured at election); contract + lying-mutant fixture |
+| 284 | runtime libzstd feature floors | ✅ 95b6dfa | ➖ N/A | shares ../src/ngx_http_zstd_version.h; negative-level latch + init_module in the zstd backend TU; no target-cblock knob; NULL http conf is a pass (→ #308). Fork: no version-gated directives |
+| 285 | docs: zstd_static always contract | ➖ docs | ➖ | |
+| 286 | portability + config probes | ✅ 95b6dfa (F10/F11/F12) | YES 6cbbe05 | EVP header probe replaces the blind auto/have (the grafted bug was verbatim in both); reorder sources filter/reorder-static.sh fail-closed (fork inlines the checks); F8 was already our shape; C89 hunks have no analog |
+| 287 | memoize malformed sidecar verdicts | ✅ 6e7d945 | ➖ N/A (validates no content) | cycle-owned in the static main conf, not file statics; deterministic verdicts only; TEST 44 = one SSI page including the malformed .zst three times (pipelined requests were not deterministic) |
+| 288 | (ours) #278 claims narrowed; CI seam guard | ✅ merged; script on tree via sync | ➖ | his #291 improved it: counts definitions, scans ci/, stages the real fixture-redirect drift |
+| 289 | (ours) no-transform detection header | 🔜 OPEN upstream — adopt on merge | 🔎 at handover | review serviced (seam extended to the family); coverage lives in test_encoding.py |
+| 290 | terminal observability | ◑ casts only (6e7d945) | ➖ | aborted flag N/A: done is set only on a successful FINISH (fork: ctx->success) |
+| 291 | ci: scan probe test consumers | ✅ via sync | ➖ | |
+| 292/293 | docs | ➖ docs | ➖ | |
+| 294 | overflow-safe $zstd_ratio | ✅ ef602ac | YES 758a272 | exact long division; verbatim-extraction fixture vs an unsigned __int128 oracle; the fork also moves its counters to uint64_t (#200 m7 had never landed there). Extraction candidate: ratio_parts is now duplicated src/compression |
+| 295 | first output buffer bound at off_t width (ILP32) | ➖ N/A | ➖ N/A | zstd out_size ignores the length; brotli bounds at off_t width before its only cast; fork SIZE_HINT clamps at 0xffffffff |
+| 296 | legacy AE branch-equivalence unit | 🔜 | 🔎 | needs an AE unit shim compression does not have; the fold-helper factoring is the structural guard meanwhile |
+| 297 | gitattributes: byte-exact rules → fuzz fixture dirs | ✅ via sync (union with ours) | ✅ earlier | |
+| 298–300, 302, 304, 305, 307 | CI sweeps, refPrefix cost bench, docs | ➖ N/A | ➖ | |
+| 301/308 | (ours) start without an http block | ✅ merged fe5db23; compression already passed | ➖ | binary gate test_no_http_block.sh |
+| 303 | static/dynamic order agreement; anchor match | ✅ 92fee0b (padding only) | YES 6cbbe05 | anchor POLICY stays ours: his brotli-anchor preference is wrong for a filter that replaces one |
+| 306 | harness pin "bump" to 9864052 | ⚠ NOT taken | ➖ | a rewind: 9864052 predates #235 (testkit main is linear); the gitlink is held forward at b4d8ca9 in 6730af6; repair = our #309 (OPEN) |
