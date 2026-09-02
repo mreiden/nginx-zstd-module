@@ -43,6 +43,13 @@ for fn in ngx_http_zstd_static_probe_frame ngx_http_zstd_static_probe_reuse; do
 		"$root"
 done
 
+# Same seam, the ratio helper: production must include its header and
+# the split must keep exactly one definition.
+grep -Fq '#include "ngx_http_zstd_ratio.h"' \
+	"$root/src/ngx_http_zstd_filter_module.c"
+check_definition "$root/src/ngx_http_zstd_ratio.h" \
+	ngx_http_zstd_ratio_parts "$root"
+
 # Detection control: redirect the real unit fixture to a copied probe
 # implementation under ci/. The fixture must stay green while the seam
 # check turns red, reproducing the drift this gate exists to catch.
