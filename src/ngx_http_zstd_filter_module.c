@@ -15,6 +15,7 @@
 #include <stdint.h>  /* SIZE_MAX — saturating dcz window-log arithmetic */
 
 #include "ngx_http_zstd_common.h"
+#include "ngx_http_zstd_cache_control.h"
 #include "ngx_http_zstd_sha256.h"
 #include "ngx_http_zstd_version.h"
 #include "ngx_http_zstd_ratio.h"
@@ -1509,128 +1510,6 @@ ngx_module_t  ngx_http_zstd_filter_module = {
     NULL,                                   /* exit master */
     NGX_MODULE_V1_PADDING
 };
-
-
-static u_char *
-ngx_http_zstd_cache_control_directive_end(u_char *p, u_char *last)
-{
-    while (p < last) {
-        if (*p == '"') {
-            p++;
-
-            while (p < last && *p != '"') {
-                if (*p == '\\' && p + 1 < last) {
-                    p++;
-                }
-                p++;
-            }
-
-            if (p < last) {
-                p++;
-            }
-
-        } else if (*p == ',') {
-            break;
-
-        } else {
-            p++;
-        }
-    }
-
-    return p;
-}
-
-
-static ngx_int_t
-ngx_http_zstd_cache_control_value_no_transform(ngx_table_elt_t *cc)
-{
-    u_char  *p, *last, *start, *end, *directive_end, *semi;
-
-    if (cc->value.len == 0) {
-        return 0;
-    }
-
-    p = cc->value.data;
-    last = p + cc->value.len;
-
-    while (p < last) {
-        start = p;
-        while (start < last && (*start == ' ' || *start == '\t')) {
-            start++;
-        }
-
-        directive_end = ngx_http_zstd_cache_control_directive_end(start, last);
-
-        /*
-         * Cut at '=' as well as ';': the compared token is then the
-         * directive NAME, so "no-transform=arg" -- malformed, since the
-         * directive defines no argument (RFC 9111 §5.2.2.6), but clear
-         * in intent -- is honored rather than transformed. The quoted
-         * parameter-value control is unaffected: extension="no-transform"
-         * cuts to "extension" and still does not match.
-         */
-        semi = start;
-        while (semi < directive_end && *semi != ';' && *semi != '=') {
-            semi++;
-        }
-        end = semi;
-
-        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
-            end--;
-        }
-
-        if ((size_t) (end - start) == sizeof("no-transform") - 1
-            && ngx_strncasecmp(start, (u_char *) "no-transform",
-                               sizeof("no-transform") - 1) == 0)
-        {
-            return 1;
-        }
-
-        p = directive_end;
-        if (p < last) {
-            p++;
-        }
-    }
-
-    return 0;
-}
-
-
-static ngx_int_t
-ngx_http_zstd_cache_control_no_transform(ngx_http_request_t *r)
-{
-    ngx_uint_t        i;
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h;
-
-    part = &r->headers_out.headers.part;
-    h = part->elts;
-
-    for (i = 0; /* void */; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-
-        if (h[i].hash == 0 || h[i].key.len != sizeof("Cache-Control") - 1) {
-            continue;
-        }
-
-        if (ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
-                            sizeof("Cache-Control") - 1) == 0
-            && ngx_http_zstd_cache_control_value_no_transform(&h[i]))
-        {
-            return 1;
-        }
-    }
-
-    return 0;
-}
 
 
 static ngx_int_t
