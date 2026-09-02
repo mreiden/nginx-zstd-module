@@ -38,7 +38,8 @@
 
 typedef unsigned long  ngx_uint_t;
 
-#include "generated_ratio_parts.inc"
+/* THE authoritative copy, included directly -- no extracted duplicate. */
+#include "../../src/ngx_http_zstd_ratio.h"
 
 static long long failures;
 
