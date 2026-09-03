@@ -82,37 +82,43 @@ WITH_HEADERS_MORE=${WITH_HEADERS_MORE:-1}
 
 for t in WITH_COMPRESSION WITH_ZSTD WITH_BROTLI WITH_HEADERS_MORE; do
     case "${!t}" in
-        0|1) ;;
-        *) echo "ERROR: $t must be 0 or 1 (got '${!t}')" >&2; exit 1 ;;
+        0 | 1) ;;
+        *)
+            echo "ERROR: $t must be 0 or 1 (got '${!t}')" >&2
+            exit 1
+            ;;
     esac
 done
 
 # Library builds default to "some enabled module can use it"; override
 # to 0 only for the unified module, whose backends are optional.
-BUILDLIB_ZSTD=${BUILDLIB_ZSTD:-$(( WITH_ZSTD || WITH_COMPRESSION ))}
-BUILDLIB_BROTLI=${BUILDLIB_BROTLI:-$(( WITH_BROTLI || WITH_COMPRESSION ))}
+BUILDLIB_ZSTD=${BUILDLIB_ZSTD:-$((WITH_ZSTD || WITH_COMPRESSION))}
+BUILDLIB_BROTLI=${BUILDLIB_BROTLI:-$((WITH_BROTLI || WITH_COMPRESSION))}
 
 for t in BUILDLIB_ZSTD BUILDLIB_BROTLI; do
     case "${!t}" in
-        0|1) ;;
-        *) echo "ERROR: $t must be 0 or 1 (got '${!t}')" >&2; exit 1 ;;
+        0 | 1) ;;
+        *)
+            echo "ERROR: $t must be 0 or 1 (got '${!t}')" >&2
+            exit 1
+            ;;
     esac
 done
 if [ "$WITH_ZSTD" = 1 ] && [ "$BUILDLIB_ZSTD" = 0 ]; then
     echo "ERROR: the standalone zstd module pair requires libzstd (its" \
-         "auto/zstd probe is fatal); BUILDLIB_ZSTD=0 only fits WITH_ZSTD=0" >&2
+        "auto/zstd probe is fatal); BUILDLIB_ZSTD=0 only fits WITH_ZSTD=0" >&2
     exit 1
 fi
 if [ "$WITH_BROTLI" = 1 ] && [ "$BUILDLIB_BROTLI" = 0 ]; then
     echo "ERROR: the standalone ngx_brotli module requires libbrotli (its" \
-         "config errors without it); BUILDLIB_BROTLI=0 only fits WITH_BROTLI=0" >&2
+        "config errors without it); BUILDLIB_BROTLI=0 only fits WITH_BROTLI=0" >&2
     exit 1
 fi
 
 if [ "$WITH_COMPRESSION" = 1 ] && { [ "$WITH_ZSTD" = 1 ] || [ "$WITH_BROTLI" = 1 ]; }; then
     echo "NOTE: building the unified module beside a standalone one; the" \
-         "unified module runs first in the body-filter chain and" \
-         "supersedes it (static filter-anchor policy)." >&2
+        "unified module runs first in the body-filter chain and" \
+        "supersedes it (static filter-anchor policy)." >&2
 fi
 
 ### version + SHA-256 pins #############################################
@@ -126,13 +132,13 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PINS_FILE=${PINS_FILE:-$SCRIPT_DIR/windows-pins.sh}
 [ -f "$PINS_FILE" ] || {
     echo "ERROR: $PINS_FILE missing -- windows-pins.sh must sit beside this" \
-         "script (or set PINS_FILE=)" >&2
+        "script (or set PINS_FILE=)" >&2
     exit 1
 }
 # shellcheck source=ci/tools/windows-pins.sh
 . "$PINS_FILE"
 for v in VER_NGINX SHA_NGINX VER_PCRE2 SHA_PCRE2 VER_OPENSSL SHA_OPENSSL \
-         VER_ZLIB SHA_ZLIB VER_NASM SHA_NASM VER_ZSTD SHA_ZSTD; do
+    VER_ZLIB SHA_ZLIB VER_NASM SHA_NASM VER_ZSTD SHA_ZSTD; do
     [ -n "${!v:-}" ] || {
         echo "ERROR: $PINS_FILE does not set $v" >&2
         exit 1
@@ -259,7 +265,7 @@ extract_complete() { # dir tarball-name [paths...]
     shift 2
     if [ ! -f "$marker" ]; then
         extract "$archive" "$@"
-        : > "$marker"
+        : >"$marker"
     fi
 }
 
@@ -290,9 +296,9 @@ clone_module() { # dest repo ref
 }
 
 ### toolchain sanity ###################################################
-command -v cl > /dev/null 2>&1 || {
+command -v cl >/dev/null 2>&1 || {
     echo "ERROR: cl not on PATH — launch from the VS Native Tools" \
-         "prompt with MSYS2_PATH_TYPE=inherit (see header)" >&2
+        "prompt with MSYS2_PATH_TYPE=inherit (see header)" >&2
     exit 1
 }
 
@@ -300,15 +306,18 @@ command -v cl > /dev/null 2>&1 || {
 # its OS and emits paths cl cannot consume.
 PERL_BIN=
 for d in "${STRAWBERRY_PERL:-}" /c/Strawberry/perl/bin /c/strawberry/perl/bin; do
-    [ -n "$d" ] && [ -x "$d/perl.exe" ] && { PERL_BIN=$d; break; }
+    [ -n "$d" ] && [ -x "$d/perl.exe" ] && {
+        PERL_BIN=$d
+        break
+    }
 done
-if [ -z "$PERL_BIN" ] && command -v perl > /dev/null 2>&1 \
+if [ -z "$PERL_BIN" ] && command -v perl >/dev/null 2>&1 \
     && [ "$(perl -e 'print $^O')" = "MSWin32" ]; then
     PERL_BIN=$(dirname "$(command -v perl)")
 fi
 [ -n "$PERL_BIN" ] || {
     echo "ERROR: no native (Strawberry) perl found; install it or set" \
-         "STRAWBERRY_PERL=/c/path/to/perl/bin" >&2
+        "STRAWBERRY_PERL=/c/path/to/perl/bin" >&2
     exit 1
 }
 
@@ -356,15 +365,15 @@ if [ "$WITH_ZSTD" = 1 ] || [ "$WITH_COMPRESSION" = 1 ]; then
     clone_module nginx-zstd-module "$REPO_ZSTD_MODULE" "$REF_ZSTD_MODULE"
     if [ "$WITH_COMPRESSION" = 1 ] && [ ! -f nginx-zstd-module/compression/config ]; then
         echo "ERROR: REF_ZSTD_MODULE=$REF_ZSTD_MODULE has no compression/ --" \
-             "WITH_COMPRESSION=1 needs a ref whose tree carries it (see the" \
-             "header); set REPO_ZSTD_MODULE/REF_ZSTD_MODULE accordingly" >&2
+            "WITH_COMPRESSION=1 needs a ref whose tree carries it (see the" \
+            "header); set REPO_ZSTD_MODULE/REF_ZSTD_MODULE accordingly" >&2
         exit 1
     fi
 fi
 
-extract_complete "pcre2-$VER_PCRE2"     "pcre2-$VER_PCRE2.tar.gz"
+extract_complete "pcre2-$VER_PCRE2" "pcre2-$VER_PCRE2.tar.gz"
 extract_complete "openssl-$VER_OPENSSL" "openssl-$VER_OPENSSL.tar.gz"
-extract_complete "zlib-$VER_ZLIB"       "zlib-$VER_ZLIB.tar.gz"
+extract_complete "zlib-$VER_ZLIB" "zlib-$VER_ZLIB.tar.gz"
 
 cd "$DIR_PROJECT"
 
@@ -374,7 +383,7 @@ cd "$DIR_PROJECT"
 # pre-build below needs it on PATH.
 if [ ! -x "nasm-$VER_NASM/nasm" ] && [ ! -x "nasm-$VER_NASM/nasm.exe" ]; then
     extract_complete "nasm-$VER_NASM" "nasm-$VER_NASM.tar.gz"
-    ( cd "nasm-$VER_NASM" && ./configure > /dev/null && make -j"$(nproc)" )
+    (cd "nasm-$VER_NASM" && ./configure >/dev/null && make -j"$(nproc)")
 fi
 
 # libzstd, built static with the static CRT (nginx's cl build is /MT;
@@ -385,7 +394,7 @@ fi
 # every other tree; the build is guarded on its archive, so an aborted
 # cmake self-heals too.
 if [ "$BUILDLIB_ZSTD" = 1 ]; then
-    extract_complete "zstd-$VER_ZSTD" "zstd-$VER_ZSTD.tar.gz"         "zstd-$VER_ZSTD/lib" "zstd-$VER_ZSTD/build"
+    extract_complete "zstd-$VER_ZSTD" "zstd-$VER_ZSTD.tar.gz" "zstd-$VER_ZSTD/lib" "zstd-$VER_ZSTD/build"
     if [ ! -f "zstd-$VER_ZSTD/out/lib/zstd_static.lib" ]; then
         cmake -B "zstd-$VER_ZSTD/out" -S "zstd-$VER_ZSTD/build/cmake" \
             -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release \
@@ -415,21 +424,24 @@ cd "$DIR_NGINX"
 # then settles for portable SHA-256. Building it first, with the exact
 # Configure line nginx's makefile.msvc uses (same prefix, same options),
 # lets the probe find the installed headers and lets nmake skip its own
-# rule (see the touch before nmake). Guarded on an installed header, so
-# an aborted build self-heals.
+# rule (see the touch before nmake). Guarded on a completion marker written
+# only after install_sw succeeds: OpenSSL installs headers before libraries,
+# so an installed evp.h alone cannot prove an interrupted install completed.
 #
 # CRT: no-shared makes OpenSSL compile its static libraries with /MT /Zl
 # (Configurations/10-main.conf, lib_cflags; the generated makefile's
 # LIB_CFLAGS shows it), the same static CRT as nginx's cl build
 # (auto/cc/msvc, LIBC="-MT"). enable-static-vcruntime is consulted only
 # for shared builds and would change nothing here.
-if [ ! -f "objs/lib/openssl-$VER_OPENSSL/openssl/include/openssl/evp.h" ]; then
+OPENSSL_INSTALL_MARKER="objs/lib/openssl-$VER_OPENSSL/openssl/.install-complete"
+if [ ! -f "$OPENSSL_INSTALL_MARKER" ]; then
     # shellcheck disable=SC2086
-    ( cd "objs/lib/openssl-$VER_OPENSSL" \
-      && perl Configure VC-WIN64A $OPENSSL_OPT \
-             --prefix="$(cygpath -m "$PWD")/openssl" \
-             --openssldir="$(cygpath -m "$PWD")/openssl/ssl" \
-      && nmake && nmake install_sw )
+    (cd "objs/lib/openssl-$VER_OPENSSL" \
+        && perl Configure VC-WIN64A $OPENSSL_OPT \
+            --prefix="$(cygpath -m "$PWD")/openssl" \
+            --openssldir="$(cygpath -m "$PWD")/openssl/ssl" \
+        && nmake && nmake install_sw)
+    : >"$OPENSSL_INSTALL_MARKER"
 fi
 
 ### configure ##########################################################
@@ -497,18 +509,18 @@ if [ "$BUILDLIB_BROTLI" = 1 ]; then
     export BROTLI_LIB="$DIR_NGINX/objs/lib/ngx_brotli/deps/brotli/out"
 fi
 if [ "$WITH_COMPRESSION" = 1 ]; then
-    [ "$BUILDLIB_ZSTD" = 1 ]   || export NGX_HTTP_COMPRESSION_NO_ZSTD=1
+    [ "$BUILDLIB_ZSTD" = 1 ] || export NGX_HTTP_COMPRESSION_NO_ZSTD=1
     [ "$BUILDLIB_BROTLI" = 1 ] || export NGX_HTTP_COMPRESSION_NO_BROTLI=1
 fi
 
 [ "$WITH_HEADERS_MORE" = 1 ] \
-    && configure_args+=( --add-module=objs/lib/headers-more-nginx-module )
+    && configure_args+=(--add-module=objs/lib/headers-more-nginx-module)
 [ "$WITH_ZSTD" = 1 ] \
-    && configure_args+=( --add-module=objs/lib/nginx-zstd-module )
+    && configure_args+=(--add-module=objs/lib/nginx-zstd-module)
 [ "$WITH_BROTLI" = 1 ] \
-    && configure_args+=( --add-module=objs/lib/ngx_brotli )
+    && configure_args+=(--add-module=objs/lib/ngx_brotli)
 [ "$WITH_COMPRESSION" = 1 ] \
-    && configure_args+=( --add-module=objs/lib/nginx-zstd-module/compression )
+    && configure_args+=(--add-module=objs/lib/nginx-zstd-module/compression)
 
 ./configure "${configure_args[@]}"
 

@@ -252,6 +252,12 @@ jobs:
       - name: Build configuration policy regressions
         run: bash "$GITHUB_WORKSPACE"/ci/tools/test_build_config_policy.sh
 
+      - name: Windows build policy regressions
+        run: |
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_build_windows_zstd_default.sh
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_build_windows_inputs.sh
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_build_windows_openssl_recovery.sh
+
       - name: Frame-probe header seam regressions
         run: bash "$GITHUB_WORKSPACE"/ci/tools/test_probe_header_seam.sh
 
