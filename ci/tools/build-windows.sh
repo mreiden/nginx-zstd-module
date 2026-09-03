@@ -208,24 +208,32 @@ DIR_NGINX="$DIR_PROJECT/nginx-$VER_NGINX"
 DIR_DL="$DIR_PROJECT/dl"
 
 verify() { # url sha
-    local url=$1 sha=$2 file="$DIR_DL/${1##*/}" actual
-    # Downloaded beside the cache slot and renamed in only after curl
-    # exits clean, so an interrupted download leaves nothing a later run
-    # trusts (a half-tarball AT the slot would fail the digest on every
-    # run until deleted by hand).
-    if [ ! -f "$file" ]; then
-        curl -fsSL -o "$file.part" "$url"
-        mv "$file.part" "$file"
+    local url=$1 sha=$2 file="$DIR_DL/${1##*/}" src actual
+    # A download lands beside the cache slot and is promoted into it only
+    # once its digest matches, so neither an interrupted download nor a
+    # completed wrong one (a mirror serving other bytes) is ever something
+    # a later run trusts. A mismatching download stays as .part for a
+    # look; the next run downloads over it.
+    if [ -f "$file" ]; then
+        src=$file
+    else
+        src=$file.part
+        curl -fsSL -o "$src" "$url"
     fi
-    actual=$(sha256sum "$file" | cut -d' ' -f1)
+    actual=$(sha256sum "$src" | cut -d' ' -f1)
     if [ "$actual" != "$sha" ]; then
         echo "ERROR: sha256 mismatch for ${file##*/}" >&2
         echo "  expected  $sha" >&2
         echo "  actual    $actual" >&2
         echo "  source    $url" >&2
-        echo "  (stale pin? update SHA_*; bad download? delete $file and rerun)" >&2
+        if [ "$src" = "$file" ]; then
+            echo "  (stale pin? update SHA_*; bad cached file? delete $file and rerun)" >&2
+        else
+            echo "  (stale pin? update SHA_*; bad download? not cached, kept as ${src##*/})" >&2
+        fi
         exit 1
     fi
+    [ "$src" = "$file" ] || mv "$src" "$file"
     echo "verified ${file##*/}"
 }
 
