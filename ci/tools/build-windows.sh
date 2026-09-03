@@ -209,7 +209,14 @@ DIR_DL="$DIR_PROJECT/dl"
 
 verify() { # url sha
     local url=$1 sha=$2 file="$DIR_DL/${1##*/}" actual
-    [ -f "$file" ] || curl -fsSL -o "$file" "$url"
+    # Downloaded beside the cache slot and renamed in only after curl
+    # exits clean, so an interrupted download leaves nothing a later run
+    # trusts (a half-tarball AT the slot would fail the digest on every
+    # run until deleted by hand).
+    if [ ! -f "$file" ]; then
+        curl -fsSL -o "$file.part" "$url"
+        mv "$file.part" "$file"
+    fi
     actual=$(sha256sum "$file" | cut -d' ' -f1)
     if [ "$actual" != "$sha" ]; then
         echo "ERROR: sha256 mismatch for ${file##*/}" >&2
@@ -385,6 +392,12 @@ cd "$DIR_NGINX"
 # lets the probe find the installed headers and lets nmake skip its own
 # rule (see the touch before nmake). Guarded on an installed header, so
 # an aborted build self-heals.
+#
+# CRT: no-shared makes OpenSSL compile its static libraries with /MT /Zl
+# (Configurations/10-main.conf, lib_cflags; the generated makefile's
+# LIB_CFLAGS shows it), the same static CRT as nginx's cl build
+# (auto/cc/msvc, LIBC="-MT"). enable-static-vcruntime is consulted only
+# for shared builds and would change nothing here.
 if [ ! -f "objs/lib/openssl-$VER_OPENSSL/openssl/include/openssl/evp.h" ]; then
     # shellcheck disable=SC2086
     ( cd "objs/lib/openssl-$VER_OPENSSL" \
