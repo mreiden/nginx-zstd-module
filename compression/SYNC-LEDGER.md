@@ -299,7 +299,7 @@ mreiden/ngx_brotli commits.
 | 286 | portability + config probes | ✅ 95b6dfa (F10/F11/F12) | YES 6cbbe05 | EVP header probe replaces the blind auto/have (the grafted bug was verbatim in both); reorder sources filter/reorder-static.sh fail-closed (fork inlines the checks); F8 was already our shape; C89 hunks have no analog |
 | 287 | memoize malformed sidecar verdicts | ✅ 6e7d945 | ➖ N/A (validates no content) | cycle-owned in the static main conf, not file statics; deterministic verdicts only; TEST 44 = one SSI page including the malformed .zst three times (pipelined requests were not deterministic) |
 | 288 | (ours) #278 claims narrowed; CI seam guard | ✅ merged; script on tree via sync | ➖ | his #291 improved it: counts definitions, scans ci/, stages the real fixture-redirect drift |
-| 289 | (ours) no-transform detection header | 🔜 OPEN upstream — adopt on merge | 🔎 at handover | review serviced (seam extended to the family); coverage lives in test_encoding.py |
+| 289 | (ours) no-transform detection header | ✅ merged 709e49d; adopted 8e52294 | 🔎 at handover | our transplant deleted (inline-seg_end shape) for the parent's header; coverage lives in test_encoding.py upstream, 07-bypass here |
 | 290 | terminal observability | ◑ casts only (6e7d945) | ➖ | aborted flag N/A: done is set only on a successful FINISH (fork: ctx->success) |
 | 291 | ci: scan probe test consumers | ✅ via sync | ➖ | |
 | 292/293 | docs | ➖ docs | ➖ | |
@@ -310,4 +310,5 @@ mreiden/ngx_brotli commits.
 | 298–300, 302, 304, 305, 307 | CI sweeps, refPrefix cost bench, docs | ➖ N/A | ➖ | |
 | 301/308 | (ours) start without an http block | ✅ merged fe5db23; compression already passed | ➖ | binary gate test_no_http_block.sh |
 | 303 | static/dynamic order agreement; anchor match | ✅ 92fee0b padding, then the shared selector adopted (CodeRabbit on #117) | YES 6cbbe05 (fork stays standalone) | registration order is chain order REVERSED, so anchoring after the last compressor makes this filter run FIRST and supersede a co-built standalone zstd/brotli; auto/reorder.sh layers a zstd-filter anchor over his selector; tools/test_static_filter_order.sh pins five shapes |
-| 306 | harness pin "bump" to 9864052 | ⚠ NOT taken | ➖ | a rewind: 9864052 predates #235 (testkit main is linear); the gitlink is held forward at b4d8ca9 in 6730af6; repair = our #309 (OPEN) |
+| 306 | harness pin "bump" to 9864052 | ⚠ NOT taken | ➖ | a rewind: 9864052 predates #235 (testkit main is linear); the gitlink was held forward at b4d8ca9 in 6730af6; repaired upstream by our #309 (merged 93df1b2) — the next sync met it as a no-op |
+| 310 | (ours) ratio split header | ✅ merged 8fdd0b1; adopted 8e52294 | 🔎 at handover (fork keeps its verbatim copy) | our copy deleted; fixture includes the header, routing check bound to the handler body (the review's cardboard-lock finding); found and wired the parent's unwired #294 fixture; compression-side seam gate tools/test_shared_header_seam.sh |
