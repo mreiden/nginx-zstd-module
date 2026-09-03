@@ -188,8 +188,12 @@ for f in "${HARNESS_FILES[@]}"; do
 done
 
 # Every Windows pin is read (and so checked for presence) before any edit,
-# so a pins file missing one line fails here with nothing rewritten.
-WINDOWS_NAMES=(NGINX PCRE2 ZLIB OPENSSL ZSTD)
+# so a pins file missing one line fails here with nothing rewritten. nasm
+# is checked too: build-windows.sh requires all twelve keys, and a bump
+# that left the file unable to load would be worse than no bump. It has
+# no release feed, so it is not in the discovery above and is never
+# rewritten here.
+WINDOWS_NAMES=(NGINX PCRE2 ZLIB OPENSSL ZSTD NASM)
 declare -A CUR_WIN=()
 for name in "${WINDOWS_NAMES[@]}"; do
     CUR_WIN[$name]="$(pin_value "VER_$name")"
@@ -198,7 +202,7 @@ done
 
 echo "pinned: nginx stable=$CUR_STABLE angie=$CUR_ANGIE harness=$CUR_HARNESS" \
     "windows: nginx=${CUR_WIN[NGINX]} pcre2=${CUR_WIN[PCRE2]} zlib=${CUR_WIN[ZLIB]}" \
-    "openssl=${CUR_WIN[OPENSSL]} zstd=${CUR_WIN[ZSTD]}"
+    "openssl=${CUR_WIN[OPENSSL]} zstd=${CUR_WIN[ZSTD]} nasm=${CUR_WIN[NASM]}"
 
 CHANGED=0
 
@@ -307,24 +311,28 @@ is_newer() {
 # --- mutators -------------------------------------------------------------
 # Every mutator here writes to a temp file and renames it into place only
 # after the edit is confirmed to have actually matched something -- a no-op
-# replacement (stale path, drifted format) now FAILS LOUDLY instead of
-# silently leaving the source file untouched while the script reports success
-# (A30-F4). No partial edits: either the temp file replaces the original, or
-# the original is untouched and the script exits non-zero.
+# replacement (stale path, drifted format) FAILS LOUDLY instead of silently
+# leaving the file untouched while the script reports success (A30-F4).
+# The apply phase points them at STAGED COPIES of the tracked files (see
+# below), so a mutator failing part-way leaves every tracked file as it
+# was; messages name the tracked file, not the copy.
+STAGE=""
+tracked() { echo "${1#"$STAGE/"}"; }
+
 bump_matrix_pin() {
     local label="$1" old="$2" new="$3" tmp
     [ "$old" = "$new" ] && return 0
     tmp="$(mktemp)"
-    if ! python3 - "$label" "$old" "$new" "$MATRIX_FILE" "$tmp" <<'PYEOF'
+    if ! python3 - "$label" "$old" "$new" "$MATRIX_FILE" "$tmp" "$(tracked "$MATRIX_FILE")" <<'PYEOF'
 import re, sys
-label, old, new, path, out = sys.argv[1:6]
+label, old, new, path, out, shown = sys.argv[1:7]
 text = open(path).read()
 pattern = re.compile(
     r'(version:\s*"' + re.escape(old) + r'"\n\s*label:\s*' + re.escape(label) + r')'
 )
 replaced = pattern.sub(lambda m: m.group(1).replace(old, new), text)
 if replaced == text:
-    print(f"FATAL: no matrix entry matched for label={label} old={old} in {path}", file=sys.stderr)
+    print(f"FATAL: no matrix entry matched for label={label} old={old} in {shown}", file=sys.stderr)
     sys.exit(1)
 open(out, "w").write(replaced)
 PYEOF
@@ -340,7 +348,7 @@ _bump_sha256_pin() {
     local table="$1" old="$2" new="$3" digest="$4" tmp
     grep -q "\[\"${new}\"\]" "$CI_BUILD_SH" && return 0 # already pinned
     if ! grep -q "declare -A ${table}=(" "$CI_BUILD_SH"; then
-        echo "FATAL: no 'declare -A ${table}=(' table found in $CI_BUILD_SH -- refusing a no-op pin" >&2
+        echo "FATAL: no 'declare -A ${table}=(' table found in $(tracked "$CI_BUILD_SH") -- refusing a no-op pin" >&2
         exit 1
     fi
     tmp="$(mktemp)"
@@ -370,7 +378,7 @@ bump_harness_pin() { # FILE OLD NEW
     sed -E "s|^(  HARNESS_NGINX_VERSION: )\"${old//./\\.}\"\$|\\1\"${new}\"|" "$file" >"$tmp"
     if cmp -s "$tmp" "$file"; then
         rm -f "$tmp"
-        echo "FATAL: no '  HARNESS_NGINX_VERSION: \"${old}\"' line in $file -- refusing a no-op pin" >&2
+        echo "FATAL: no '  HARNESS_NGINX_VERSION: \"${old}\"' line in $(tracked "$file") -- refusing a no-op pin" >&2
         exit 1
     fi
     mv "$tmp" "$file"
@@ -384,7 +392,7 @@ bump_pins_line() { # KEY NEW
     sed -E "s|^${key}=.*\$|${key}=${new}|" "$PINS_FILE" >"$tmp"
     if cmp -s "$tmp" "$PINS_FILE"; then
         rm -f "$tmp"
-        echo "FATAL: ${key}=${new} changed nothing in $PINS_FILE -- refusing a no-op pin" >&2
+        echo "FATAL: ${key}=${new} changed nothing in $(tracked "$PINS_FILE") -- refusing a no-op pin" >&2
         exit 1
     fi
     mv "$tmp" "$PINS_FILE"
@@ -473,6 +481,23 @@ if [ "$DRY_RUN" = 1 ] || [ "$CHANGED" = 0 ]; then
 fi
 
 # --- apply: local edits only, every input already in hand ----------------
+# The mutators work on staged copies of the tracked files, installed
+# together at the end, so a mutator failing part-way (a drifted format in
+# the second file it reaches) leaves every tracked file as it was -- the
+# same guarantee the resolve phase gives for the network.
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+TRACKED=("$MATRIX_FILE" "$CI_BUILD_SH" "$PINS_FILE" "${HARNESS_FILES[@]}")
+for f in "${TRACKED[@]}"; do
+    mkdir -p "$STAGE/$(dirname "$f")"
+    cp "$f" "$STAGE/$f"
+done
+MATRIX_FILE="$STAGE/$MATRIX_FILE"
+CI_BUILD_SH="$STAGE/$CI_BUILD_SH"
+PINS_FILE="$STAGE/$PINS_FILE"
+for i in "${!HARNESS_FILES[@]}"; do
+    HARNESS_FILES[i]="$STAGE/${HARNESS_FILES[i]}"
+done
 
 if [ -n "$STABLE_DIGEST" ]; then
     bump_matrix_pin stable "$CUR_STABLE" "$NEW_STABLE"
@@ -498,6 +523,12 @@ for name in PCRE2 ZLIB OPENSSL ZSTD; do
     if [ -n "${LIB_DIGEST[$name]:-}" ]; then
         bump_windows_pin "$name" "${NEW_LIB[$name]}" "${LIB_DIGEST[$name]}"
     fi
+done
+
+# Every edit succeeded: install the staged copies (cp into the existing
+# file keeps its mode; ci-build.sh is executable).
+for f in "${TRACKED[@]}"; do
+    cmp -s "$STAGE/$f" "$f" || cp "$STAGE/$f" "$f"
 done
 
 echo "CHANGED=$CHANGED"

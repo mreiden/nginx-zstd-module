@@ -12,8 +12,10 @@
 # Windows build's sources (ci/tools/windows-pins.sh) were bumped by hand or
 # not at all. The cases below cover every pin the script rewrites, the
 # forward-only rule for release-API feeds, the fail-loud / no-partial-edit
-# rule for every mutator, and the resolve/apply split (every digest fetched
-# before any file is touched, so a dead mirror part-way edits nothing).
+# rule for every mutator, the resolve/apply split (every digest fetched
+# before any file is touched, so a dead mirror part-way edits nothing), and
+# the staged apply (mutators edit copies, installed together, so a mutator
+# failing on the second file leaves every tracked file unchanged).
 #
 # This test builds a scratch copy of the repo layout the script actually
 # needs (ci/tools/ci-build.sh, ci/tools/keys/*.key, ci/tools/windows-pins.sh,
@@ -305,6 +307,75 @@ elif ! grep -q 'could not fetch' "$SANDBOX/out.log"; then
     bad "transient: exited non-zero but did not name the failed fetch: $(cat "$SANDBOX/out.log")"
 else
     ok "transient: named the failed fetch, exited non-zero, no file edited"
+fi
+
+say "== case: missing nasm pin (not bumped, but required by build-windows.sh -- must FAIL before any edit) =="
+make_sandbox SANDBOX
+sed -i '/^SHA_NASM=/d' "$SANDBOX/ci/tools/windows-pins.sh"
+before_pins="$(cat "$SANDBOX/ci/tools/windows-pins.sh")"
+before_matrix="$(cat "$SANDBOX/.github/workflows/ci-deep.yml")"
+bindir="$(NEW_STABLE=1.30.5 stub_bin "$SANDBOX")"
+set +e
+(
+    cd "$SANDBOX"
+    PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    bad "missing-nasm: script exited 0 with SHA_NASM missing from windows-pins.sh"
+elif [ "$before_pins" != "$(cat "$SANDBOX/ci/tools/windows-pins.sh")" ]     || [ "$before_matrix" != "$(cat "$SANDBOX/.github/workflows/ci-deep.yml")" ]; then
+    bad "missing-nasm: a file was mutated before the missing pin was reported (partial edit)"
+elif ! grep -q 'does not set SHA_NASM' "$SANDBOX/out.log"; then
+    bad "missing-nasm: exited non-zero but did not name the missing pin: $(cat "$SANDBOX/out.log")"
+else
+    ok "missing-nasm: exited non-zero, named the missing pin, and edited nothing"
+fi
+
+say "== case: apply-phase failure on the SECOND file (must leave EVERY tracked file byte-for-byte unchanged) =="
+make_sandbox SANDBOX
+# The stable entry is well-formed, the angie entry is drifted: the stable
+# bump lands (on the staged copy), then the angie mutator fails. Before the
+# staged apply, ci-deep.yml and ci-build.sh already carried the stable bump.
+cat >"$SANDBOX/.github/workflows/ci-deep.yml" <<'EOF'
+env:
+  HARNESS_NGINX_VERSION: "1.31.4"
+jobs:
+  build-flavors:
+    strategy:
+      matrix:
+        include:
+          - version: "1.31.2"
+            label: mainline
+          - version: "1.30.4"
+            label: stable
+          - label: angie
+            version: "1.12.1"
+EOF
+declare -A before=()
+for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
+    before[$f]="$(cat "$SANDBOX/$f")"
+done
+bindir="$(NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0 stub_bin "$SANDBOX")"
+set +e
+(
+    cd "$SANDBOX"
+    PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+)
+rc=$?
+set -e
+changed=""
+for f in "${!before[@]}"; do
+    [ "${before[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+done
+if [ "$rc" -eq 0 ]; then
+    bad "apply-failure: script exited 0 despite the drifted angie entry"
+elif [ -n "$changed" ]; then
+    bad "apply-failure: tracked file(s) changed despite the failed mutator:$changed -- $(cat "$SANDBOX/out.log")"
+elif ! grep -q 'bump nginx stable: 1.30.4 -> 1.30.5' "$SANDBOX/out.log"     || ! grep -q 'no matrix entry matched' "$SANDBOX/out.log"; then
+    bad "apply-failure: unexpected log: $(cat "$SANDBOX/out.log")"
+else
+    ok "apply-failure: the stable bump was resolved, the angie mutator failed, every tracked file unchanged"
 fi
 
 say "== case: format-drift (matrix entry does not match -- must FAIL LOUDLY, no partial edit) =="
