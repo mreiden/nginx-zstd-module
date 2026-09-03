@@ -246,21 +246,18 @@ extract() { # tarball-name [paths...]
 }
 
 # Extract into DIR unless a completed extraction is already there. A killed
-# tar leaves a partial tree behind, and a directory-exists guard would then
-# skip re-extraction and fail later on missing files; the marker is written
-# only after tar exits clean. A tree from before the marker existed is
-# accepted when the archive's LAST member is present (tar writes members
-# in order) and stamped, so upgrading this script does not throw away a
-# built tree; anything else is removed and extracted again.
+# or failed tar leaves a partial tree behind, and a directory-exists guard
+# would then skip re-extraction and fail later on missing files. The
+# marker is written only after tar exits clean, and a tree without one is
+# extracted again IN PLACE: tar rewrites every selected member from the
+# archive, so the result is complete whatever was there, while what is
+# not an archive member (objs/, the OpenSSL pre-build, the module clones
+# under objs/lib) is kept. A tree from before the marker existed costs one
+# re-extraction, not a rebuild.
 extract_complete() { # dir tarball-name [paths...]
-    local dir=$1 archive=$2 marker="$1/.extracted" last
+    local archive=$2 marker="$1/.extracted"
     shift 2
-    if [ -d "$dir" ] && [ ! -f "$marker" ]; then
-        last=$(tar tzf "$DIR_DL/$archive" "$@" | tail -1)
-        [ -n "$last" ] && [ -e "$last" ] && : > "$marker"
-    fi
     if [ ! -f "$marker" ]; then
-        rm -rf "$dir"
         extract "$archive" "$@"
         : > "$marker"
     fi
