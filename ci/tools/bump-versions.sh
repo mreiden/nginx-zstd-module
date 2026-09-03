@@ -91,11 +91,32 @@ HARNESS_FILES=(".github/workflows/ci-deep.yml" ".github/workflows/harness-fault-
 NGINX_PAGE="$(curl -fsSL https://nginx.org/en/download.html)"
 
 nginx_section_version() { # "Mainline version" | "Stable version"
+    local section="$1" next tail
+    tail="${NGINX_PAGE#*"$section"}"
+    if [ "$tail" = "$NGINX_PAGE" ]; then
+        echo "FATAL: nginx.org/en/download.html has no \"$section\" section -- refusing to guess" >&2
+        return 1
+    fi
+    case "$section" in
+        "Mainline version") next="Stable version" ;;
+        "Stable version") next="Legacy version" ;;
+        *)
+            echo "FATAL: unsupported nginx section \"$section\"" >&2
+            return 1
+            ;;
+    esac
+    if [ "${tail#*"$next"}" = "$tail" ]; then
+        echo "FATAL: nginx.org/en/download.html has no \"$next\" boundary after \"$section\" -- refusing to guess" >&2
+        return 1
+    fi
+    # Do not borrow a tarball from the next section when this section is
+    # present but empty or its markup has drifted.
+    tail="${tail%%"$next"*}"
     # A section with no tarball link yields a blank, which the blank-version
     # check below reports by name (|| true: keep that message under -e).
-    echo "${NGINX_PAGE#*"$1"}" |
-        grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' | head -1 |
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
+    echo "$tail" \
+        | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' | head -1 \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
 }
 
 latest_nginx_stable() { nginx_section_version "Stable version"; }
@@ -108,9 +129,15 @@ gh_latest_tag() {
     # The runners share an egress IP, so the unauthenticated API allowance
     # (60/hr) is routinely exhausted and this call 403s. Send GH_TOKEN when
     # one is present -- authenticated requests get their own, far larger quota.
-    local -a auth=()
-    [ -n "${GH_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GH_TOKEN")
-    if ! json="$(curl -fsSL "${auth[@]}" "https://api.github.com/repos/${repo}/releases/latest")"; then
+    if [ -n "${GH_TOKEN:-}" ]; then
+        # Read the header from stdin so the token never appears in curl's
+        # process arguments on a shared runner.
+        json="$(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" \
+            | curl --config - -fsSL "https://api.github.com/repos/${repo}/releases/latest")" || json=""
+    else
+        json="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest")" || json=""
+    fi
+    if [ -z "$json" ]; then
         echo "error: could not query the ${repo} release API (rate limit? set GH_TOKEN)" >&2
         return 1
     fi
@@ -143,13 +170,18 @@ echo "latest: nginx stable=$NEW_STABLE mainline=$NEW_MAINLINE angie=$NEW_ANGIE" 
 
 # --- discover current pins ----------------------------------------------
 
-# Each matrix entry is "version:" immediately followed by "label:" (see
-# ci-deep.yml's build-flavors job) -- pair them up rather than assuming
-# ordering, so a future reordering of the matrix can't silently swap pins.
+# Read version and label from the same YAML list entry regardless of their
+# order. The mutator below deliberately remains format-strict so unexpected
+# layout drift fails before anything is installed.
 matrix_version_for_label() {
     awk -v want="$1" '
-        /version:/ { match($0, /"[0-9.]+"/); v = substr($0, RSTART+1, RLENGTH-2); next }
-        /label:/   { split($0, a, ":"); l = a[2]; gsub(/[ \t]/, "", l); if (l == want) { print v; exit } }
+        function emit() {
+            if (l == want && v != "") { print v; found = 1; exit }
+        }
+        /^[[:space:]]*-[[:space:]]/ { emit(); v = ""; l = "" }
+        /version:/ { match($0, /"[0-9.]+"/); v = substr($0, RSTART+1, RLENGTH-2) }
+        /label:/   { split($0, a, ":"); l = a[2]; gsub(/[ \t]/, "", l) }
+        END { if (!found) emit() }
     ' "$MATRIX_FILE"
 }
 
@@ -217,14 +249,17 @@ fetch_or_die() { # url out
     fi
 }
 
-sha256_for_url() {
+sha256_for_url() (
     local url="$1" tmp digest
+    cleanup_url_digest() {
+        [ -z "${tmp:-}" ] || rm -f -- "$tmp"
+    }
+    trap cleanup_url_digest EXIT
     tmp="$(mktemp)"
     fetch_or_die "$url" "$tmp"
     digest="$(sha256sum "$tmp" | awk '{print $1}')"
-    rm -f "$tmp"
     echo "$digest"
-}
+)
 
 sha256_for_angie() {
     sha256_for_url "https://download.angie.software/files/angie-${1}.tar.gz"
@@ -235,8 +270,14 @@ sha256_for_angie() {
 # we're about to pin -- a bump script that records a hash without checking
 # provenance first would just be moving the F3 trust gap here instead of
 # fixing it.
-sha256_for_nginx() {
+sha256_for_nginx() (
     local version="$1" url tmp digest gnupghome keyfiles
+    cleanup_nginx_verify() {
+        [ -z "${gnupghome:-}" ] || rm -rf "$gnupghome"
+        [ -z "${tmp:-}" ] || rm -f "$tmp" "${tmp}.asc"
+    }
+    trap cleanup_nginx_verify EXIT
+
     url="https://nginx.org/download/nginx-${version}.tar.gz"
     tmp="$(mktemp)"
     fetch_or_die "$url" "$tmp"
@@ -250,8 +291,6 @@ sha256_for_nginx() {
     keyfiles=("$KEYS_DIR"/*.key)
     shopt -u nullglob
     if [ "${#keyfiles[@]}" -eq 0 ]; then
-        rm -rf "$gnupghome" "$tmp" "${tmp}.asc"
-        unset GNUPGHOME
         echo "FATAL: no keyring found under $KEYS_DIR -- refusing to pin an unverified digest" >&2
         exit 1
     fi
@@ -259,18 +298,13 @@ sha256_for_nginx() {
         gpg --quiet --import "$keyfile" 2>/dev/null
     done
     if ! gpg --quiet --verify "${tmp}.asc" "$tmp" 2>/dev/null; then
-        rm -rf "$gnupghome" "$tmp" "${tmp}.asc"
-        unset GNUPGHOME
         echo "FATAL: PGP verification failed for nginx-${version}.tar.gz -- refusing to pin an unverified digest" >&2
         exit 1
     fi
-    rm -rf "$gnupghome"
-    unset GNUPGHOME
 
     digest="$(sha256sum "$tmp" | awk '{print $1}')"
-    rm -f "$tmp" "${tmp}.asc"
     echo "$digest"
-}
+)
 
 # The release tarball a Windows pin names -- the URL windows-build.yml
 # fetches (build-windows.sh uses the same, except zlib.net for zlib).
@@ -305,7 +339,31 @@ sha256_for_release() { # NAME VERSION
 
 # is_newer NEW CUR -- NEW sorts strictly above CUR as a version.
 is_newer() {
-    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]
+    local sorted
+
+    [ "$1" != "$2" ] || return 1
+    if ! sorted="$(printf '%s\n%s\n' "$1" "$2" | sort -V)"; then
+        echo "FATAL: could not compare versions $1 and $2" >&2
+        return 2
+    fi
+    [ "$(printf '%s\n' "$sorted" | tail -1)" = "$1" ]
+}
+
+# should_bump LABEL NEW CUR -- true only for a strict forward move. Equality
+# is quiet; an older feed value is reported as a hold; comparison failure is
+# propagated as a fatal status for the caller to distinguish from both.
+should_bump() {
+    local label="$1" new="$2" cur="$3" rc
+
+    [ "$new" != "$cur" ] || return 1
+    if is_newer "$new" "$cur"; then
+        return 0
+    else
+        rc=$?
+    fi
+    [ "$rc" -eq 1 ] || return "$rc"
+    echo "hold $label: release feed says $new, pinned $cur is newer -- not moving a pin backwards"
+    return 1
 }
 
 # --- mutators -------------------------------------------------------------
@@ -317,7 +375,8 @@ is_newer() {
 # below), so a mutator failing part-way leaves every tracked file as it
 # was; messages name the tracked file, not the copy.
 STAGE=""
-tracked() { echo "${1#"$STAGE/"}"; }
+UPDATES=""
+tracked() { echo "${1#"$UPDATES/"}"; }
 
 bump_matrix_pin() {
     local label="$1" old="$2" new="$3" tmp
@@ -419,39 +478,51 @@ WIN_NGINX_DIGEST=""
 BUMP_HARNESS=0
 declare -A LIB_DIGEST=()
 
-if [ "$NEW_STABLE" != "$CUR_STABLE" ]; then
+if should_bump "nginx stable" "$NEW_STABLE" "$CUR_STABLE"; then
     echo "bump nginx stable: $CUR_STABLE -> $NEW_STABLE"
     CHANGED=1
     if [ "$DRY_RUN" = 0 ]; then
         STABLE_DIGEST="$(sha256_for_nginx "$NEW_STABLE")"
         echo "  sha256 $STABLE_DIGEST"
     fi
+else
+    rc=$?
+    [ "$rc" -eq 1 ] || exit "$rc"
 fi
 
-if [ "$NEW_ANGIE" != "$CUR_ANGIE" ]; then
+if should_bump angie "$NEW_ANGIE" "$CUR_ANGIE"; then
     echo "bump angie: $CUR_ANGIE -> $NEW_ANGIE"
     CHANGED=1
     if [ "$DRY_RUN" = 0 ]; then
         ANGIE_DIGEST="$(sha256_for_angie "$NEW_ANGIE")"
         echo "  sha256 $ANGIE_DIGEST"
     fi
+else
+    rc=$?
+    [ "$rc" -eq 1 ] || exit "$rc"
 fi
 
 # The two static mainline pins are compared on their own, so a hand-bump of
 # one does not hide the other falling behind.
-if [ "$NEW_MAINLINE" != "${CUR_WIN[NGINX]}" ]; then
+if should_bump "windows nginx" "$NEW_MAINLINE" "${CUR_WIN[NGINX]}"; then
     echo "bump windows nginx: ${CUR_WIN[NGINX]} -> $NEW_MAINLINE"
     CHANGED=1
     if [ "$DRY_RUN" = 0 ]; then
         WIN_NGINX_DIGEST="$(sha256_for_nginx "$NEW_MAINLINE")"
         echo "  sha256 $WIN_NGINX_DIGEST"
     fi
+else
+    rc=$?
+    [ "$rc" -eq 1 ] || exit "$rc"
 fi
 
-if [ "$NEW_MAINLINE" != "$CUR_HARNESS" ]; then
+if should_bump "harness nginx" "$NEW_MAINLINE" "$CUR_HARNESS"; then
     echo "bump harness nginx: $CUR_HARNESS -> $NEW_MAINLINE"
     CHANGED=1
     BUMP_HARNESS=1
+else
+    rc=$?
+    [ "$rc" -eq 1 ] || exit "$rc"
 fi
 
 declare -A NEW_LIB=([PCRE2]="$NEW_PCRE2" [ZLIB]="$NEW_ZLIB" [OPENSSL]="$NEW_OPENSSL" [ZSTD]="$NEW_ZSTD")
@@ -459,8 +530,11 @@ for name in PCRE2 ZLIB OPENSSL ZSTD; do
     new="${NEW_LIB[$name]}"
     cur="${CUR_WIN[$name]}"
     [ "$new" = "$cur" ] && continue
-    if ! is_newer "$new" "$cur"; then
-        echo "hold windows ${name,,}: release feed says $new, pinned $cur is newer -- not moving a pin backwards"
+    if should_bump "windows ${name,,}" "$new" "$cur"; then
+        :
+    else
+        rc=$?
+        [ "$rc" -eq 1 ] || exit "$rc"
         continue
     fi
     echo "bump windows ${name,,}: $cur -> $new"
@@ -486,17 +560,57 @@ fi
 # the second file it reaches) leaves every tracked file as it was -- the
 # same guarantee the resolve phase gives for the network.
 STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
-TRACKED=("$MATRIX_FILE" "$CI_BUILD_SH" "$PINS_FILE" "${HARNESS_FILES[@]}")
-for f in "${TRACKED[@]}"; do
-    mkdir -p "$STAGE/$(dirname "$f")"
-    cp "$f" "$STAGE/$f"
+ORIGINALS="$STAGE/originals"
+UPDATES="$STAGE/updates"
+INSTALLING=0
+INSTALL_TEMP=""
+INSTALLED=()
+cleanup_stage() {
+    local rc=$? f rollback_tmp rollback_failed=0 i
+    trap - EXIT INT TERM
+    if [ "$INSTALLING" -eq 1 ] && [ "$rc" -ne 0 ]; then
+        for ((i = ${#INSTALLED[@]} - 1; i >= 0; i--)); do
+            f="${INSTALLED[i]}"
+            rollback_tmp="$(mktemp "$(dirname "$f")/.bump-rollback.XXXXXX")" || {
+                rollback_failed=1
+                continue
+            }
+            if ! cp -p "$ORIGINALS/$f" "$rollback_tmp" || ! mv -f "$rollback_tmp" "$f"; then
+                rm -f -- "$rollback_tmp"
+                rollback_failed=1
+            fi
+        done
+        [ "$rollback_failed" -eq 0 ] || echo "FATAL: rollback could not restore every tracked file" >&2
+    fi
+    [ -z "$INSTALL_TEMP" ] || rm -f -- "$INSTALL_TEMP"
+    rm -rf -- "$STAGE"
+    [ "$rollback_failed" -eq 0 ] || rc=1
+    exit "$rc"
+}
+trap cleanup_stage EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ci-deep.yml is both the matrix and a harness workflow. Keep one copy in
+# the transaction so each tracked path is installed and rolled back once.
+TRACKED=()
+declare -A TRACKED_SEEN=()
+for f in "$MATRIX_FILE" "$CI_BUILD_SH" "$PINS_FILE" "${HARNESS_FILES[@]}"; do
+    if [ -z "${TRACKED_SEEN[$f]:-}" ]; then
+        TRACKED+=("$f")
+        TRACKED_SEEN[$f]=1
+    fi
 done
-MATRIX_FILE="$STAGE/$MATRIX_FILE"
-CI_BUILD_SH="$STAGE/$CI_BUILD_SH"
-PINS_FILE="$STAGE/$PINS_FILE"
+for f in "${TRACKED[@]}"; do
+    mkdir -p "$ORIGINALS/$(dirname "$f")" "$UPDATES/$(dirname "$f")"
+    cp -p "$f" "$ORIGINALS/$f"
+    cp -p "$f" "$UPDATES/$f"
+done
+MATRIX_FILE="$UPDATES/$MATRIX_FILE"
+CI_BUILD_SH="$UPDATES/$CI_BUILD_SH"
+PINS_FILE="$UPDATES/$PINS_FILE"
 for i in "${!HARNESS_FILES[@]}"; do
-    HARNESS_FILES[i]="$STAGE/${HARNESS_FILES[i]}"
+    HARNESS_FILES[i]="$UPDATES/${HARNESS_FILES[i]}"
 done
 
 if [ -n "$STABLE_DIGEST" ]; then
@@ -525,10 +639,28 @@ for name in PCRE2 ZLIB OPENSSL ZSTD; do
     fi
 done
 
-# Every edit succeeded: install the staged copies (cp into the existing
-# file keeps its mode; ci-build.sh is executable).
+# Every edit succeeded. Replace each changed file atomically and roll back
+# earlier replacements if a later install fails or the process is interrupted.
+INSTALLING=1
+INSTALL_COUNT=0
 for f in "${TRACKED[@]}"; do
-    cmp -s "$STAGE/$f" "$f" || cp "$STAGE/$f" "$f"
+    cmp -s "$UPDATES/$f" "$f" && continue
+    INSTALL_COUNT=$((INSTALL_COUNT + 1))
+    INSTALL_TEMP="$(mktemp "$(dirname "$f")/.bump-install.XXXXXX")"
+    cp -p "$UPDATES/$f" "$INSTALL_TEMP"
+    if [ "${BUMP_VERSIONS_TEST_FAIL_INSTALL_AT:-}" = "$INSTALL_COUNT" ]; then
+        echo "FATAL: injected install failure at changed file $INSTALL_COUNT" >&2
+        false
+    fi
+    # Register before mv so a signal in the tiny post-rename window still
+    # restores this path. Restoring an unchanged path if mv itself fails is safe.
+    INSTALLED+=("$f")
+    mv -f "$INSTALL_TEMP" "$f"
+    INSTALL_TEMP=""
+    if [ "${BUMP_VERSIONS_TEST_INTERRUPT_INSTALL_AT:-}" = "$INSTALL_COUNT" ]; then
+        kill -TERM "$$"
+    fi
 done
+INSTALLING=0
 
 echo "CHANGED=$CHANGED"

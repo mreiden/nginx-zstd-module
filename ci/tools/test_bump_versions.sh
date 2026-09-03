@@ -31,6 +31,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUMP_SCRIPT="$REPO_ROOT/ci/tools/bump-versions.sh"
 
 fail=0
+SANDBOXES=()
+cleanup_sandboxes() {
+    local dir
+    for dir in "${SANDBOXES[@]}"; do
+        rm -rf -- "$dir"
+    done
+}
+trap cleanup_sandboxes EXIT
 say() { printf '%s\n' "$*"; }
 ok() { printf 'OK: %s\n' "$*"; }
 bad() {
@@ -54,7 +62,8 @@ make_sandbox() {
     # shellcheck disable=SC2034  # nameref out-parameter, assigned for the caller
     local -n out="$1"
     local dir
-    dir="$(mktemp -d)"
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/http-zstd-bump-test.XXXXXX")"
+    SANDBOXES+=("$dir")
     mkdir -p "$dir/ci/tools/keys" "$dir/.github/workflows"
     cat >"$dir/ci/tools/keys/dummy.key" <<'EOF'
 dummy keyring placeholder
@@ -122,13 +131,18 @@ stub_bin() {
     cat >"$bindir/curl" <<EOF
 #!/bin/bash
 # Fake nginx.org download page / GitHub release APIs / tarball fetch.
+[ -z "\${CURL_ARGV_LOG:-}" ] || printf '%s\n' "\$@" >>"\$CURL_ARGV_LOG"
 url=""
 out=""
 prev=""
 fail_url="${FAIL_URL:-}"
+omit_stable_heading="${OMIT_STABLE_HEADING:-0}"
+omit_stable_tarball="${OMIT_STABLE_TARBALL:-0}"
+omit_legacy_heading="${OMIT_LEGACY_HEADING:-0}"
 for a in "\$@"; do
     case "\$a" in http*) url="\$a" ;; esac
     [ "\$prev" = "-o" ] && out="\$a"
+    [ "\$prev" = "--config" ] && [ "\$a" = "-" ] && cat >>"\${CURL_HEADER_LOG:-/dev/null}"
     prev="\$a"
 done
 if [ -n "\$fail_url" ]; then
@@ -136,7 +150,15 @@ if [ -n "\$fail_url" ]; then
 fi
 case "\$url" in
     *nginx.org/en/download.html*)
-        echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionnginx-${NEW_STABLE:-$CUR_STABLE}.tar.gz"
+        if [ "\$omit_stable_heading" = 1 ]; then
+            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gz nginx-${NEW_STABLE:-$CUR_STABLE}.tar.gz"
+        elif [ "\$omit_stable_tarball" = 1 ]; then
+            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionLegacy versionnginx-1.28.0.tar.gz"
+        elif [ "\$omit_legacy_heading" = 1 ]; then
+            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionLegacy nginx-1.28.0.tar.gz"
+        else
+            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionnginx-${NEW_STABLE:-$CUR_STABLE}.tar.gzLegacy versionnginx-1.28.0.tar.gz"
+        fi
         exit 0 ;;
     *api.github.com/repos/webserver-llc/angie/releases/latest*)
         echo "{\"tag_name\": \"${NEW_ANGIE:-$CUR_ANGIE}\"}"
@@ -166,6 +188,13 @@ EOF
 exit 0
 EOF
     chmod +x "$bindir/curl" "$bindir/gpg"
+    if [ "${FAIL_SORT:-0}" = 1 ]; then
+        cat >"$bindir/sort" <<'EOF'
+#!/bin/sh
+exit 42
+EOF
+        chmod +x "$bindir/sort"
+    fi
     echo "$bindir"
 }
 
@@ -293,13 +322,39 @@ else
     bad "backwards: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
 fi
 
+say "== case: every nginx/Angie feed behind its pin (all must hold) =="
+if run_case backwards-webservers NEW_STABLE=1.30.3 NEW_ANGIE=1.11.0 NEW_MAINLINE=1.31.3; then
+    if grep -q 'CHANGED=0' "$SANDBOX/out.log" \
+        && [ "$(grep -c 'not moving a pin backwards' "$SANDBOX/out.log")" -eq 4 ] \
+        && grep -q 'version: "1.30.4"' "$SANDBOX/.github/workflows/ci-deep.yml" \
+        && grep -q 'version: "1.12.1"' "$SANDBOX/.github/workflows/ci-deep.yml" \
+        && [ "$(pins_line VER_NGINX)" = "VER_NGINX=1.31.4" ] \
+        && [ "$(harness_line 1.31.4 ci-deep.yml)" = 1 ] \
+        && [ "$(harness_line 1.31.4 harness-fault-arms.yml)" = 1 ]; then
+        ok "backwards webservers: all four pins held without edits"
+    else
+        bad "backwards webservers: unexpected result: $(cat "$SANDBOX/out.log")"
+    fi
+else
+    bad "backwards webservers: script exited non-zero: $(cat "$SANDBOX/out.log")"
+fi
+
+say "== case: version comparator failure is fatal, never a backwards hold =="
+if run_case comparator-failure NEW_ANGIE=1.11.0 FAIL_SORT=1; then
+    bad "comparator-failure: updater exited 0 after sort -V failed"
+elif ! grep -q 'FATAL: could not compare versions' "$SANDBOX/out.log"; then
+    bad "comparator-failure: missing fatal diagnostic: $(cat "$SANDBOX/out.log")"
+else
+    ok "comparator-failure: failed closed with a fatal diagnostic"
+fi
+
 say "== case: transient fetch failure part-way (must edit NOTHING: every digest is fetched before any file is touched) =="
 # Stable resolves first and its tarball fetch succeeds; the angie tarball
 # fetch then fails. Before the resolve/apply split, the stable matrix and
 # digest edits had already landed by then, leaving a half-bumped tree.
 if run_case transient NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0 FAIL_URL=angie-1.13.0.tar.gz; then
     bad "transient: script exited 0 despite a failed tarball fetch"
-elif grep -q '1.30.5' "$SANDBOX/.github/workflows/ci-deep.yml"     || grep -q '1.30.5' "$SANDBOX/ci/tools/ci-build.sh"; then
+elif grep -q '1.30.5' "$SANDBOX/.github/workflows/ci-deep.yml" || grep -q '1.30.5' "$SANDBOX/ci/tools/ci-build.sh"; then
     bad "transient: the stable bump was written before the angie fetch failed (partial edit): $(cat "$SANDBOX/out.log")"
 elif ! grep -q 'bump nginx stable: 1.30.4 -> 1.30.5' "$SANDBOX/out.log"; then
     bad "transient: the stable bump was not even resolved: $(cat "$SANDBOX/out.log")"
@@ -324,7 +379,7 @@ rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
     bad "missing-nasm: script exited 0 with SHA_NASM missing from windows-pins.sh"
-elif [ "$before_pins" != "$(cat "$SANDBOX/ci/tools/windows-pins.sh")" ]     || [ "$before_matrix" != "$(cat "$SANDBOX/.github/workflows/ci-deep.yml")" ]; then
+elif [ "$before_pins" != "$(cat "$SANDBOX/ci/tools/windows-pins.sh")" ] || [ "$before_matrix" != "$(cat "$SANDBOX/.github/workflows/ci-deep.yml")" ]; then
     bad "missing-nasm: a file was mutated before the missing pin was reported (partial edit)"
 elif ! grep -q 'does not set SHA_NASM' "$SANDBOX/out.log"; then
     bad "missing-nasm: exited non-zero but did not name the missing pin: $(cat "$SANDBOX/out.log")"
@@ -372,10 +427,176 @@ if [ "$rc" -eq 0 ]; then
     bad "apply-failure: script exited 0 despite the drifted angie entry"
 elif [ -n "$changed" ]; then
     bad "apply-failure: tracked file(s) changed despite the failed mutator:$changed -- $(cat "$SANDBOX/out.log")"
-elif ! grep -q 'bump nginx stable: 1.30.4 -> 1.30.5' "$SANDBOX/out.log"     || ! grep -q 'no matrix entry matched' "$SANDBOX/out.log"; then
+elif ! grep -q 'bump nginx stable: 1.30.4 -> 1.30.5' "$SANDBOX/out.log" || ! grep -q 'no matrix entry matched' "$SANDBOX/out.log"; then
     bad "apply-failure: unexpected log: $(cat "$SANDBOX/out.log")"
+elif ! grep -Fq -- '.github/workflows/ci-deep.yml' "$SANDBOX/out.log" || grep -Fq -- 'updates/.github/workflows/ci-deep.yml' "$SANDBOX/out.log"; then
+    bad "apply-failure: diagnostic did not name the tracked repository path: $(cat "$SANDBOX/out.log")"
 else
     ok "apply-failure: the stable bump was resolved, the angie mutator failed, every tracked file unchanged"
+fi
+
+say "== case: authenticated release queries keep the token out of curl argv =="
+make_sandbox SANDBOX
+bindir="$(stub_bin "$SANDBOX")"
+argv_log="$SANDBOX/curl.argv"
+header_log="$SANDBOX/curl.header"
+token='test-token-not-for-output'
+if (
+    cd "$SANDBOX"
+    GH_TOKEN="$token" CURL_ARGV_LOG="$argv_log" CURL_HEADER_LOG="$header_log" \
+        PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+); then
+    if grep -Fq "$token" "$argv_log"; then
+        bad "token-argv: the GitHub token appeared in curl arguments"
+    elif ! grep -Fxq -- '--config' "$argv_log" || ! grep -Fxq -- '-' "$argv_log"; then
+        bad "token-argv: authenticated queries did not use stdin config: $(cat "$argv_log")"
+    elif ! grep -Fqx "header = \"Authorization: Bearer $token\"" "$header_log"; then
+        bad "token-argv: the stdin header did not carry the bearer token"
+    else
+        ok "token-argv: authenticated header used stdin, carried the token, and kept argv clean"
+    fi
+else
+    bad "token-argv: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
+fi
+
+say "== case: missing stable section heading fails closed without edits =="
+make_sandbox SANDBOX
+declare -A before_heading=()
+for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
+    before_heading[$f]="$(cat "$SANDBOX/$f")"
+done
+bindir="$(OMIT_STABLE_HEADING=1 stub_bin "$SANDBOX")"
+set +e
+(
+    cd "$SANDBOX"
+    PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+)
+rc=$?
+set -e
+changed=""
+for f in "${!before_heading[@]}"; do
+    [ "${before_heading[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+done
+if [ "$rc" -eq 0 ]; then
+    bad "missing-heading: script exited 0 after the stable heading disappeared"
+elif [ -n "$changed" ]; then
+    bad "missing-heading: tracked file(s) changed despite the parse failure:$changed"
+elif ! grep -Fq 'has no "Stable version" section -- refusing to guess' "$SANDBOX/out.log"; then
+    bad "missing-heading: unexpected log: $(cat "$SANDBOX/out.log")"
+else
+    ok "missing-heading: failed closed, named the missing section, and edited nothing"
+fi
+
+say "== case: stable section without a tarball cannot borrow the legacy release =="
+make_sandbox SANDBOX
+declare -A before_empty_section=()
+for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
+    before_empty_section[$f]="$(cat "$SANDBOX/$f")"
+done
+bindir="$(OMIT_STABLE_TARBALL=1 stub_bin "$SANDBOX")"
+set +e
+(
+    cd "$SANDBOX"
+    PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+)
+rc=$?
+set -e
+changed=""
+for f in "${!before_empty_section[@]}"; do
+    [ "${before_empty_section[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+done
+if [ "$rc" -eq 0 ]; then
+    bad "empty-section: script exited 0 after the stable tarball disappeared"
+elif [ -n "$changed" ]; then
+    bad "empty-section: tracked file(s) changed despite the parse failure:$changed"
+elif ! grep -Fq 'could not determine NEW_STABLE' "$SANDBOX/out.log"; then
+    bad "empty-section: unexpected log: $(cat "$SANDBOX/out.log")"
+else
+    ok "empty-section: failed closed instead of borrowing the legacy tarball"
+fi
+
+say "== case: missing next-section boundary cannot expose a later tarball =="
+make_sandbox SANDBOX
+declare -A before_missing_boundary=()
+for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
+    before_missing_boundary[$f]="$(cat "$SANDBOX/$f")"
+done
+bindir="$(OMIT_LEGACY_HEADING=1 stub_bin "$SANDBOX")"
+set +e
+(
+    cd "$SANDBOX"
+    PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+)
+rc=$?
+set -e
+changed=""
+for f in "${!before_missing_boundary[@]}"; do
+    [ "${before_missing_boundary[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+done
+if [ "$rc" -eq 0 ]; then
+    bad "missing-boundary: script exited 0 after the legacy heading disappeared"
+elif [ -n "$changed" ]; then
+    bad "missing-boundary: tracked file(s) changed despite the parse failure:$changed"
+elif ! grep -Fq 'has no "Legacy version" boundary after "Stable version"' "$SANDBOX/out.log"; then
+    bad "missing-boundary: unexpected log: $(cat "$SANDBOX/out.log")"
+else
+    ok "missing-boundary: failed closed instead of exposing a later tarball"
+fi
+
+say "== case: install failure on the SECOND changed file rolls back the first =="
+make_sandbox SANDBOX
+declare -A before_install=()
+for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
+    before_install[$f]="$(cat "$SANDBOX/$f")"
+done
+bindir="$(NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0 stub_bin "$SANDBOX")"
+set +e
+(
+    cd "$SANDBOX"
+    BUMP_VERSIONS_TEST_FAIL_INSTALL_AT=2 PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+)
+rc=$?
+set -e
+changed=""
+for f in "${!before_install[@]}"; do
+    [ "${before_install[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+done
+if [ "$rc" -eq 0 ]; then
+    bad "install-failure: script exited 0 despite the injected failure"
+elif [ -n "$changed" ]; then
+    bad "install-failure: tracked file(s) changed despite rollback:$changed"
+elif ! grep -q 'injected install failure at changed file 2' "$SANDBOX/out.log"; then
+    bad "install-failure: unexpected log: $(cat "$SANDBOX/out.log")"
+else
+    ok "install-failure: every tracked file remained byte-identical"
+fi
+
+say "== case: interruption after the FIRST replacement rolls it back =="
+make_sandbox SANDBOX
+declare -A before_interrupt=()
+for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
+    before_interrupt[$f]="$(cat "$SANDBOX/$f")"
+done
+bindir="$(NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0 stub_bin "$SANDBOX")"
+set +e
+(
+    cd "$SANDBOX"
+    BUMP_VERSIONS_TEST_INTERRUPT_INSTALL_AT=1 PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+)
+rc=$?
+set -e
+changed=""
+for f in "${!before_interrupt[@]}"; do
+    [ "${before_interrupt[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+done
+if [ "$rc" -eq 0 ]; then
+    bad "install-interrupt: script exited 0 despite the injected TERM"
+elif [ -n "$changed" ]; then
+    bad "install-interrupt: tracked file(s) changed despite rollback:$changed"
+elif [ "$rc" -ne 143 ]; then
+    bad "install-interrupt: expected status 143, got $rc: $(cat "$SANDBOX/out.log")"
+else
+    ok "install-interrupt: the replaced file was restored byte-identically"
 fi
 
 say "== case: format-drift (matrix entry does not match -- must FAIL LOUDLY, no partial edit) =="
