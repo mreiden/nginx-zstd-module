@@ -273,6 +273,9 @@ jobs:
       - name: coverage.sh stale-prober rebuild guard regression (A30-F7)
         run: bash "$GITHUB_WORKSPACE"/ci/tools/test_coverage_prober_rebuild.sh
 
+      - name: bump-versions.sh pin-coverage and fail-loud regressions (A30-F4)
+        run: bash "$GITHUB_WORKSPACE"/ci/tools/test_bump_versions.sh
+
       - name: Shell script linting (shellcheck)
         run: |
           # Gate on error-severity findings (real bugs); style/info noise does

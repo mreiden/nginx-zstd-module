@@ -1,12 +1,15 @@
 # ci/tools/windows-pins.sh -- the pinned sources of the Windows build.
 #
 # THE one place the Windows build's versions and SHA-256 digests live.
-# ci/tools/build-windows.sh sources this file and refuses to run without
-# it; a version bump edits this file and nothing else. Plain KEY=value
-# lines only -- no quoting, no expansion, no logic -- so any consumer
-# (a workflow step, a bump script, a human) can read it as data.
+# ci/tools/build-windows.sh sources this file (and refuses to run without
+# it) and .github/workflows/windows-build.yml reads it into each job's
+# environment; a version bump edits this file and nothing else. Plain
+# KEY=value lines only -- no quoting, no expansion, no logic -- so any
+# consumer (a workflow step, a bump script, a human) can read it as data.
 #
-# Bumping: set VER_X, then SHA_X to the tarball's sha256 (the build
+# Bumping: the weekly Bump workflow (ci/tools/bump-versions.sh) rewrites
+# these lines for every source but nasm, which has no release feed to
+# query. By hand: set VER_X, then SHA_X to the tarball's sha256 (the build
 # script prints the actual digest on a mismatch, so a stale digest is a
 # copy-paste away from fixed). nginx tarballs also carry a detached PGP
 # signature -- verify it with ci/tools/verify-nginx-tarball.sh before
