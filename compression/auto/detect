@@ -358,7 +358,14 @@ if [ "${NGX_HTTP_COMPRESSION_NO_LIBCRYPTO:-0}" != 1 ]; then
         ngx_feature_incs="#include <openssl/evp.h>"
         ngx_feature_path="$CORE_INCS"
         if [ -n "${OPENSSL:-}" ]; then
-            ngx_feature_path="$ngx_feature_path $OPENSSL/.openssl/include"
+            # A prepared --with-openssl source tree keeps its installed
+            # headers under .openssl/ (auto/lib/openssl/make) on Unix and
+            # under openssl/ (makefile.msvc's --prefix) on MSVC. Named
+            # explicitly because configure runs addon configs
+            # (auto/modules) BEFORE auto/lib/conf appends either directory
+            # to CORE_INCS, so at probe time CORE_INCS does not carry it
+            # yet -- on MSVC the probe could never succeed without this.
+            ngx_feature_path="$ngx_feature_path $OPENSSL/.openssl/include $OPENSSL/openssl/include"
         fi
         ngx_feature_test="unsigned char  md[EVP_MAX_MD_SIZE];
                           unsigned int   n;
