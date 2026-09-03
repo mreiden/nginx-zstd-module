@@ -14,6 +14,15 @@
 #include "ngx_http_compression_ae.h"
 #include "ngx_http_compression_dict.h"
 
+/*
+ * The parent's authoritative copies (#270 series): the Cache-Control
+ * no-transform detection and the $ratio split. This module used to
+ * carry a synchronized transplant of each; #251/#274 and then #294
+ * were each hand-mirrored into it within days of merging upstream.
+ */
+#include "../src/ngx_http_zstd_cache_control.h"
+#include "../src/ngx_http_zstd_ratio.h"
+
 
 #if (NGX_HTTP_COMPRESSION_HAVE_ZSTD)
 extern ngx_http_compression_backend_t  *ngx_http_compression_backend_zstd;
@@ -135,9 +144,6 @@ static ngx_int_t ngx_http_compression_ratio_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *vv, uintptr_t data);
 static ngx_int_t ngx_http_compression_bytes_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *vv, uintptr_t data);
-static ngx_int_t ngx_http_compression_cc_value_no_transform(
-    ngx_table_elt_t *cc);
-static ngx_int_t ngx_http_compression_no_transform(ngx_http_request_t *r);
 static ngx_int_t ngx_http_compression_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_compression_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
@@ -1238,87 +1244,11 @@ ngx_http_compression_window_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
-/*
- * Split bytes_in/bytes_out into an integer part and a three-decimal
- * fractional part (*ratio_int, *ratio_frac) without ever overflowing
- * uint64_t (parent #294). bytes_in is a running total of streamed input
- * and bytes_out a running total of compressed output; either can
- * approach UINT64_MAX on a long-lived connection, and bytes_out may
- * exceed bytes_in whenever the encoder expands incompressible input.
- *
- * Neither obvious form is safe. `bytes_in * 1000 / bytes_out` wraps in
- * the multiply. Dividing first and scaling only the remainder still
- * wraps when bytes_out > bytes_in, because the remainder is then
- * bytes_in itself: for bytes_in = UINT64_MAX - 1, bytes_out = UINT64_MAX
- * it reports 0.000 instead of 0.999.
- *
- * Extract the three fractional digits by exact long division instead.
- * Per digit the remainder (always < divisor) is multiplied by 10, which
- * is the only growth step. When that product would not fit, peel off
- * whole multiples of the divisor from remainder * 10 one addition at a
- * time so nothing leaves uint64_t -- no value is ever approximated, so
- * the result matches an exact 128-bit bytes_in * 1000 / bytes_out for
- * every input pair. tools/test_ratio_scaling_unit.sh extracts this
- * function verbatim and checks it against that 128-bit oracle.
- */
-static void
-ngx_http_compression_ratio_parts(uint64_t bytes_in, uint64_t bytes_out,
-    ngx_uint_t *ratio_int, ngx_uint_t *ratio_frac)
-{
-    uint64_t  remainder, frac;
-    int       i;
-
-    *ratio_int = (ngx_uint_t) (bytes_in / bytes_out);
-
-    remainder = bytes_in % bytes_out;
-    frac      = 0;
-
-    for (i = 0; i < 3; i++) {
-
-        if (remainder <= UINT64_MAX / 10) {
-            remainder *= 10;
-            frac       = frac * 10 + remainder / bytes_out;
-            remainder %= bytes_out;
-            continue;
-        }
-
-        /*
-         * remainder * 10 would overflow. Since remainder < bytes_out, that
-         * only happens for a very large divisor; then remainder * 10 is at
-         * most 10 * bytes_out, so the quotient digit is in [0, 10) and can
-         * be found exactly without forming the product: peel off whole
-         * multiples of bytes_out from remainder * 10 one at a time, each
-         * step staying inside uint64_t.
-         */
-        {
-            uint64_t  acc = remainder;
-            uint64_t  digit = 0;
-            int       k;
-
-            /* acc accumulates remainder * 10 modulo bytes_out. */
-            for (k = 0; k < 9; k++) {
-                acc += remainder;
-
-                if (acc >= bytes_out || acc < remainder) {
-                    /* wrapped past, or reached, one whole bytes_out */
-                    acc -= bytes_out;
-                    digit++;
-                }
-            }
-
-            frac      = frac * 10 + digit;
-            remainder = acc;
-        }
-    }
-
-    *ratio_frac = (ngx_uint_t) frac;
-}
-
 
 /*
  * $compression_ratio: bytes_in/bytes_out with three decimals through the
- * overflow-safe split above. Meaningful only after FINISH — a log-phase
- * variable.
+ * parent's shared overflow-safe split (../src/ngx_http_zstd_ratio.h).
+ * Meaningful only after FINISH — a log-phase variable.
  */
 static ngx_int_t
 ngx_http_compression_ratio_variable(ngx_http_request_t *r,
@@ -1343,7 +1273,7 @@ ngx_http_compression_ratio_variable(ngx_http_request_t *r,
         return NGX_ERROR;
     }
 
-    ngx_http_compression_ratio_parts(ctx->bytes_in, ctx->bytes_out,
+    ngx_http_zstd_ratio_parts(ctx->bytes_in, ctx->bytes_out,
                                      &ratio_int, &ratio_frac);
 
     vv->len = ngx_sprintf(vv->data, "%ui.%03ui", ratio_int, ratio_frac)
@@ -1890,132 +1820,6 @@ ngx_http_compression_order(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
-/*
- * Does one Cache-Control value carry a no-transform DIRECTIVE (RFC 9111
- * §5.2.2.6)? Directives are comma-separated; everything from the first
- * ';' or '=' onward in a segment is parameter/argument text, so a
- * quoted parameter VALUE like extension="no-transform" does not match.
- * Cutting at '=' also keeps a directive named no-transform-something or
- * no-transform=arg from matching, since the token compare is
- * whole-segment (upstream #251's walker, with the '=' cut added — his
- * cuts at ';' only, relying on the trailing quote to break the match
- * for the quoted case; both reject the same fixtures).
- */
-static ngx_int_t
-ngx_http_compression_cc_value_no_transform(ngx_table_elt_t *cc)
-{
-    u_char  *p, *last, *start, *end, *cut;
-
-    u_char  *seg_end;
-
-    p = cc->value.data;
-    last = p + cc->value.len;
-
-    while (p < last) {
-        start = p;
-        while (start < last && (*start == ' ' || *start == '\t')) {
-            start++;
-        }
-
-        /*
-         * Segment end = the next comma OUTSIDE any quoted string
-         * (parent #274): a quoted extension value may contain commas
-         * (and backslash-escaped characters), and splitting there
-         * fabricated a segment out of the quoted text — a false
-         * compression opt-out for values like x=",no-transform,y".
-         * Computed ONCE and used for both the token cut and the
-         * advance, so the next segment can never start inside a quote.
-         */
-        seg_end = start;
-        while (seg_end < last && *seg_end != ',') {
-            if (*seg_end == '"') {
-                seg_end++;
-                while (seg_end < last && *seg_end != '"') {
-                    if (*seg_end == '\\' && seg_end + 1 < last) {
-                        seg_end++;
-                    }
-                    seg_end++;
-                }
-                if (seg_end < last) {
-                    seg_end++;      /* the closing quote */
-                }
-                continue;
-            }
-            seg_end++;
-        }
-
-        cut = start;
-        while (cut < seg_end && *cut != ';' && *cut != '=') {
-            cut++;
-        }
-        end = cut;
-
-        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
-            end--;
-        }
-
-        if ((size_t) (end - start) == sizeof("no-transform") - 1
-            && ngx_strncasecmp(start, (u_char *) "no-transform",
-                               sizeof("no-transform") - 1) == 0)
-        {
-            return 1;
-        }
-
-        p = (seg_end < last) ? seg_end + 1 : seg_end;
-    }
-
-    return 0;
-}
-
-
-/*
- * RFC 9110 §7.7: no-transform forbids changing the content coding.
- * The walk covers the whole headers_out list rather than the
- * headers_out.cache_control chain because only some producers (the
- * upstream module) wire that chain — a Cache-Control pushed straight
- * onto the list by a module or an add_header would be invisible there.
- * Repeated Cache-Control lines are each checked (caches treat them as
- * one combined list).
- */
-static ngx_int_t
-ngx_http_compression_no_transform(ngx_http_request_t *r)
-{
-    ngx_uint_t        i;
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h;
-
-    part = &r->headers_out.headers.part;
-    h = part->elts;
-
-    for (i = 0; /* void */; i++) {
-
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-
-        if (h[i].hash == 0
-            || h[i].key.len != sizeof("Cache-Control") - 1
-            || h[i].value.len == 0)
-        {
-            continue;
-        }
-
-        if (ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
-                            sizeof("Cache-Control") - 1) == 0
-            && ngx_http_compression_cc_value_no_transform(&h[i]))
-        {
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
 
 /*
  * The negotiated-URI Vary: ONE combined line for dictionary locations,
@@ -2109,7 +1913,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
      * below) — falling through to a core gzip that ignores
      * no-transform would defeat the origin's directive.
      */
-    if (ngx_http_compression_no_transform(r)) {
+    if (ngx_http_zstd_cache_control_no_transform(r)) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "compression: skip, Cache-Control no-transform");
 

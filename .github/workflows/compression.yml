@@ -156,6 +156,9 @@ jobs:
       - name: Static filter-order policy (anchor after the last compressor)
         run: sh compression/tools/test_static_filter_order.sh
 
+      - name: Shared-header seam (parent headers consumed, no local copies)
+        run: sh compression/tools/test_shared_header_seam.sh
+
   gzipless:
     name: Build without the gzip module (no compat)
     runs-on: ubuntu-latest

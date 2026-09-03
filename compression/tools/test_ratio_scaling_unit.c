@@ -1,14 +1,12 @@
 /*
- * Unit oracle for ngx_http_compression_ratio_parts() -- the
+ * Unit oracle for ngx_http_zstd_ratio_parts() -- the
  * $compression_ratio split (the parent's #294 fixture shape). The
  * previous form computed `bytes_in * 1000 / bytes_out` in one step: for
  * a bytes_in near UINT64_MAX the multiply wraps and corrupts both the
  * integer and the fractional digits reported to the log.
  *
- * The function is EXTRACTED VERBATIM from ngx_http_compression_module.c
- * by test_ratio_scaling_unit.sh into generated_ratio_parts.inc -- this
- * file never re-implements the split, so it cannot quietly agree with a
- * stale copy of itself.
+ * The header is included directly -- this file never re-implements the
+ * split, so it cannot quietly agree with a stale copy of itself.
  *
  *   1. Ordinary threshold/boundary cases must keep their digits.
  *   2. bytes_in near UINT64_MAX with a small divisor: the case the
@@ -28,7 +26,8 @@
 
 typedef unsigned long  ngx_uint_t;
 
-#include "generated_ratio_parts.inc"
+/* THE authoritative copy (upstream #310), included directly. */
+#include "../../src/ngx_http_zstd_ratio.h"
 
 static long long failures;
 
@@ -38,7 +37,7 @@ check(const char *what, uint64_t bytes_in, uint64_t bytes_out,
 {
     ngx_uint_t  got_int, got_frac;
 
-    ngx_http_compression_ratio_parts(bytes_in, bytes_out, &got_int,
+    ngx_http_zstd_ratio_parts(bytes_in, bytes_out, &got_int,
                                      &got_frac);
 
     if (got_int != want_int || got_frac != want_frac) {
@@ -61,7 +60,7 @@ check_oracle(const char *what, uint64_t bi, uint64_t bo)
 
     scaled = ((unsigned __int128) bi * 1000) / (unsigned __int128) bo;
 
-    ngx_http_compression_ratio_parts(bi, bo, &gi, &gf);
+    ngx_http_zstd_ratio_parts(bi, bo, &gi, &gf);
 
     if (gi != (ngx_uint_t) (scaled / 1000)
         || gf != (ngx_uint_t) (scaled % 1000))

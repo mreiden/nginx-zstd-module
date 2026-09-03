@@ -25,7 +25,9 @@ if test -n "$ngx_module_link"; then
                      $ngx_addon_dir/ngx_http_compression_ae.h \
                      $ngx_addon_dir/ngx_http_compression_dict.h \
                      $ngx_addon_dir/../src/ngx_http_zstd_sha256.h \
-                     $ngx_addon_dir/../src/ngx_http_zstd_version.h"
+                     $ngx_addon_dir/../src/ngx_http_zstd_version.h \
+                     $ngx_addon_dir/../src/ngx_http_zstd_cache_control.h \
+                     $ngx_addon_dir/../src/ngx_http_zstd_ratio.h"
     ngx_module_srcs="$ngx_addon_dir/ngx_http_compression_module.c \
                      $ngx_addon_dir/ngx_http_compression_dict.c \
                      $ngx_addon_dir/ngx_http_compression_zstd.c \
