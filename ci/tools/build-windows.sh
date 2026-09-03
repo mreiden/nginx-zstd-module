@@ -245,6 +245,27 @@ extract() { # tarball-name [paths...]
     tar xzf "$file" "$@"
 }
 
+# Extract into DIR unless a completed extraction is already there. A killed
+# tar leaves a partial tree behind, and a directory-exists guard would then
+# skip re-extraction and fail later on missing files; the marker is written
+# only after tar exits clean. A tree from before the marker existed is
+# accepted when the archive's LAST member is present (tar writes members
+# in order) and stamped, so upgrading this script does not throw away a
+# built tree; anything else is removed and extracted again.
+extract_complete() { # dir tarball-name [paths...]
+    local dir=$1 archive=$2 marker="$1/.extracted" last
+    shift 2
+    if [ -d "$dir" ] && [ ! -f "$marker" ]; then
+        last=$(tar tzf "$DIR_DL/$archive" "$@" | tail -1)
+        [ -n "$last" ] && [ -e "$last" ] && : > "$marker"
+    fi
+    if [ ! -f "$marker" ]; then
+        rm -rf "$dir"
+        extract "$archive" "$@"
+        : > "$marker"
+    fi
+}
+
 # Clone at a pinned ref, applying the script's bundled patches and any
 # workspace-local ones from patches/<name>/*.patch, idempotently.
 # Submodules are synced AFTER the switch so nested pins (e.g.
@@ -314,7 +335,7 @@ verify "https://zlib.net/zlib-$VER_ZLIB.tar.gz" "$SHA_ZLIB"
     && verify "https://github.com/facebook/zstd/releases/download/v$VER_ZSTD/zstd-$VER_ZSTD.tar.gz" "$SHA_ZSTD"
 
 ### sources: extract and clone, still before any compile ##############
-[ -d "nginx-$VER_NGINX" ] || extract "nginx-$VER_NGINX.tar.gz"
+extract_complete "nginx-$VER_NGINX" "nginx-$VER_NGINX.tar.gz"
 mkdir -p "$DIR_NGINX/objs/lib"
 
 # Module clones next, so a bad ref (or a ref without compression/) also
@@ -344,9 +365,9 @@ if [ "$WITH_ZSTD" = 1 ] || [ "$WITH_COMPRESSION" = 1 ]; then
     fi
 fi
 
-[ -d "pcre2-$VER_PCRE2" ]     || extract "pcre2-$VER_PCRE2.tar.gz"
-[ -d "openssl-$VER_OPENSSL" ] || extract "openssl-$VER_OPENSSL.tar.gz"
-[ -d "zlib-$VER_ZLIB" ]       || extract "zlib-$VER_ZLIB.tar.gz"
+extract_complete "pcre2-$VER_PCRE2"     "pcre2-$VER_PCRE2.tar.gz"
+extract_complete "openssl-$VER_OPENSSL" "openssl-$VER_OPENSSL.tar.gz"
+extract_complete "zlib-$VER_ZLIB"       "zlib-$VER_ZLIB.tar.gz"
 
 cd "$DIR_PROJECT"
 
@@ -355,7 +376,7 @@ cd "$DIR_PROJECT"
 # OPENSSL_OPT and deleting this block). Built first: the OpenSSL
 # pre-build below needs it on PATH.
 if [ ! -x "nasm-$VER_NASM/nasm" ] && [ ! -x "nasm-$VER_NASM/nasm.exe" ]; then
-    extract "nasm-$VER_NASM.tar.gz"
+    extract_complete "nasm-$VER_NASM" "nasm-$VER_NASM.tar.gz"
     ( cd "nasm-$VER_NASM" && ./configure > /dev/null && make -j"$(nproc)" )
 fi
 
@@ -363,12 +384,11 @@ fi
 # CMake's default /MD would conflict at link). Extract only lib/ and
 # build/: the tarball's tests/ tree contains symlinks MSYS tar cannot
 # create, which would abort the whole extraction — and this build
-# needs neither tests nor programs. Guarded on a marker file, not the
-# directory, so a previously aborted extraction or build self-heals.
+# needs neither tests nor programs. Extraction is marker-guarded like
+# every other tree; the build is guarded on its archive, so an aborted
+# cmake self-heals too.
 if [ "$BUILDLIB_ZSTD" = 1 ]; then
-    if [ ! -f "zstd-$VER_ZSTD/build/cmake/CMakeLists.txt" ]; then
-        extract "zstd-$VER_ZSTD.tar.gz" "zstd-$VER_ZSTD/lib" "zstd-$VER_ZSTD/build"
-    fi
+    extract_complete "zstd-$VER_ZSTD" "zstd-$VER_ZSTD.tar.gz"         "zstd-$VER_ZSTD/lib" "zstd-$VER_ZSTD/build"
     if [ ! -f "zstd-$VER_ZSTD/out/lib/zstd_static.lib" ]; then
         cmake -B "zstd-$VER_ZSTD/out" -S "zstd-$VER_ZSTD/build/cmake" \
             -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release \
