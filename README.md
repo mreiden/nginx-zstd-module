@@ -192,9 +192,12 @@ load_module modules/ngx_http_zstd_static_module.so;
   `configure`; see [`zstd_max_cctx_memory`](#zstd_max_cctx_memory) and
   [Compatibility](#compatibility) for the full requirement.
 * **Windows:** MSVC builds the modules statically into `nginx.exe`; MinGW-w64
-  can also build them as dynamic `.so`-named PE DLLs. The SHA-pinned
+  can also build them as dynamic `.so`-named PE DLLs.
   [`ci/tools/build-windows.sh`](ci/tools/build-windows.sh) assembles the MSVC build
-  (and optionally ngx_brotli and headers-more). The usual Windows-nginx caveats
+  (and optionally ngx_brotli, the unified compression module, and headers-more;
+  library builds follow the modules selected), with every source version and
+  SHA-256 pinned in [`ci/tools/windows-pins.sh`](ci/tools/windows-pins.sh) and
+  verified before any compile. The usual Windows-nginx caveats
   apply (effectively single-worker via `select()`, no HTTP/3 — local dev use,
   not production). The `zstd_static` frame probes (magic number, truncation,
   declared-window and skippable-frame-chain checks) run on Windows too: the
