@@ -59,6 +59,11 @@
 # that version resolves to, never carried over from a previous entry.
 
 set -euo pipefail
+# Command substitutions do not inherit -e by default, so a failed curl inside
+# `digest="$(fetch ...)"` would be ignored and the EMPTY temp file hashed and
+# pinned. Every fetch below also checks curl explicitly; this closes the same
+# hole for anything added later.
+shopt -s inherit_errexit
 
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
@@ -86,9 +91,11 @@ HARNESS_FILES=(".github/workflows/ci-deep.yml" ".github/workflows/harness-fault-
 NGINX_PAGE="$(curl -fsSL https://nginx.org/en/download.html)"
 
 nginx_section_version() { # "Mainline version" | "Stable version"
+    # A section with no tarball link yields a blank, which the blank-version
+    # check below reports by name (|| true: keep that message under -e).
     echo "${NGINX_PAGE#*"$1"}" |
         grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' | head -1 |
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+'
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
 }
 
 latest_nginx_stable() { nginx_section_version "Stable version"; }
@@ -107,7 +114,7 @@ gh_latest_tag() {
         echo "error: could not query the ${repo} release API (rate limit? set GH_TOKEN)" >&2
         return 1
     fi
-    echo "$json" | grep -m1 '"tag_name"' | grep -oE '[0-9]+(\.[0-9]+)+' | head -1
+    echo "$json" | grep -m1 '"tag_name"' | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 || true
 }
 
 latest_angie() { gh_latest_tag webserver-llc/angie; }
@@ -196,10 +203,20 @@ echo "pinned: nginx stable=$CUR_STABLE angie=$CUR_ANGIE harness=$CUR_HARNESS" \
 CHANGED=0
 
 # --- sha256 helpers ---
+# A fetch that fails is fatal here, explicitly: the digest of whatever is
+# left in the temp file (nothing) must never be the value recorded.
+fetch_or_die() { # url out
+    if ! curl -fsSL "$1" -o "$2"; then
+        rm -f "$2"
+        echo "FATAL: could not fetch $1 -- refusing to pin a digest of what was not downloaded" >&2
+        exit 1
+    fi
+}
+
 sha256_for_url() {
     local url="$1" tmp digest
     tmp="$(mktemp)"
-    curl -fsSL "$url" -o "$tmp"
+    fetch_or_die "$url" "$tmp"
     digest="$(sha256sum "$tmp" | awk '{print $1}')"
     rm -f "$tmp"
     echo "$digest"
@@ -218,8 +235,8 @@ sha256_for_nginx() {
     local version="$1" url tmp digest gnupghome keyfiles
     url="https://nginx.org/download/nginx-${version}.tar.gz"
     tmp="$(mktemp)"
-    curl -fsSL "$url" -o "$tmp"
-    curl -fsSL "${url}.asc" -o "${tmp}.asc"
+    fetch_or_die "$url" "$tmp"
+    fetch_or_die "${url}.asc" "${tmp}.asc"
 
     gnupghome="$(mktemp -d)"
     GNUPGHOME="$gnupghome"
@@ -381,29 +398,34 @@ bump_windows_pin() { # NAME NEW DIGEST
     bump_pins_line "SHA_$1" "$3"
 }
 
-# --- bump ---------------------------------------------------------------
+# --- resolve: decide every bump and fetch every digest, editing nothing ---
+# All network work happens here, before the first file is touched, so a
+# download or verification failure part-way through leaves the tree
+# exactly as it was -- never a matrix bumped for a digest that was then
+# not fetched. The apply phase below is local edits only, each of which
+# fails loudly before writing its file (A30-F4).
+
+STABLE_DIGEST=""
+ANGIE_DIGEST=""
+WIN_NGINX_DIGEST=""
+BUMP_HARNESS=0
+declare -A LIB_DIGEST=()
 
 if [ "$NEW_STABLE" != "$CUR_STABLE" ]; then
     echo "bump nginx stable: $CUR_STABLE -> $NEW_STABLE"
+    CHANGED=1
     if [ "$DRY_RUN" = 0 ]; then
-        DIGEST="$(sha256_for_nginx "$NEW_STABLE")"
-        echo "  sha256 $DIGEST"
-        bump_matrix_pin stable "$CUR_STABLE" "$NEW_STABLE"
-        bump_nginx_sha256_pin "$CUR_STABLE" "$NEW_STABLE" "$DIGEST"
-    else
-        CHANGED=1
+        STABLE_DIGEST="$(sha256_for_nginx "$NEW_STABLE")"
+        echo "  sha256 $STABLE_DIGEST"
     fi
 fi
 
 if [ "$NEW_ANGIE" != "$CUR_ANGIE" ]; then
     echo "bump angie: $CUR_ANGIE -> $NEW_ANGIE"
+    CHANGED=1
     if [ "$DRY_RUN" = 0 ]; then
-        DIGEST="$(sha256_for_angie "$NEW_ANGIE")"
-        echo "  sha256 $DIGEST"
-        bump_matrix_pin angie "$CUR_ANGIE" "$NEW_ANGIE"
-        bump_angie_sha256_pin "$CUR_ANGIE" "$NEW_ANGIE" "$DIGEST"
-    else
-        CHANGED=1
+        ANGIE_DIGEST="$(sha256_for_angie "$NEW_ANGIE")"
+        echo "  sha256 $ANGIE_DIGEST"
     fi
 fi
 
@@ -411,24 +433,17 @@ fi
 # one does not hide the other falling behind.
 if [ "$NEW_MAINLINE" != "${CUR_WIN[NGINX]}" ]; then
     echo "bump windows nginx: ${CUR_WIN[NGINX]} -> $NEW_MAINLINE"
+    CHANGED=1
     if [ "$DRY_RUN" = 0 ]; then
-        DIGEST="$(sha256_for_nginx "$NEW_MAINLINE")"
-        echo "  sha256 $DIGEST"
-        bump_windows_pin NGINX "$NEW_MAINLINE" "$DIGEST"
-    else
-        CHANGED=1
+        WIN_NGINX_DIGEST="$(sha256_for_nginx "$NEW_MAINLINE")"
+        echo "  sha256 $WIN_NGINX_DIGEST"
     fi
 fi
 
 if [ "$NEW_MAINLINE" != "$CUR_HARNESS" ]; then
     echo "bump harness nginx: $CUR_HARNESS -> $NEW_MAINLINE"
-    if [ "$DRY_RUN" = 0 ]; then
-        for f in "${HARNESS_FILES[@]}"; do
-            bump_harness_pin "$f" "$CUR_HARNESS" "$NEW_MAINLINE"
-        done
-    else
-        CHANGED=1
-    fi
+    CHANGED=1
+    BUMP_HARNESS=1
 fi
 
 declare -A NEW_LIB=([PCRE2]="$NEW_PCRE2" [ZLIB]="$NEW_ZLIB" [OPENSSL]="$NEW_OPENSSL" [ZSTD]="$NEW_ZSTD")
@@ -441,17 +456,48 @@ for name in PCRE2 ZLIB OPENSSL ZSTD; do
         continue
     fi
     echo "bump windows ${name,,}: $cur -> $new"
+    CHANGED=1
     if [ "$DRY_RUN" = 0 ]; then
-        DIGEST="$(sha256_for_release "$name" "$new")"
-        echo "  sha256 $DIGEST"
-        bump_windows_pin "$name" "$new" "$DIGEST"
-    else
-        CHANGED=1
+        LIB_DIGEST[$name]="$(sha256_for_release "$name" "$new")"
+        echo "  sha256 ${LIB_DIGEST[$name]}"
     fi
 done
 
 if [ "$CHANGED" = 0 ]; then
     echo "everything up to date, nothing to bump"
 fi
+
+if [ "$DRY_RUN" = 1 ] || [ "$CHANGED" = 0 ]; then
+    echo "CHANGED=$CHANGED"
+    exit 0
+fi
+
+# --- apply: local edits only, every input already in hand ----------------
+
+if [ -n "$STABLE_DIGEST" ]; then
+    bump_matrix_pin stable "$CUR_STABLE" "$NEW_STABLE"
+    bump_nginx_sha256_pin "$CUR_STABLE" "$NEW_STABLE" "$STABLE_DIGEST"
+fi
+
+if [ -n "$ANGIE_DIGEST" ]; then
+    bump_matrix_pin angie "$CUR_ANGIE" "$NEW_ANGIE"
+    bump_angie_sha256_pin "$CUR_ANGIE" "$NEW_ANGIE" "$ANGIE_DIGEST"
+fi
+
+if [ -n "$WIN_NGINX_DIGEST" ]; then
+    bump_windows_pin NGINX "$NEW_MAINLINE" "$WIN_NGINX_DIGEST"
+fi
+
+if [ "$BUMP_HARNESS" = 1 ]; then
+    for f in "${HARNESS_FILES[@]}"; do
+        bump_harness_pin "$f" "$CUR_HARNESS" "$NEW_MAINLINE"
+    done
+fi
+
+for name in PCRE2 ZLIB OPENSSL ZSTD; do
+    if [ -n "${LIB_DIGEST[$name]:-}" ]; then
+        bump_windows_pin "$name" "${NEW_LIB[$name]}" "${LIB_DIGEST[$name]}"
+    fi
+done
 
 echo "CHANGED=$CHANGED"

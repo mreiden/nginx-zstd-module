@@ -11,8 +11,9 @@
 # static mainline pin (HARNESS_NGINX_VERSION, in two workflows) and the
 # Windows build's sources (ci/tools/windows-pins.sh) were bumped by hand or
 # not at all. The cases below cover every pin the script rewrites, the
-# forward-only rule for release-API feeds, and the fail-loud / no-partial-
-# edit rule for every mutator.
+# forward-only rule for release-API feeds, the fail-loud / no-partial-edit
+# rule for every mutator, and the resolve/apply split (every digest fetched
+# before any file is touched, so a dead mirror part-way edits nothing).
 #
 # This test builds a scratch copy of the repo layout the script actually
 # needs (ci/tools/ci-build.sh, ci/tools/keys/*.key, ci/tools/windows-pins.sh,
@@ -111,7 +112,8 @@ EOF
 
 # stub_bin DIR -- creates PATH-shadowing curl/gpg stubs and prints the bin
 # dir to prepend to PATH. Reads NEW_* env for what each feed's "latest"
-# should resolve to; any not set answers the sandbox's current pin.
+# should resolve to; any not set answers the sandbox's current pin. FAIL_URL,
+# when set, makes every fetch whose URL contains it fail like a dead mirror.
 stub_bin() {
     local dir="$1" bindir="$1/bin"
     mkdir -p "$bindir"
@@ -121,11 +123,15 @@ stub_bin() {
 url=""
 out=""
 prev=""
+fail_url="${FAIL_URL:-}"
 for a in "\$@"; do
     case "\$a" in http*) url="\$a" ;; esac
     [ "\$prev" = "-o" ] && out="\$a"
     prev="\$a"
 done
+if [ -n "\$fail_url" ]; then
+    case "\$url" in *"\$fail_url"*) echo "curl: (22) stub: \$url unreachable" >&2; exit 22 ;; esac
+fi
 case "\$url" in
     *nginx.org/en/download.html*)
         echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionnginx-${NEW_STABLE:-$CUR_STABLE}.tar.gz"
@@ -283,6 +289,22 @@ if run_case backwards NEW_OPENSSL=3.5.5; then
     fi
 else
     bad "backwards: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
+fi
+
+say "== case: transient fetch failure part-way (must edit NOTHING: every digest is fetched before any file is touched) =="
+# Stable resolves first and its tarball fetch succeeds; the angie tarball
+# fetch then fails. Before the resolve/apply split, the stable matrix and
+# digest edits had already landed by then, leaving a half-bumped tree.
+if run_case transient NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0 FAIL_URL=angie-1.13.0.tar.gz; then
+    bad "transient: script exited 0 despite a failed tarball fetch"
+elif grep -q '1.30.5' "$SANDBOX/.github/workflows/ci-deep.yml"     || grep -q '1.30.5' "$SANDBOX/ci/tools/ci-build.sh"; then
+    bad "transient: the stable bump was written before the angie fetch failed (partial edit): $(cat "$SANDBOX/out.log")"
+elif ! grep -q 'bump nginx stable: 1.30.4 -> 1.30.5' "$SANDBOX/out.log"; then
+    bad "transient: the stable bump was not even resolved: $(cat "$SANDBOX/out.log")"
+elif ! grep -q 'could not fetch' "$SANDBOX/out.log"; then
+    bad "transient: exited non-zero but did not name the failed fetch: $(cat "$SANDBOX/out.log")"
+else
+    ok "transient: named the failed fetch, exited non-zero, no file edited"
 fi
 
 say "== case: format-drift (matrix entry does not match -- must FAIL LOUDLY, no partial edit) =="
