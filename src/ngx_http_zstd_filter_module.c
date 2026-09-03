@@ -15,8 +15,10 @@
 #include <stdint.h>  /* SIZE_MAX — saturating dcz window-log arithmetic */
 
 #include "ngx_http_zstd_common.h"
+#include "ngx_http_zstd_cache_control.h"
 #include "ngx_http_zstd_sha256.h"
 #include "ngx_http_zstd_version.h"
+#include "ngx_http_zstd_ratio.h"
 
 #ifdef NGX_TEST_HARNESS
 #include "ngx_http_zstd_probe_hooks.h"
@@ -1508,128 +1510,6 @@ ngx_module_t  ngx_http_zstd_filter_module = {
     NULL,                                   /* exit master */
     NGX_MODULE_V1_PADDING
 };
-
-
-static u_char *
-ngx_http_zstd_cache_control_directive_end(u_char *p, u_char *last)
-{
-    while (p < last) {
-        if (*p == '"') {
-            p++;
-
-            while (p < last && *p != '"') {
-                if (*p == '\\' && p + 1 < last) {
-                    p++;
-                }
-                p++;
-            }
-
-            if (p < last) {
-                p++;
-            }
-
-        } else if (*p == ',') {
-            break;
-
-        } else {
-            p++;
-        }
-    }
-
-    return p;
-}
-
-
-static ngx_int_t
-ngx_http_zstd_cache_control_value_no_transform(ngx_table_elt_t *cc)
-{
-    u_char  *p, *last, *start, *end, *directive_end, *semi;
-
-    if (cc->value.len == 0) {
-        return 0;
-    }
-
-    p = cc->value.data;
-    last = p + cc->value.len;
-
-    while (p < last) {
-        start = p;
-        while (start < last && (*start == ' ' || *start == '\t')) {
-            start++;
-        }
-
-        directive_end = ngx_http_zstd_cache_control_directive_end(start, last);
-
-        /*
-         * Cut at '=' as well as ';': the compared token is then the
-         * directive NAME, so "no-transform=arg" -- malformed, since the
-         * directive defines no argument (RFC 9111 §5.2.2.6), but clear
-         * in intent -- is honored rather than transformed. The quoted
-         * parameter-value control is unaffected: extension="no-transform"
-         * cuts to "extension" and still does not match.
-         */
-        semi = start;
-        while (semi < directive_end && *semi != ';' && *semi != '=') {
-            semi++;
-        }
-        end = semi;
-
-        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
-            end--;
-        }
-
-        if ((size_t) (end - start) == sizeof("no-transform") - 1
-            && ngx_strncasecmp(start, (u_char *) "no-transform",
-                               sizeof("no-transform") - 1) == 0)
-        {
-            return 1;
-        }
-
-        p = directive_end;
-        if (p < last) {
-            p++;
-        }
-    }
-
-    return 0;
-}
-
-
-static ngx_int_t
-ngx_http_zstd_cache_control_no_transform(ngx_http_request_t *r)
-{
-    ngx_uint_t        i;
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *h;
-
-    part = &r->headers_out.headers.part;
-    h = part->elts;
-
-    for (i = 0; /* void */; i++) {
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-
-            part = part->next;
-            h = part->elts;
-            i = 0;
-        }
-
-        if (h[i].hash == 0 || h[i].key.len != sizeof("Cache-Control") - 1) {
-            continue;
-        }
-
-        if (ngx_strncasecmp(h[i].key.data, (u_char *) "Cache-Control",
-                            sizeof("Cache-Control") - 1) == 0
-            && ngx_http_zstd_cache_control_value_no_transform(&h[i]))
-        {
-            return 1;
-        }
-    }
-
-    return 0;
-}
 
 
 static ngx_int_t
@@ -5799,81 +5679,6 @@ ngx_http_zstd_dcz_dicts_hashed_variable(ngx_http_request_t *r,
     vv->not_found = 0;
 
     return NGX_OK;
-}
-
-
-/*
- * Split bytes_in/bytes_out into an integer part and a three-decimal
- * fractional part (*ratio_int, *ratio_frac) without ever overflowing
- * uint64_t. bytes_in is a running total of streamed input and bytes_out a
- * running total of compressed output; either can approach UINT64_MAX on a
- * long-lived connection, and bytes_out may exceed bytes_in whenever zstd
- * expands incompressible input.
- *
- * Neither obvious form is safe. `bytes_in * 1000 / bytes_out` wraps in the
- * multiply. Dividing first and scaling only the remainder still wraps when
- * bytes_out > bytes_in, because the remainder is then bytes_in itself: for
- * bytes_in = UINT64_MAX - 1, bytes_out = UINT64_MAX it reports 0.000
- * instead of 0.999.
- *
- * Extract the three fractional digits by exact long division instead. Per
- * digit the remainder (always < divisor) is multiplied by 10, which is the
- * only growth step. When that product would not fit, compute it as
- * q * divisor + r with q = remainder / (divisor / 10) so the multiply stays
- * in range -- no value is ever approximated, so the result matches an
- * exact 128-bit bytes_in * 1000 / bytes_out for every input pair.
- */
-static void
-ngx_http_zstd_ratio_parts(uint64_t bytes_in, uint64_t bytes_out,
-    ngx_uint_t *ratio_int, ngx_uint_t *ratio_frac)
-{
-    uint64_t  remainder, frac;
-    int       i;
-
-    *ratio_int = (ngx_uint_t) (bytes_in / bytes_out);
-
-    remainder = bytes_in % bytes_out;
-    frac      = 0;
-
-    for (i = 0; i < 3; i++) {
-
-        if (remainder <= UINT64_MAX / 10) {
-            remainder *= 10;
-            frac       = frac * 10 + remainder / bytes_out;
-            remainder %= bytes_out;
-            continue;
-        }
-
-        /*
-         * remainder * 10 would overflow. Since remainder < bytes_out, that
-         * only happens for a very large divisor; then remainder * 10 is at
-         * most 10 * bytes_out, so the quotient digit is in [0, 10) and can
-         * be found exactly without forming the product: peel off whole
-         * multiples of bytes_out from remainder * 10 one at a time, each
-         * step staying inside uint64_t.
-         */
-        {
-            uint64_t  acc = remainder;
-            uint64_t  digit = 0;
-            int       k;
-
-            /* acc accumulates remainder * 10 modulo bytes_out. */
-            for (k = 0; k < 9; k++) {
-                acc += remainder;
-
-                if (acc >= bytes_out || acc < remainder) {
-                    /* wrapped past, or reached, one whole bytes_out */
-                    acc -= bytes_out;
-                    digit++;
-                }
-            }
-
-            frac      = frac * 10 + digit;
-            remainder = acc;
-        }
-    }
-
-    *ratio_frac = (ngx_uint_t) frac;
 }
 
 

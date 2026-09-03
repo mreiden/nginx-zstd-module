@@ -43,6 +43,26 @@ for fn in ngx_http_zstd_static_probe_frame ngx_http_zstd_static_probe_reuse; do
 		"$root"
 done
 
+# Same seam, second family: the Cache-Control no-transform helpers
+# moved to their own authoritative header; production must include it
+# and each helper must keep exactly one definition.
+grep -Fq '#include "ngx_http_zstd_cache_control.h"' \
+	"$root/src/ngx_http_zstd_filter_module.c"
+
+for fn in ngx_http_zstd_cache_control_directive_end \
+	ngx_http_zstd_cache_control_value_no_transform \
+	ngx_http_zstd_cache_control_no_transform; do
+	check_definition "$root/src/ngx_http_zstd_cache_control.h" "$fn" \
+		"$root"
+done
+
+# Same seam, the ratio helper: production must include its header and
+# the split must keep exactly one definition.
+grep -Fq '#include "ngx_http_zstd_ratio.h"' \
+	"$root/src/ngx_http_zstd_filter_module.c"
+check_definition "$root/src/ngx_http_zstd_ratio.h" \
+	ngx_http_zstd_ratio_parts "$root"
+
 # Detection control: redirect the real unit fixture to a copied probe
 # implementation under ci/. The fixture must stay green while the seam
 # check turns red, reproducing the drift this gate exists to catch.
@@ -72,6 +92,22 @@ cc=${CC:-cc}
 if check_definition "$tmp/src/ngx_http_zstd_frame_probe.h" \
 	ngx_http_zstd_static_probe_frame "$tmp" >/dev/null 2>&1; then
 	echo 'probe seam: detection control missed a copied CI implementation' >&2
+	exit 1
+fi
+
+# Cache-control control: the same staged-drift shape -- the header
+# copied back under ci/ (no unit fixture exists for this family, so
+# the copy alone is the scenario) -- must turn the definition count
+# red.
+cp "$root/src/ngx_http_zstd_cache_control.h" \
+	"$tmp/src/ngx_http_zstd_cache_control.h"
+cp "$root/src/ngx_http_zstd_cache_control.h" \
+	"$tmp/ci/tools/copied_cache_control.h"
+
+if check_definition "$tmp/src/ngx_http_zstd_cache_control.h" \
+	ngx_http_zstd_cache_control_value_no_transform "$tmp" \
+	>/dev/null 2>&1; then
+	echo 'probe seam: detection control missed a copied cache-control header' >&2
 	exit 1
 fi
 

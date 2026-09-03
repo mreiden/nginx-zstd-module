@@ -384,6 +384,16 @@ jobs:
           # so the 32-bit pass needs no 32-bit libzstd.
           bash "$GITHUB_WORKSPACE"/ci/tools/test_pledge_bound_input_unit.sh
 
+      - name: $zstd_ratio scaling unit fixture (#294, against the shared header)
+        run: |
+          # ngx_http_zstd_ratio_parts() against an unsigned __int128 oracle:
+          # the boundary table, the near-UINT64_MAX and expanding-stream
+          # witnesses, a magnitude sweep and a seeded random sweep. The
+          # fixture includes src/ngx_http_zstd_ratio.h directly, and the
+          # script pins that $zstd_ratio still routes through it and that
+          # the header stays C89-clean.
+          bash "$GITHUB_WORKSPACE"/ci/tools/test_ratio_scaling_unit.sh
+
       - name: soak.sh ASAN/UBSAN verdict unit fixture (A27-F9)
         run: |
           # A27-F9: ci/tools/soak.sh's ASan/UBSan check used to fail on
