@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 #
-# Hermetic regression test for audit A30-F4: ci/tools/bump-versions.sh used
-# stale pre-move paths (tools/keys/, tools/ci-build.sh) that do not exist
-# after the tools/ -> ci/tools/ move, so a real bump could not import the
-# PGP keyring and a matrix/pin replacement that matched nothing failed
-# silently, leaving a partial edit.
+# Hermetic regression test for ci/tools/bump-versions.sh.
+#
+# Audit A30-F4 first: the script used stale pre-move paths (tools/keys/,
+# tools/ci-build.sh) that do not exist after the tools/ -> ci/tools/ move,
+# so a real bump could not import the PGP keyring, and a matrix/pin
+# replacement that matched nothing failed silently, leaving a partial edit.
+#
+# Then the pins the weekly bump did not know about: the harness jobs'
+# static mainline pin (HARNESS_NGINX_VERSION, in two workflows) and the
+# Windows build's sources (ci/tools/windows-pins.sh) were bumped by hand or
+# not at all. The cases below cover every pin the script rewrites, the
+# forward-only rule for release-API feeds, and the fail-loud / no-partial-
+# edit rule for every mutator.
 #
 # This test builds a scratch copy of the repo layout the script actually
-# needs (ci/tools/ci-build.sh, ci/tools/keys/*.key, .github/workflows/
-# ci-deep.yml matrix) and stubs curl/gpg/sha256sum on PATH so no network is
-# used. It drives bump-versions.sh --covered by a scenario cases-array so
-# each case name is asserted individually.
+# needs (ci/tools/ci-build.sh, ci/tools/keys/*.key, ci/tools/windows-pins.sh,
+# .github/workflows/{ci-deep,harness-fault-arms}.yml) and stubs curl/gpg on
+# PATH so no network is used. Each case name is asserted individually.
 #
 # Usage: ci/tools/test_bump_versions.sh
 
@@ -27,6 +34,16 @@ bad() {
     printf 'FAIL: %s\n' "$*"
     fail=1
 }
+
+# The sandbox's current pins. Every stubbed feed answers these unless a case
+# overrides it, so a case changes exactly the pins it names.
+CUR_STABLE=1.30.4
+CUR_MAINLINE=1.31.4
+CUR_ANGIE=1.12.1
+CUR_PCRE2=10.44
+CUR_ZLIB=1.3.1
+CUR_OPENSSL=4.0.1
+CUR_ZSTD=1.5.7
 
 # make_sandbox VARNAME  -- creates a scratch repo layout under a temp dir and
 # assigns its path to VARNAME.
@@ -50,7 +67,26 @@ declare -A NGINX_SHA256=(
 )
 KEYRING_DIR="$SCRIPT_DIR/keys"
 EOF
+    cat >"$dir/ci/tools/windows-pins.sh" <<'EOF'
+# sandbox copy of ci/tools/windows-pins.sh -- data only
+# shellcheck shell=sh disable=SC2034
+VER_NGINX=1.31.4
+SHA_NGINX=cccc1
+VER_PCRE2=10.44
+SHA_PCRE2=cccc2
+VER_OPENSSL=4.0.1
+SHA_OPENSSL=cccc3
+VER_ZLIB=1.3.1
+SHA_ZLIB=cccc4
+VER_NASM=3.02
+SHA_NASM=cccc5
+VER_ZSTD=1.5.7
+SHA_ZSTD=cccc6
+EOF
     cat >"$dir/.github/workflows/ci-deep.yml" <<'EOF'
+env:
+  NGINX_VERSION: ""
+  HARNESS_NGINX_VERSION: "1.31.4"
 jobs:
   build-flavors:
     strategy:
@@ -63,39 +99,57 @@ jobs:
           - version: "1.12.1"
             label: angie
 EOF
+    cat >"$dir/.github/workflows/harness-fault-arms.yml" <<'EOF'
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  HARNESS_NGINX_VERSION: "1.31.4"
+EOF
     cp "$BUMP_SCRIPT" "$dir/ci/tools/bump-versions.sh"
     # shellcheck disable=SC2034  # nameref out-parameter, read by the caller
     out="$dir"
 }
 
-# stub_bin DIR -- creates PATH-shadowing curl/gpg/sha256sum stubs and prints
-# the bin dir to prepend to PATH. Reads NEW_STABLE / NEW_ANGIE env for what
-# "latest" should resolve to.
+# stub_bin DIR -- creates PATH-shadowing curl/gpg stubs and prints the bin
+# dir to prepend to PATH. Reads NEW_* env for what each feed's "latest"
+# should resolve to; any not set answers the sandbox's current pin.
 stub_bin() {
     local dir="$1" bindir="$1/bin"
     mkdir -p "$bindir"
     cat >"$bindir/curl" <<EOF
 #!/bin/bash
-# Fake nginx.org download page / angie GitHub API / tarball fetch.
-for a in "\$@"; do
-    case "\$a" in
-        *nginx.org/en/download.html*)
-            echo "Stable versionnginx-${NEW_STABLE}.tar.gz"
-            exit 0 ;;
-        *api.github.com*angie*releases/latest*)
-            echo "{\"tag_name\": \"${NEW_ANGIE}\"}"
-            exit 0 ;;
-        -o) : ;;
-    esac
-done
-# tarball / .asc fetch: write a dummy file at -o target if present.
+# Fake nginx.org download page / GitHub release APIs / tarball fetch.
+url=""
 out=""
 prev=""
 for a in "\$@"; do
-    if [ "\$prev" = "-o" ]; then out="\$a"; fi
+    case "\$a" in http*) url="\$a" ;; esac
+    [ "\$prev" = "-o" ] && out="\$a"
     prev="\$a"
 done
-[ -n "\$out" ] && echo "dummy-tarball-bytes" > "\$out"
+case "\$url" in
+    *nginx.org/en/download.html*)
+        echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionnginx-${NEW_STABLE:-$CUR_STABLE}.tar.gz"
+        exit 0 ;;
+    *api.github.com/repos/webserver-llc/angie/releases/latest*)
+        echo "{\"tag_name\": \"${NEW_ANGIE:-$CUR_ANGIE}\"}"
+        exit 0 ;;
+    *api.github.com/repos/PCRE2Project/pcre2/releases/latest*)
+        echo "{\"tag_name\": \"pcre2-${NEW_PCRE2:-$CUR_PCRE2}\"}"
+        exit 0 ;;
+    *api.github.com/repos/madler/zlib/releases/latest*)
+        echo "{\"tag_name\": \"v${NEW_ZLIB:-$CUR_ZLIB}\"}"
+        exit 0 ;;
+    *api.github.com/repos/openssl/openssl/releases/latest*)
+        echo "{\"tag_name\": \"openssl-${NEW_OPENSSL:-$CUR_OPENSSL}\"}"
+        exit 0 ;;
+    *api.github.com/repos/facebook/zstd/releases/latest*)
+        echo "{\"tag_name\": \"v${NEW_ZSTD:-$CUR_ZSTD}\"}"
+        exit 0 ;;
+esac
+# tarball / .asc fetch: write a stand-in whose bytes depend only on the
+# file name, so the same tarball from two hosts (zlib) hashes the same and
+# a case can predict the digest the script records.
+[ -n "\$out" ] && echo "dummy \${url##*/}" > "\$out"
 exit 0
 EOF
     cat >"$bindir/gpg" <<'EOF'
@@ -107,24 +161,32 @@ EOF
     echo "$bindir"
 }
 
-# run_case NAME NEW_STABLE NEW_ANGIE  -- runs bump-versions.sh in $1's sandbox
-# with the given "latest" values and returns its exit status; sandbox path is
-# left in SANDBOX for the caller to inspect.
+# The digest the stub tarball for FILE hashes to.
+stub_sha() { printf 'dummy %s\n' "$1" | sha256sum | awk '{print $1}'; }
+
+# run_case NAME [NEW_X=value ...] -- runs bump-versions.sh in a fresh sandbox
+# with the stubbed feeds answering the given "latest" values and returns its
+# exit status; sandbox path is left in SANDBOX for the caller to inspect.
 run_case() {
-    local ns="$2" na="$3"
+    shift
     make_sandbox SANDBOX
     local bindir
-    bindir="$(NEW_STABLE="$ns" NEW_ANGIE="$na" stub_bin "$SANDBOX")"
+    bindir="$(
+        for kv in "$@"; do export "${kv?}"; done
+        stub_bin "$SANDBOX"
+    )"
     (
         cd "$SANDBOX"
-        PATH="$bindir:$PATH" NEW_STABLE="$ns" NEW_ANGIE="$na" \
-            bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+        PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
     )
     return $?
 }
 
+pins_line() { grep -E "^$1=" "$SANDBOX/ci/tools/windows-pins.sh"; }
+harness_line() { grep -c 'HARNESS_NGINX_VERSION: "'"$1"'"' "$SANDBOX/.github/workflows/$2"; }
+
 say "== case: stable-only bump =="
-if run_case stable-only "1.30.5" "1.12.1"; then
+if run_case stable-only NEW_STABLE=1.30.5; then
     if grep -q 'version: "1.30.5"' "$SANDBOX/.github/workflows/ci-deep.yml" \
         && grep -q '\["1.30.5"\]' "$SANDBOX/ci/tools/ci-build.sh"; then
         ok "stable-only: matrix and sha256 pin both updated"
@@ -136,7 +198,7 @@ else
 fi
 
 say "== case: angie-only bump =="
-if run_case angie-only "1.30.4" "1.13.0"; then
+if run_case angie-only NEW_ANGIE=1.13.0; then
     if grep -q 'version: "1.13.0"' "$SANDBOX/.github/workflows/ci-deep.yml" \
         && grep -q '\["1.13.0"\]' "$SANDBOX/ci/tools/ci-build.sh"; then
         ok "angie-only: matrix and sha256 pin both updated"
@@ -148,7 +210,7 @@ else
 fi
 
 say "== case: both bump =="
-if run_case both "1.30.5" "1.13.0"; then
+if run_case both NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0; then
     if grep -q 'version: "1.30.5"' "$SANDBOX/.github/workflows/ci-deep.yml" \
         && grep -q 'version: "1.13.0"' "$SANDBOX/.github/workflows/ci-deep.yml" \
         && grep -q '\["1.30.5"\]' "$SANDBOX/ci/tools/ci-build.sh" \
@@ -162,7 +224,7 @@ else
 fi
 
 say "== case: no-change =="
-if run_case no-change "1.30.4" "1.12.1"; then
+if run_case no-change; then
     if grep -q 'CHANGED=0' "$SANDBOX/out.log"; then
         ok "no-change: script reports CHANGED=0 and exits 0"
     else
@@ -172,11 +234,64 @@ else
     bad "no-change: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
 fi
 
+say "== case: mainline bump (harness pin in both workflows + Windows nginx pin; matrix entry untouched) =="
+if run_case mainline NEW_MAINLINE=1.31.5; then
+    if [ "$(harness_line 1.31.5 ci-deep.yml)" = 1 ] \
+        && [ "$(harness_line 1.31.5 harness-fault-arms.yml)" = 1 ] \
+        && [ "$(pins_line VER_NGINX)" = "VER_NGINX=1.31.5" ] \
+        && [ "$(pins_line SHA_NGINX)" = "SHA_NGINX=$(stub_sha nginx-1.31.5.tar.gz)" ] \
+        && grep -q 'version: "1.31.2"' "$SANDBOX/.github/workflows/ci-deep.yml" \
+        && grep -q 'version: "1.30.4"' "$SANDBOX/.github/workflows/ci-deep.yml" \
+        && ! grep -q '1.31.5' "$SANDBOX/ci/tools/ci-build.sh"; then
+        ok "mainline: both harness pins and the Windows nginx pin+digest updated, matrix and ci-build.sh untouched"
+    else
+        bad "mainline: unexpected result: $(cat "$SANDBOX/out.log")"
+    fi
+else
+    bad "mainline: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
+fi
+
+say "== case: windows library bumps (pcre2, zlib, openssl, zstd) =="
+if run_case windows-libs NEW_PCRE2=10.48 NEW_ZLIB=1.3.2 NEW_OPENSSL=4.0.2 NEW_ZSTD=1.5.8; then
+    if [ "$(pins_line VER_PCRE2)" = "VER_PCRE2=10.48" ] \
+        && [ "$(pins_line SHA_PCRE2)" = "SHA_PCRE2=$(stub_sha pcre2-10.48.tar.gz)" ] \
+        && [ "$(pins_line VER_ZLIB)" = "VER_ZLIB=1.3.2" ] \
+        && [ "$(pins_line SHA_ZLIB)" = "SHA_ZLIB=$(stub_sha zlib-1.3.2.tar.gz)" ] \
+        && [ "$(pins_line VER_OPENSSL)" = "VER_OPENSSL=4.0.2" ] \
+        && [ "$(pins_line SHA_OPENSSL)" = "SHA_OPENSSL=$(stub_sha openssl-4.0.2.tar.gz)" ] \
+        && [ "$(pins_line VER_ZSTD)" = "VER_ZSTD=1.5.8" ] \
+        && [ "$(pins_line SHA_ZSTD)" = "SHA_ZSTD=$(stub_sha zstd-1.5.8.tar.gz)" ] \
+        && [ "$(pins_line VER_NGINX)" = "VER_NGINX=1.31.4" ] \
+        && [ "$(pins_line SHA_NASM)" = "SHA_NASM=cccc5" ]; then
+        ok "windows-libs: all four version+digest pairs updated, nginx and nasm untouched"
+    else
+        bad "windows-libs: unexpected pins: $(cat "$SANDBOX/ci/tools/windows-pins.sh") -- $(cat "$SANDBOX/out.log")"
+    fi
+else
+    bad "windows-libs: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
+fi
+
+say "== case: release feed behind the pin (must hold, never move backwards) =="
+if run_case backwards NEW_OPENSSL=3.5.5; then
+    if grep -q 'CHANGED=0' "$SANDBOX/out.log" \
+        && grep -q 'not moving a pin backwards' "$SANDBOX/out.log" \
+        && [ "$(pins_line VER_OPENSSL)" = "VER_OPENSSL=4.0.1" ] \
+        && [ "$(pins_line SHA_OPENSSL)" = "SHA_OPENSSL=cccc3" ]; then
+        ok "backwards: reported the hold, CHANGED=0, pin untouched"
+    else
+        bad "backwards: unexpected result: $(cat "$SANDBOX/out.log")"
+    fi
+else
+    bad "backwards: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
+fi
+
 say "== case: format-drift (matrix entry does not match -- must FAIL LOUDLY, no partial edit) =="
 make_sandbox SANDBOX
 # Corrupt the matrix so version/label are no longer adjacent the way the
 # script's pattern expects -- simulates a future reformat/reorder.
 cat >"$SANDBOX/.github/workflows/ci-deep.yml" <<'EOF'
+env:
+  HARNESS_NGINX_VERSION: "1.31.4"
 jobs:
   build-flavors:
     strategy:
@@ -191,12 +306,11 @@ jobs:
 EOF
 before_matrix="$(cat "$SANDBOX/.github/workflows/ci-deep.yml")"
 before_build="$(cat "$SANDBOX/ci/tools/ci-build.sh")"
-bindir="$(NEW_STABLE=1.30.5 NEW_ANGIE=1.12.1 stub_bin "$SANDBOX")"
+bindir="$(NEW_STABLE=1.30.5 stub_bin "$SANDBOX")"
 set +e
 (
     cd "$SANDBOX"
-    PATH="$bindir:$PATH" NEW_STABLE=1.30.5 NEW_ANGIE=1.12.1 \
-        bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+    PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
 )
 rc=$?
 set -e
@@ -210,6 +324,55 @@ elif ! grep -qi 'no matrix entry matched' "$SANDBOX/out.log"; then
     bad "format-drift: exited non-zero but did not report the no-op match: $(cat "$SANDBOX/out.log")"
 else
     ok "format-drift: exited non-zero, reported the no-op, and left both files untouched"
+fi
+
+say "== case: pins-file drift (a VER_ line missing -- must FAIL LOUDLY before ANY edit) =="
+make_sandbox SANDBOX
+sed -i '/^VER_PCRE2=/d' "$SANDBOX/ci/tools/windows-pins.sh"
+before_pins="$(cat "$SANDBOX/ci/tools/windows-pins.sh")"
+before_matrix="$(cat "$SANDBOX/.github/workflows/ci-deep.yml")"
+# A stable bump is pending too: the pins check must run before it lands.
+bindir="$(NEW_STABLE=1.30.5 NEW_PCRE2=10.48 stub_bin "$SANDBOX")"
+set +e
+(
+    cd "$SANDBOX"
+    PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    bad "pins-drift: script exited 0 with a pin missing from windows-pins.sh"
+elif [ "$before_pins" != "$(cat "$SANDBOX/ci/tools/windows-pins.sh")" ] \
+    || [ "$before_matrix" != "$(cat "$SANDBOX/.github/workflows/ci-deep.yml")" ]; then
+    bad "pins-drift: a file was mutated before the missing pin was reported (partial edit)"
+elif ! grep -q 'does not set VER_PCRE2' "$SANDBOX/out.log"; then
+    bad "pins-drift: exited non-zero but did not name the missing pin: $(cat "$SANDBOX/out.log")"
+else
+    ok "pins-drift: exited non-zero, named the missing pin, and edited nothing"
+fi
+
+say "== case: harness drift (the two workflows disagree -- must FAIL LOUDLY, no edit) =="
+make_sandbox SANDBOX
+sed -i 's/HARNESS_NGINX_VERSION: "1.31.4"/HARNESS_NGINX_VERSION: "1.31.3"/' "$SANDBOX/.github/workflows/harness-fault-arms.yml"
+before_arms="$(cat "$SANDBOX/.github/workflows/harness-fault-arms.yml")"
+before_pins="$(cat "$SANDBOX/ci/tools/windows-pins.sh")"
+bindir="$(NEW_MAINLINE=1.31.5 stub_bin "$SANDBOX")"
+set +e
+(
+    cd "$SANDBOX"
+    PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    bad "harness-drift: script exited 0 with the two harness pins disagreeing"
+elif [ "$before_arms" != "$(cat "$SANDBOX/.github/workflows/harness-fault-arms.yml")" ] \
+    || [ "$before_pins" != "$(cat "$SANDBOX/ci/tools/windows-pins.sh")" ]; then
+    bad "harness-drift: a file was mutated despite the disagreement (partial edit)"
+elif ! grep -q 'must build the same nginx' "$SANDBOX/out.log"; then
+    bad "harness-drift: exited non-zero but did not report the disagreement: $(cat "$SANDBOX/out.log")"
+else
+    ok "harness-drift: exited non-zero, reported the disagreement, and edited nothing"
 fi
 
 if [ "$fail" -eq 0 ]; then
