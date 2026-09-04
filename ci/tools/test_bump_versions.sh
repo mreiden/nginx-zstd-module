@@ -130,15 +130,13 @@ stub_bin() {
     mkdir -p "$bindir"
     cat >"$bindir/curl" <<EOF
 #!/bin/bash
-# Fake nginx.org download page / GitHub release APIs / tarball fetch.
+# Fake GitHub release APIs (nginx included) / tarball fetch.
 [ -z "\${CURL_ARGV_LOG:-}" ] || printf '%s\n' "\$@" >>"\$CURL_ARGV_LOG"
 url=""
 out=""
 prev=""
 fail_url="${FAIL_URL:-}"
-omit_stable_heading="${OMIT_STABLE_HEADING:-0}"
-omit_stable_tarball="${OMIT_STABLE_TARBALL:-0}"
-omit_legacy_heading="${OMIT_LEGACY_HEADING:-0}"
+nginx_feed="${NGINX_FEED:-json}"
 for a in "\$@"; do
     case "\$a" in http*) url="\$a" ;; esac
     [ "\$prev" = "-o" ] && out="\$a"
@@ -149,16 +147,90 @@ if [ -n "\$fail_url" ]; then
     case "\$url" in *"\$fail_url"*) echo "curl: (22) stub: \$url unreachable" >&2; exit 22 ;; esac
 fi
 case "\$url" in
-    *nginx.org/en/download.html*)
-        if [ "\$omit_stable_heading" = 1 ]; then
-            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gz nginx-${NEW_STABLE:-$CUR_STABLE}.tar.gz"
-        elif [ "\$omit_stable_tarball" = 1 ]; then
-            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionLegacy versionnginx-1.28.0.tar.gz"
-        elif [ "\$omit_legacy_heading" = 1 ]; then
-            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionLegacy nginx-1.28.0.tar.gz"
-        else
-            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionnginx-${NEW_STABLE:-$CUR_STABLE}.tar.gzLegacy versionnginx-1.28.0.tar.gz"
-        fi
+    *api.github.com/repos/nginx/nginx/releases?per_page=30\&page=*)
+        page="\${url##*page=}"
+        # The feed as GitHub serves it, plus decoys every case must ignore:
+        # a legacy line listed FIRST (order must not matter), a draft and a
+        # prerelease newer than everything, and a tag of another shape.
+        # A full page (30 entries) tells the script there may be more.
+        full_page_of_mainline() { # 30 odd-minor entries older than the mainline pin
+            local i sep=""
+            echo "["
+            for i in \$(seq 1 30); do
+                echo " \${sep}{\"tag_name\": \"release-1.29.\$i\", \"draft\": false, \"prerelease\": false}"
+                sep=","
+            done
+            echo "]"
+        }
+        case "\$nginx_feed" in
+            html)
+                echo "<html>Mainline version nginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gz</html>" ;;
+            no-even)
+                echo "[{\"tag_name\": \"release-${NEW_MAINLINE:-$CUR_MAINLINE}\", \"draft\": false, \"prerelease\": false}]" ;;
+            malformed-only)
+                echo '[{"tag_name": "release-9.98.1", "prerelease": false},'
+                echo ' {"tag_name": "release-9.98.2", "draft": 0, "prerelease": false},'
+                echo ' {"tag_name": "release-9.98.3", "draft": "false", "prerelease": false},'
+                echo ' {"tag_name": "release-9.98.4", "draft": null, "prerelease": false},'
+                echo ' {"tag_name": "release-9.98.5", "draft": false},'
+                echo ' {"tag_name": "release-9.98.6", "draft": false, "prerelease": 0},'
+                echo ' {"tag_name": "release-9.98.7", "draft": false, "prerelease": "false"},'
+                echo ' {"tag_name": "release-9.98.8", "draft": false, "prerelease": null}]' ;;
+            paged)
+                # Stable only appears on page two, behind a full page of mainline.
+                if [ "\$page" = 1 ]; then
+                    echo "[{\"tag_name\": \"release-${NEW_MAINLINE:-$CUR_MAINLINE}\", \"draft\": false, \"prerelease\": false},"
+                    for i in \$(seq 1 28); do
+                        echo " {\"tag_name\": \"release-1.29.\$i\", \"draft\": false, \"prerelease\": false},"
+                    done
+                    echo " {\"tag_name\": \"release-1.29.30\", \"draft\": false, \"prerelease\": false}]"
+                else
+                    echo "[{\"tag_name\": \"release-1.28.0\", \"draft\": false, \"prerelease\": false},"
+                    echo " {\"tag_name\": \"release-${NEW_STABLE:-$CUR_STABLE}\", \"draft\": false, \"prerelease\": false}]"
+                fi ;;
+            legacy-first)
+                # Page one is full and carries a recently created LEGACY even
+                # release beside the mainline; the newer stable line is on
+                # page two. Stopping at "both parities seen" would pin the
+                # legacy release as stable.
+                if [ "\$page" = 1 ]; then
+                    echo "[{\"tag_name\": \"release-${NEW_MAINLINE:-$CUR_MAINLINE}\", \"draft\": false, \"prerelease\": false},"
+                    echo " {\"tag_name\": \"release-1.28.9\", \"draft\": false, \"prerelease\": false},"
+                    for i in \$(seq 1 27); do
+                        echo " {\"tag_name\": \"release-1.29.\$i\", \"draft\": false, \"prerelease\": false},"
+                    done
+                    echo " {\"tag_name\": \"release-1.29.30\", \"draft\": false, \"prerelease\": false}]"
+                else
+                    echo "[{\"tag_name\": \"release-${NEW_STABLE:-$CUR_STABLE}\", \"draft\": false, \"prerelease\": false}]"
+                fi ;;
+            endless)
+                # Every page is full and never shows a stable: the cap must end it.
+                full_page_of_mainline ;;
+            capped)
+                # Every page is full and carries BOTH parities, newer than the
+                # pins: a read that stops at the cap must not pick from them.
+                echo "["
+                for i in \$(seq 1 15); do
+                    echo " {\"tag_name\": \"release-1.30.\$((i + 4))\", \"draft\": false, \"prerelease\": false},"
+                    echo " {\"tag_name\": \"release-1.31.\$((i + 4))\", \"draft\": false, \"prerelease\": false}\$([ "\$i" -lt 15 ] && echo ,)"
+                done
+                echo "]" ;;
+            *)
+                echo "[{\"tag_name\": \"release-1.28.0\", \"draft\": false, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-1.33.0\", \"draft\": true, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-1.33.1\", \"draft\": false, \"prerelease\": true},"
+                echo " {\"tag_name\": \"release-9.98.1\", \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-9.98.2\", \"draft\": 0, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-9.98.3\", \"draft\": \"false\", \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-9.98.4\", \"draft\": null, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-9.98.5\", \"draft\": false},"
+                echo " {\"tag_name\": \"release-9.98.6\", \"draft\": false, \"prerelease\": 0},"
+                echo " {\"tag_name\": \"release-9.98.7\", \"draft\": false, \"prerelease\": \"false\"},"
+                echo " {\"tag_name\": \"release-9.98.8\", \"draft\": false, \"prerelease\": null},"
+                echo " {\"tag_name\": \"v9.9.9\", \"draft\": false, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-${NEW_STABLE:-$CUR_STABLE}\", \"draft\": false, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-${NEW_MAINLINE:-$CUR_MAINLINE}\", \"draft\": false, \"prerelease\": false}]" ;;
+        esac
         exit 0 ;;
     *api.github.com/repos/webserver-llc/angie/releases/latest*)
         echo "{\"tag_name\": \"${NEW_ANGIE:-$CUR_ANGIE}\"}"
@@ -370,13 +442,11 @@ sed -i '/^SHA_NASM=/d' "$SANDBOX/ci/tools/windows-pins.sh"
 before_pins="$(cat "$SANDBOX/ci/tools/windows-pins.sh")"
 before_matrix="$(cat "$SANDBOX/.github/workflows/ci-deep.yml")"
 bindir="$(NEW_STABLE=1.30.5 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 if [ "$rc" -eq 0 ]; then
     bad "missing-nasm: script exited 0 with SHA_NASM missing from windows-pins.sh"
 elif [ "$before_pins" != "$(cat "$SANDBOX/ci/tools/windows-pins.sh")" ] || [ "$before_matrix" != "$(cat "$SANDBOX/.github/workflows/ci-deep.yml")" ]; then
@@ -412,13 +482,11 @@ for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml 
     before[$f]="$(cat "$SANDBOX/$f")"
 done
 bindir="$(NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
 for f in "${!before[@]}"; do
     [ "${before[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
@@ -459,88 +527,197 @@ else
     bad "token-argv: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
 fi
 
-say "== case: missing stable section heading fails closed without edits =="
+say "== case: nginx feed is not JSON (HTML came back) fails closed without edits =="
 make_sandbox SANDBOX
-declare -A before_heading=()
+declare -A before_feed=()
 for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
-    before_heading[$f]="$(cat "$SANDBOX/$f")"
+    before_feed[$f]="$(cat "$SANDBOX/$f")"
 done
-bindir="$(OMIT_STABLE_HEADING=1 stub_bin "$SANDBOX")"
-set +e
+bindir="$(NGINX_FEED=html stub_bin "$SANDBOX")"
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
-for f in "${!before_heading[@]}"; do
-    [ "${before_heading[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+for f in "${!before_feed[@]}"; do
+    [ "${before_feed[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
 done
 if [ "$rc" -eq 0 ]; then
-    bad "missing-heading: script exited 0 after the stable heading disappeared"
+    bad "feed-not-json: script exited 0 on an HTML answer from the release feed"
 elif [ -n "$changed" ]; then
-    bad "missing-heading: tracked file(s) changed despite the parse failure:$changed"
-elif ! grep -Fq 'has no "Stable version" section -- refusing to guess' "$SANDBOX/out.log"; then
-    bad "missing-heading: unexpected log: $(cat "$SANDBOX/out.log")"
+    bad "feed-not-json: tracked file(s) changed despite the feed failure:$changed"
+elif ! grep -Fq 'the nginx release feed is not JSON' "$SANDBOX/out.log"; then
+    bad "feed-not-json: unexpected log: $(cat "$SANDBOX/out.log")"
 else
-    ok "missing-heading: failed closed, named the missing section, and edited nothing"
+    ok "feed-not-json: failed closed, named the bad feed, and edited nothing"
 fi
 
-say "== case: stable section without a tarball cannot borrow the legacy release =="
+say "== case: nginx feed with no even-minor release cannot invent a stable =="
 make_sandbox SANDBOX
-declare -A before_empty_section=()
+declare -A before_no_even=()
 for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
-    before_empty_section[$f]="$(cat "$SANDBOX/$f")"
+    before_no_even[$f]="$(cat "$SANDBOX/$f")"
 done
-bindir="$(OMIT_STABLE_TARBALL=1 stub_bin "$SANDBOX")"
-set +e
+bindir="$(NGINX_FEED=no-even stub_bin "$SANDBOX")"
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
-for f in "${!before_empty_section[@]}"; do
-    [ "${before_empty_section[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+for f in "${!before_no_even[@]}"; do
+    [ "${before_no_even[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
 done
 if [ "$rc" -eq 0 ]; then
-    bad "empty-section: script exited 0 after the stable tarball disappeared"
+    bad "feed-no-even: script exited 0 with no stable release in the feed"
 elif [ -n "$changed" ]; then
-    bad "empty-section: tracked file(s) changed despite the parse failure:$changed"
+    bad "feed-no-even: tracked file(s) changed despite the missing line:$changed"
 elif ! grep -Fq 'could not determine NEW_STABLE' "$SANDBOX/out.log"; then
-    bad "empty-section: unexpected log: $(cat "$SANDBOX/out.log")"
+    bad "feed-no-even: unexpected log: $(cat "$SANDBOX/out.log")"
 else
-    ok "empty-section: failed closed instead of borrowing the legacy tarball"
+    ok "feed-no-even: failed closed instead of pinning a mainline release as stable"
 fi
 
-say "== case: missing next-section boundary cannot expose a later tarball =="
+say "== case: nginx feed with only schema-invalid release records fails closed without edits =="
 make_sandbox SANDBOX
-declare -A before_missing_boundary=()
+declare -A before_malformed=()
 for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
-    before_missing_boundary[$f]="$(cat "$SANDBOX/$f")"
+    before_malformed[$f]="$(sha256sum "$SANDBOX/$f" | awk '{print $1}')"
 done
-bindir="$(OMIT_LEGACY_HEADING=1 stub_bin "$SANDBOX")"
-set +e
+bindir="$(NGINX_FEED=malformed-only stub_bin "$SANDBOX")"
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
-for f in "${!before_missing_boundary[@]}"; do
-    [ "${before_missing_boundary[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+for f in "${!before_malformed[@]}"; do
+    [ "${before_malformed[$f]}" = "$(sha256sum "$SANDBOX/$f" | awk '{print $1}')" ] \
+        || changed="$changed $f"
 done
 if [ "$rc" -eq 0 ]; then
-    bad "missing-boundary: script exited 0 after the legacy heading disappeared"
+    bad "feed-malformed: script exited 0 with no schema-valid nginx release"
 elif [ -n "$changed" ]; then
-    bad "missing-boundary: tracked file(s) changed despite the parse failure:$changed"
-elif ! grep -Fq 'has no "Legacy version" boundary after "Stable version"' "$SANDBOX/out.log"; then
-    bad "missing-boundary: unexpected log: $(cat "$SANDBOX/out.log")"
+    bad "feed-malformed: tracked file(s) changed despite the invalid feed:$changed"
+elif ! grep -Fq 'could not determine NEW_STABLE' "$SANDBOX/out.log"; then
+    bad "feed-malformed: unexpected log: $(cat "$SANDBOX/out.log")"
 else
-    ok "missing-boundary: failed closed instead of exposing a later tarball"
+    ok "feed-malformed: rejected missing and non-boolean eligibility flags and edited nothing"
+fi
+
+say "== case: branch transition -- a new even-minor stable above the mainline line moves stable only =="
+if run_case transition NEW_STABLE=1.32.0; then
+    if grep -q 'version: "1.32.0"' "$SANDBOX/.github/workflows/ci-deep.yml" \
+        && grep -q '\["1.32.0"\]' "$SANDBOX/ci/tools/ci-build.sh" \
+        && [ "$(harness_line 1.31.4 ci-deep.yml)" = 1 ] \
+        && [ "$(harness_line 1.31.4 harness-fault-arms.yml)" = 1 ] \
+        && [ "$(pins_line VER_NGINX)" = "VER_NGINX=1.31.4" ] \
+        && ! grep -q '1.33' "$SANDBOX/.github/workflows/ci-deep.yml"; then
+        ok "transition: stable moved to 1.32.0; mainline pins stayed on 1.31.4; the draft/prerelease 1.33.x were ignored"
+    else
+        bad "transition: unexpected result: $(cat "$SANDBOX/out.log")"
+    fi
+else
+    bad "transition: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
+fi
+
+say "== case: stable only on page two of the feed is still found =="
+make_sandbox SANDBOX
+argv_log="$SANDBOX/curl.argv"
+bindir="$(NGINX_FEED=paged NEW_STABLE=1.30.5 stub_bin "$SANDBOX")"
+if (
+    cd "$SANDBOX"
+    CURL_ARGV_LOG="$argv_log" PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+); then
+    if grep -q 'version: "1.30.5"' "$SANDBOX/.github/workflows/ci-deep.yml" \
+        && grep -q '\["1.30.5"\]' "$SANDBOX/ci/tools/ci-build.sh" \
+        && grep -q 'releases?per_page=30&page=2' "$argv_log" \
+        && ! grep -q 'releases?per_page=30&page=3' "$argv_log"; then
+        ok "feed-page-two: read page two, found the stable there, stopped at the short page"
+    else
+        bad "feed-page-two: unexpected result: $(cat "$SANDBOX/out.log"); pages: $(grep -o 'page=[0-9]*' "$argv_log" | tr '\n' ' ')"
+    fi
+else
+    bad "feed-page-two: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
+fi
+
+say "== case: a legacy even-minor release on page one must not hide the newer stable on page two =="
+make_sandbox SANDBOX
+argv_log="$SANDBOX/curl.argv"
+bindir="$(NGINX_FEED=legacy-first NEW_STABLE=1.30.5 stub_bin "$SANDBOX")"
+if (
+    cd "$SANDBOX"
+    CURL_ARGV_LOG="$argv_log" PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+); then
+    if grep -q 'version: "1.30.5"' "$SANDBOX/.github/workflows/ci-deep.yml" \
+        && grep -q '\["1.30.5"\]' "$SANDBOX/ci/tools/ci-build.sh" \
+        && ! grep -q '1.28.9' "$SANDBOX/out.log" \
+        && grep -q 'releases?per_page=30&page=2' "$argv_log"; then
+        ok "feed-legacy-first: read past a page that already had both parities; stable is 1.30.5, not the legacy 1.28.9"
+    else
+        bad "feed-legacy-first: unexpected result: $(cat "$SANDBOX/out.log"); pages: $(grep -o 'page=[0-9]*' "$argv_log" | tr '\n' ' ')"
+    fi
+else
+    bad "feed-legacy-first: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
+fi
+
+say "== case: a feed that never shows a stable stops at the page cap and fails closed =="
+make_sandbox SANDBOX
+argv_log="$SANDBOX/curl.argv"
+declare -A before_endless=()
+for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
+    before_endless[$f]="$(cat "$SANDBOX/$f")"
+done
+bindir="$(NGINX_FEED=endless stub_bin "$SANDBOX")"
+rc=0
+(
+    cd "$SANDBOX"
+    CURL_ARGV_LOG="$argv_log" PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+) || rc=$?
+changed=""
+for f in "${!before_endless[@]}"; do
+    [ "${before_endless[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+done
+if [ "$rc" -eq 0 ]; then
+    bad "feed-endless: script exited 0 without ever seeing a stable release"
+elif [ -n "$changed" ]; then
+    bad "feed-endless: tracked file(s) changed:$changed"
+elif ! grep -Fq 'did not end within 5 pages' "$SANDBOX/out.log"; then
+    bad "feed-endless: unexpected log: $(cat "$SANDBOX/out.log")"
+elif ! grep -q 'page=5' "$argv_log" || grep -q 'page=6' "$argv_log"; then
+    bad "feed-endless: paging did not stop at the cap: $(grep -o 'page=[0-9]*' "$argv_log" | tr '\n' ' ')"
+else
+    ok "feed-endless: read five pages, no more, and refused the incomplete read"
+fi
+
+say "== case: every capped page full and carrying newer releases of both lines -- must refuse, not pick =="
+make_sandbox SANDBOX
+argv_log="$SANDBOX/curl.argv"
+declare -A before_capped=()
+for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
+    before_capped[$f]="$(cat "$SANDBOX/$f")"
+done
+bindir="$(NGINX_FEED=capped stub_bin "$SANDBOX")"
+rc=0
+(
+    cd "$SANDBOX"
+    CURL_ARGV_LOG="$argv_log" PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+) || rc=$?
+changed=""
+for f in "${!before_capped[@]}"; do
+    [ "${before_capped[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+done
+if [ "$rc" -eq 0 ]; then
+    bad "feed-capped: script exited 0 after reading only the capped pages"
+elif [ -n "$changed" ]; then
+    bad "feed-capped: tracked file(s) changed from an incomplete read:$changed"
+elif ! grep -Fq 'did not end within 5 pages' "$SANDBOX/out.log"; then
+    bad "feed-capped: unexpected log: $(cat "$SANDBOX/out.log")"
+elif grep -q 'bump nginx stable' "$SANDBOX/out.log"; then
+    bad "feed-capped: a bump was resolved from the incomplete read: $(cat "$SANDBOX/out.log")"
+else
+    ok "feed-capped: refused at the cap with both lines visible on every page, edited nothing"
 fi
 
 say "== case: install failure on the SECOND changed file rolls back the first =="
@@ -550,13 +727,11 @@ for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml 
     before_install[$f]="$(cat "$SANDBOX/$f")"
 done
 bindir="$(NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     BUMP_VERSIONS_TEST_FAIL_INSTALL_AT=2 PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
 for f in "${!before_install[@]}"; do
     [ "${before_install[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
@@ -578,13 +753,11 @@ for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml 
     before_interrupt[$f]="$(cat "$SANDBOX/$f")"
 done
 bindir="$(NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     BUMP_VERSIONS_TEST_INTERRUPT_INSTALL_AT=1 PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
 for f in "${!before_interrupt[@]}"; do
     [ "${before_interrupt[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
@@ -621,13 +794,11 @@ EOF
 before_matrix="$(cat "$SANDBOX/.github/workflows/ci-deep.yml")"
 before_build="$(cat "$SANDBOX/ci/tools/ci-build.sh")"
 bindir="$(NEW_STABLE=1.30.5 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 after_matrix="$(cat "$SANDBOX/.github/workflows/ci-deep.yml")"
 after_build="$(cat "$SANDBOX/ci/tools/ci-build.sh")"
 if [ "$rc" -eq 0 ]; then
@@ -647,13 +818,11 @@ before_pins="$(cat "$SANDBOX/ci/tools/windows-pins.sh")"
 before_matrix="$(cat "$SANDBOX/.github/workflows/ci-deep.yml")"
 # A stable bump is pending too: the pins check must run before it lands.
 bindir="$(NEW_STABLE=1.30.5 NEW_PCRE2=10.48 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 if [ "$rc" -eq 0 ]; then
     bad "pins-drift: script exited 0 with a pin missing from windows-pins.sh"
 elif [ "$before_pins" != "$(cat "$SANDBOX/ci/tools/windows-pins.sh")" ] \
@@ -671,13 +840,11 @@ sed -i 's/HARNESS_NGINX_VERSION: "1.31.4"/HARNESS_NGINX_VERSION: "1.31.3"/' "$SA
 before_arms="$(cat "$SANDBOX/.github/workflows/harness-fault-arms.yml")"
 before_pins="$(cat "$SANDBOX/ci/tools/windows-pins.sh")"
 bindir="$(NEW_MAINLINE=1.31.5 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 if [ "$rc" -eq 0 ]; then
     bad "harness-drift: script exited 0 with the two harness pins disagreeing"
 elif [ "$before_arms" != "$(cat "$SANDBOX/.github/workflows/harness-fault-arms.yml")" ] \
