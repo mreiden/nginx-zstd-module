@@ -418,6 +418,87 @@ static ngx_str_t  ngx_http_compression_gzip_token = ngx_string("gzip");
  * the lists are short by construction (a handful of dictionaries per
  * location), so a linear scan is the right tool.
  */
+/*
+ * Dictionary lookup by digest (parent #322). Up to the threshold a
+ * linear memcmp over the pointer array is the cheaper scan; above it
+ * the array is sorted by digest at config load (ngx_http_compression_
+ * dicts_sort() from merge_loc_conf) and searched binarily. Equal
+ * digests never coexist -- the store refuses a duplicate hash at
+ * declaration -- so the order is unambiguous and the search exact.
+ * The threshold is the parent's, from its dcz lookup measurement
+ * (ci/tools/dcz_refprefix_cost_bench.sh); a deployment with hundreds
+ * of dictionaries paid the full scan on every negotiated request.
+ */
+#define NGX_HTTP_COMPRESSION_DICT_BSEARCH_THRESHOLD  16
+
+static int ngx_libc_cdecl
+ngx_http_compression_dict_cmp(const void *one, const void *two)
+{
+    const ngx_http_compression_dict_t *const  *a = one;
+    const ngx_http_compression_dict_t *const  *b = two;
+
+    return ngx_memcmp((*a)->sha256, (*b)->sha256,
+                      NGX_HTTP_COMPRESSION_SHA256_LEN);
+}
+
+
+static void
+ngx_http_compression_dicts_sort(ngx_array_t *dicts)
+{
+    if (dicts != NULL && dicts->nelts > 1) {
+        ngx_qsort(dicts->elts, (size_t) dicts->nelts,
+                  sizeof(ngx_http_compression_dict_t *),
+                  ngx_http_compression_dict_cmp);
+    }
+}
+
+
+static ngx_http_compression_dict_t *
+ngx_http_compression_dict_lookup(ngx_array_t *dicts,
+    const u_char raw[NGX_HTTP_COMPRESSION_SHA256_LEN])
+{
+    ngx_int_t                       lo, hi, mid, c;
+    ngx_uint_t                      i;
+    ngx_http_compression_dict_t   **list;
+
+    list = dicts->elts;
+
+    if (dicts->nelts > NGX_HTTP_COMPRESSION_DICT_BSEARCH_THRESHOLD) {
+        lo = 0;
+        hi = (ngx_int_t) dicts->nelts - 1;
+
+        while (lo <= hi) {
+            mid = lo + (hi - lo) / 2;
+            c = ngx_memcmp(list[mid]->sha256, raw,
+                           NGX_HTTP_COMPRESSION_SHA256_LEN);
+
+            if (c == 0) {
+                return list[mid];
+            }
+
+            if (c < 0) {
+                lo = mid + 1;
+
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        return NULL;
+    }
+
+    for (i = 0; i < dicts->nelts; i++) {
+        if (ngx_memcmp(list[i]->sha256, raw,
+                       NGX_HTTP_COMPRESSION_SHA256_LEN) == 0)
+        {
+            return list[i];
+        }
+    }
+
+    return NULL;
+}
+
+
 static ngx_http_compression_dict_t *
 ngx_http_compression_match_dict(ngx_http_request_t *r,
     ngx_http_compression_conf_t *conf)
@@ -436,7 +517,6 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
     ngx_uint_t                     i, ad_n, sfs_n;
     ngx_list_part_t               *part;
     ngx_table_elt_t               *h, *ad, *sfs;
-    ngx_http_compression_dict_t  **list;
 
     if (conf->dicts == NULL || conf->dicts->nelts == 0) {
         return NULL;
@@ -606,16 +686,7 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
         return NULL;
     }
 
-    list = conf->dicts->elts;
-    for (i = 0; i < conf->dicts->nelts; i++) {
-        if (ngx_memcmp(list[i]->sha256, raw,
-                       NGX_HTTP_COMPRESSION_SHA256_LEN) == 0)
-        {
-            return list[i];
-        }
-    }
-
-    return NULL;
+    return ngx_http_compression_dict_lookup(conf->dicts, raw);
 }
 
 
@@ -1669,6 +1740,19 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
      */
     if (conf->dicts == NULL) {
         conf->dicts = prev->dicts;
+
+        /*
+         * The http-level array is only ever the parent side of a merge,
+         * so it is sorted here, at inheritance, and again by every
+         * child that inherits it: idempotent and config-time only. The
+         * array holds pointers into the cycle-global store, so
+         * reordering it invalidates nothing anyone captured.
+         */
+        ngx_http_compression_dicts_sort(conf->dicts);
+
+    } else {
+        /* an owned array: sorted once, after its last push */
+        ngx_http_compression_dicts_sort(conf->dicts);
     }
 
     if (conf->order == NULL) {

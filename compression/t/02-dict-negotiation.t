@@ -42,6 +42,19 @@ our $odd_raw = "\x01" x 32;
 our $odd_hex = "01" x 32;
 our $odd_b64 = encode_base64($odd_raw, "");
 
+# twenty dictionaries (parent #322): above sixteen the store's lookup is a
+# binary search over the digest-sorted pointer array instead of a linear
+# scan; these fixtures make a location carry enough entries to take that
+# branch, and the negotiated one sits mid-list in declaration order.
+our @many     = map { "filler dictionary number $_ content
+" x 20 } 1..19;
+our $mid_raw  = sha256($many[12]);
+our $mid_b64  = encode_base64($mid_raw, "");
+our $many_cfg = join("
+", "    compression_dict_file html/app.dict;",
+                     map { "    compression_dict_file html/many_$_.dict;" } 1..19);
+our @many_files = ([ "app.dict" => $dict ], map { [ "many_$_.dict" => $many[$_ - 1] ] } 1..19);
+
 # dcz: 40-byte skippable frame (magic 0x184D2A5E LE, size 0x20 LE,
 # SHA-256), then the zstd magic of the checksummed stream
 our $dcz_re = qr/^\x5E\x2A\x4D\x18\x20\x00\x00\x00\Q$raw\E\x28\xB5\x2F\xFD/s;
@@ -1056,5 +1069,91 @@ GET /page.shtml
 qq{Accept-Encoding: gzip, zstd, dcz\nAvailable-Dictionary: :$::b64:}
 --- response_body_like
 GZ-SIDECAR-MARKER
+--- no_error_log
+[error]
+
+
+
+=== TEST 30: twenty dictionaries: the mid-list one negotiates through the binary search
+# parent #322: above sixteen entries the lookup is a binary search over
+# the pointer array sorted by digest at config load (an http-level list,
+# inherited by the location, sorted at inheritance). The thirteenth
+# dictionary in declaration order is neither first nor last of anything
+# once sorted, so a search over an unsorted array would miss it.
+--- user_files eval
+\@::many_files
+--- http_config eval
+$::many_cfg
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        return 200 "negotiation fixture body, long enough to compress meaningfully
+";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz
+Available-Dictionary: :$::mid_b64:}
+--- response_headers
+Content-Encoding: dcz
+--- response_body_like eval
+qr/^\x5E\x2A\x4D\x18\x20\x00\x00\x00\Q$::mid_raw\E\x28\xB5\x2F\xFD/s
+--- no_error_log
+[error]
+
+
+=== TEST 31: twenty dictionaries: the first-declared one still negotiates
+# The same list; declaration order is not lookup order any more, and the
+# first-declared dictionary must be found wherever the sort put it.
+--- user_files eval
+\@::many_files
+--- http_config eval
+$::many_cfg
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        return 200 "negotiation fixture body, long enough to compress meaningfully
+";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz
+Available-Dictionary: :$::b64:}
+--- response_headers
+Content-Encoding: dcz
+--- response_body_like eval
+$::dcz_re
+--- no_error_log
+[error]
+
+
+=== TEST 32: twenty dictionaries: an unknown digest falls through to plain zstd
+# The search's miss path: no entry has this digest, so negotiation
+# declines dcz and the base coding serves.
+--- user_files eval
+\@::many_files
+--- http_config eval
+$::many_cfg
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        return 200 "negotiation fixture body, long enough to compress meaningfully
+";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz
+Available-Dictionary: :$::odd_b64:}
+--- response_headers
+Content-Encoding: zstd
 --- no_error_log
 [error]
