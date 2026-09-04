@@ -220,10 +220,22 @@ ngx_http_compression_eval_qvalue(ngx_str_t *ae, u_char *p)
 /*
  * Effective weight for `coding` in milli-units (0..1000), or -1 when
  * the header expresses no preference for it at all.
+ *
+ * The _ex form also reports the two accumulated weights it computed
+ * anyway (parent #315): *explicit_q is the latest explicit `coding`
+ * token's weight and *star_q_out the latest "*" weight, each -1 when
+ * that form is absent. The chain walker below needs both to compose
+ * duplicate field lines, and taking them from one pass keeps it from
+ * parsing the same line a second time just to learn which of the two
+ * produced the answer. The return value is exactly the precedence rule
+ * applied to them. The parent keeps a single-value wrapper without the
+ * out-params for its fuzz oracle; this module has no caller for one
+ * (every negotiation goes through the field walkers below), so only
+ * the _ex form exists here and the name stays aligned with the parent.
  */
 static ngx_int_t
-ngx_http_compression_coding_weight(ngx_str_t *ae, ngx_str_t *coding,
-    ngx_uint_t allow_wildcard)
+ngx_http_compression_coding_weight_ex(ngx_str_t *ae, ngx_str_t *coding,
+    ngx_uint_t allow_wildcard, ngx_int_t *explicit_q, ngx_int_t *star_q_out)
 {
     u_char     *p   = ae->data;
     u_char     *end = ae->data + ae->len;
@@ -305,6 +317,9 @@ ngx_http_compression_coding_weight(ngx_str_t *ae, ngx_str_t *coding,
             }
         }
     }
+
+    *explicit_q = coding_q;
+    *star_q_out = star_q;
 
     if (coding_q >= 0) {
         return coding_q;
@@ -488,14 +503,15 @@ ngx_http_compression_ae_header(ngx_http_request_t *r)
  * "Accept-Encoding: gzip" + "Accept-Encoding: zstd" IS "gzip, zstd".
  *
  * Composition, not a second parser: the single-value parser above is
- * asked twice per line — wildcard suppressed, to learn the line's
- * EXPLICIT weight, then as the caller asked, so a differing answer can
- * only have come from "*". The latest explicit token wins across lines
- * exactly as it does within one line, and the wildcard stays
- * subordinate to any explicit token anywhere in the field. The
- * single-value parser itself is untouched — it is the fuzz-differential
- * lineage shared with the parent, and this function never reaches
- * inside one line.
+ * asked once per line through its _ex form, which hands back the
+ * line's EXPLICIT weight and its "*" weight separately (parent #315;
+ * the earlier shape asked twice, wildcard-suppressed then as-asked, and
+ * so re-scanned every line that named no explicit token, the common
+ * case). The latest explicit token wins across lines exactly as it
+ * does within one line, and the wildcard stays subordinate to any
+ * explicit token anywhere in the field. The single-value parser's
+ * lineage is untouched, and this function never reaches inside one
+ * line.
  */
 /*
  * One field line folded into the field-wide accumulators, and the
@@ -509,21 +525,20 @@ static ngx_inline void
 ngx_http_compression_fold_line_weight(ngx_str_t *value, ngx_str_t *coding,
     ngx_uint_t allow_wildcard, ngx_int_t *coding_q, ngx_int_t *star_q)
 {
-    ngx_int_t  q;
+    ngx_int_t  line_coding_q, line_star_q;
 
-    q = ngx_http_compression_coding_weight(value, coding, 0);
-    if (q >= 0) {
-        *coding_q = q;      /* comma-joined in received order */
+    (void) ngx_http_compression_coding_weight_ex(value, coding,
+                                                 allow_wildcard,
+                                                 &line_coding_q,
+                                                 &line_star_q);
+
+    if (line_coding_q >= 0) {
+        *coding_q = line_coding_q;  /* comma-joined in received order */
         return;
     }
 
-    if (!allow_wildcard) {
-        return;
-    }
-
-    q = ngx_http_compression_coding_weight(value, coding, 1);
-    if (q >= 0) {
-        *star_q = q;        /* only "*" could answer here */
+    if (allow_wildcard && line_star_q >= 0) {
+        *star_q = line_star_q;
     }
 }
 
