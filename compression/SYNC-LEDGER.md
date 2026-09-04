@@ -332,10 +332,7 @@ mreiden/ngx_brotli commits.
 
 phase0 synced through master 8fdd0b1 (#310) in his 16f1db5; master is
 12 commits ahead (#311–#322) and the next sync is his. The 🔜 ports
-below wait for it, so the shared headers move together. Still open:
-#323 (gitignore, N/A), #324 (Vary-walk fusion — expected N/A, Vary is
-by construction here; confirm at merge), #325 (positive frame-probe
-verdict cache — port candidate onto the cycle-owned memo). RFC #312
+below wait for it, so the shared headers move together. RFC #312
 (dict-file I/O consolidation) awaits his shape choice.
 
 | # | subject | disposition | brotli? | notes |
@@ -353,3 +350,12 @@ verdict cache — port candidate onto the cycle-owned memo). RFC #312
 | 320 | rate-limit the directio probe hard-error log | 🔜 | ➖ N/A | his window counter is file-static; ours goes in the cycle-owned static main conf beside the dio scratch (#103 rule) |
 | 321 | A33 micro sweep P7–P11 | ◑ P7 🔜, P8 🔎, P9 via sync, P10/P11 N/A | ➖ | P7 bounds the bad-verdict scan by populated slots (our bad[64] memo can take it); P8 lowcase_key memcmp for Available-Dictionary (our walk uses strncasecmp, module.c:500); P9 changes the shared cache-control header's directive_end signature — we call only the top-level no_transform() and the seam test counts the same three definitions, so his sync is safe; P10 Vary token walk N/A (Vary by construction); P11 loc-conf threading N/A (one fetch, module.c:1876) |
 | 322 | binary-search the dict negotiation lookup above 16 entries | 🔜 | 🔎 | match_dict is a linear memcmp over conf->dicts (module.c:610); a deployment with hundreds of dictionaries pays that per request, which is what his threshold targets; dicts inherit by pointer (module.c:1671), so only owned arrays get sorted, as his |
+
+### Batch: #323–#326 (2026-09-04)
+
+| # | subject | disposition | brotli? | notes |
+|---|---------|-------------|---------|-------|
+| 323 | gitignore the unit build outputs | ➖ N/A | ➖ | |
+| 324 | fuse the two Vary walks in the dcz dict-bypass path | 🔎 expected N/A | ➖ | our Vary is by construction (single line, no scanner pair, #263 row); confirm nothing to fuse at the port round |
+| 325 | cache the positive frame-probe verdict too | 🔜 | ➖ N/A | onto the cycle-owned bad-verdict memo (#287 port), same key (path, uniq, mtime, size); under directio the probe is a device read per request, which is the cost it removes |
+| 326 | (ours, OPEN) nginx stable/mainline from the GitHub releases feed | ➖ upstream tooling (phase0 unaffected) | ➖ | Mark's idea from the #319 review's HTML-parsing thread: nginx publishes signed Releases (asset bytes and .asc identical to nginx.org's, ci/tools/keys verifies); even minor = stable, odd = mainline; drafts/prereleases/foreign tags ignored, non-JSON and missing-parity fail closed; 21 hermetic cases |
