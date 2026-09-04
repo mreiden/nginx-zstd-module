@@ -62,12 +62,18 @@ typedef struct {
 
 #define NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS  64
 
+/* a memo slot's verdict (parent #325: positive verdicts join the ring) */
+#define NGX_HTTP_COMPRESSION_STATIC_VERDICT_NONE  0
+#define NGX_HTTP_COMPRESSION_STATIC_VERDICT_BAD   1
+#define NGX_HTTP_COMPRESSION_STATIC_VERDICT_GOOD  2
+
 typedef struct {
     ngx_file_uniq_t  uniq;
     time_t           mtime;
     off_t            size;
+    time_t           checked;  /* when a GOOD verdict was probed */
     size_t           len;
-    ngx_uint_t       valid;
+    ngx_uint_t       valid;    /* NGX_HTTP_COMPRESSION_STATIC_VERDICT_* */
     u_char           path[NGX_MAX_PATH];
 } ngx_http_compression_static_bad_t;
 
@@ -110,6 +116,17 @@ typedef struct {
      * geometry, window) are remembered -- a read error is transient
      * and must be retried. Cycle-owned like the scratch above: a new
      * cycle starts from a pcalloc'd conf, nothing to reset.
+     *
+     * GOOD verdicts share the ring (parent #325): under directio the
+     * probe is an O_DIRECT read that bypasses the page cache, a real
+     * device read on every request that reaches it, and the probe's
+     * whole output is its verdict (window and skippable-chain findings
+     * become DECLINED plus a log line inside it), so a cached NGX_OK
+     * carries everything a fresh one would. A GOOD entry is remembered
+     * only when open_file_cache is configured and lives exactly
+     * open_file_cache_valid seconds -- the same freshness contract the
+     * fd itself is served under -- so a file edited in place inside
+     * one mtime tick is re-probed no later than the cache re-opens it.
      */
     ngx_http_compression_static_bad_t
                    bad[NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS];
@@ -546,41 +563,61 @@ ngx_http_compression_static_dio_err_should_log(
 }
 
 
+/*
+ * The memoized verdict for this file identity, or VERDICT_NONE. A GOOD
+ * entry older than good_valid seconds (or any GOOD entry when good_valid
+ * is 0) is retired here rather than skipped: the caller records the
+ * fresh verdict at the ring cursor, and a stale twin left live would
+ * shadow that newer entry on every lookup until the cursor evicted it.
+ */
 static ngx_uint_t
-ngx_http_compression_static_bad_cached(
+ngx_http_compression_static_cached_verdict(
     ngx_http_compression_static_main_conf_t *smcf, ngx_str_t *path,
-    ngx_open_file_info_t *of)
+    ngx_open_file_info_t *of, time_t now, time_t good_valid)
 {
     ngx_uint_t                          i;
     ngx_http_compression_static_bad_t  *e;
 
     if (path->len >= NGX_MAX_PATH || smcf->bad_count == 0) {
-        return 0;
+        return NGX_HTTP_COMPRESSION_STATIC_VERDICT_NONE;
     }
 
     for (i = 0; i < smcf->bad_count; i++) {
         e = &smcf->bad[i];
 
-        if (e->valid && e->uniq == of->uniq && e->mtime == of->mtime
+        if (e->valid != NGX_HTTP_COMPRESSION_STATIC_VERDICT_NONE
+            && e->uniq == of->uniq && e->mtime == of->mtime
             && e->size == of->size && e->len == path->len
             && ngx_memcmp(e->path, path->data, path->len) == 0)
         {
-            return 1;
+            if (e->valid == NGX_HTTP_COMPRESSION_STATIC_VERDICT_GOOD
+                && (good_valid == 0 || now < e->checked
+                    || now - e->checked >= good_valid))
+            {
+                e->valid = NGX_HTTP_COMPRESSION_STATIC_VERDICT_NONE;
+                continue;
+            }
+
+            return e->valid;
         }
     }
 
-    return 0;
+    return NGX_HTTP_COMPRESSION_STATIC_VERDICT_NONE;
 }
 
 
 static void
-ngx_http_compression_static_bad_remember(
+ngx_http_compression_static_remember(
     ngx_http_compression_static_main_conf_t *smcf, ngx_str_t *path,
-    ngx_open_file_info_t *of)
+    ngx_open_file_info_t *of, ngx_uint_t verdict, time_t now,
+    time_t good_valid)
 {
     ngx_http_compression_static_bad_t  *e;
 
-    if (path->len >= NGX_MAX_PATH) {
+    if (path->len >= NGX_MAX_PATH
+        || (verdict == NGX_HTTP_COMPRESSION_STATIC_VERDICT_GOOD
+            && good_valid == 0))
+    {
         return;
     }
 
@@ -588,16 +625,17 @@ ngx_http_compression_static_bad_remember(
     e->uniq = of->uniq;
     e->mtime = of->mtime;
     e->size = of->size;
+    e->checked = now;
     e->len = path->len;
     ngx_memcpy(e->path, path->data, path->len);
 
-    if (!e->valid) {
-        e->valid = 1;
-
-        if (smcf->bad_count < NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS) {
-            smcf->bad_count++;
-        }
+    if (e->valid == NGX_HTTP_COMPRESSION_STATIC_VERDICT_NONE
+        && smcf->bad_count < NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS)
+    {
+        smcf->bad_count++;
     }
+
+    e->valid = verdict;
 
     smcf->bad_next++;
     if (smcf->bad_next == NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS) {
@@ -641,7 +679,8 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
     uint64_t    window, skip;
     ngx_int_t   probe_rc;
     ngx_uint_t  frames, scratch, have_block, reuse, malformed;
-    ngx_uint_t  dio_suppressed;
+    ngx_uint_t  dio_suppressed, verdict;
+    time_t      now, good_valid;
     off_t       pos, base, have_base;
     ngx_log_t  *log;
 
@@ -658,11 +697,31 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
     malformed = 0;
     n = 0;
 
-    if (ngx_http_compression_static_bad_cached(smcf, path, of)) {
+    now = ngx_time();
+    good_valid = clcf->open_file_cache == NULL
+                     ? 0 : clcf->open_file_cache_valid;
+
+    verdict = ngx_http_compression_static_cached_verdict(smcf, path, of,
+                                                         now, good_valid);
+
+    if (verdict == NGX_HTTP_COMPRESSION_STATIC_VERDICT_BAD) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
                        "compression static: cached malformed verdict for "
                        "\"%V\"", path);
         return NGX_DECLINED;
+    }
+
+    if (verdict == NGX_HTTP_COMPRESSION_STATIC_VERDICT_GOOD) {
+        /*
+         * Debug witness that the probe was elided: serving correctly
+         * proves only that the verdict was right, not where it came
+         * from. Returning here skips the scratch buffer entirely, so
+         * its busy guard is never taken on this path.
+         */
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
+                       "compression static: cached good frame verdict for "
+                       "\"%V\"", path);
+        return NGX_OK;
     }
 
     if (of->size < 4) {
@@ -974,7 +1033,14 @@ probe_done:
     }
 
     if (probe_rc == NGX_DECLINED && malformed) {
-        ngx_http_compression_static_bad_remember(smcf, path, of);
+        ngx_http_compression_static_remember(smcf, path, of,
+                                        NGX_HTTP_COMPRESSION_STATIC_VERDICT_BAD,
+                                        now, good_valid);
+
+    } else if (probe_rc == NGX_OK) {
+        ngx_http_compression_static_remember(smcf, path, of,
+                                       NGX_HTTP_COMPRESSION_STATIC_VERDICT_GOOD,
+                                       now, good_valid);
     }
 
     return probe_rc;

@@ -1280,3 +1280,74 @@ cached malformed verdict
 cached malformed verdict
 --- no_error_log
 [alert]
+
+
+=== TEST 44a: a GOOD verdict is memoized under open_file_cache, for its validity
+# parent #325: the same served .zst included three times from one SSI
+# page. With open_file_cache configured the first include probes and
+# the next two take the cached good verdict (debug witness) without
+# touching the file; the body is the sidecar three times either way.
+--- log_level: debug
+--- user_files eval
+[ [ "page/good.shtml" => '<!--#include virtual="/st/hello.js" --><!--#include virtual="/st/hello.js" --><!--#include virtual="/st/hello.js" -->' ],
+  [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::zst ] ]
+--- config
+    location /page/ {
+        ssi on;
+        default_type text/html;
+        root html;
+    }
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        open_file_cache max=16 inactive=60s;
+        open_file_cache_valid 60s;
+        root html;
+    }
+--- request
+GET /page/good.shtml
+--- more_headers
+Accept-Encoding: zstd
+--- grep_error_log eval
+qr/compression static probe:|cached good frame verdict/
+--- grep_error_log_out
+compression static probe:
+compression static probe:
+cached good frame verdict
+compression static probe:
+cached good frame verdict
+--- no_error_log
+[error]
+
+
+=== TEST 44b: without open_file_cache no GOOD verdict is kept: every include probes
+# Positive control for 44a: the cache's validity is open_file_cache_valid,
+# and with no open_file_cache there is no validity to honour, so nothing
+# is remembered and every request reads the frame header afresh.
+--- log_level: debug
+--- user_files eval
+[ [ "page/good.shtml" => '<!--#include virtual="/st/hello.js" --><!--#include virtual="/st/hello.js" --><!--#include virtual="/st/hello.js" -->' ],
+  [ "st/hello.js" => $::src ], [ "st/hello.js.zst" => $::zst ] ]
+--- config
+    location /page/ {
+        ssi on;
+        default_type text/html;
+        root html;
+    }
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        root html;
+    }
+--- request
+GET /page/good.shtml
+--- more_headers
+Accept-Encoding: zstd
+--- grep_error_log eval
+qr/compression static probe:|cached good frame verdict/
+--- grep_error_log_out
+compression static probe:
+compression static probe:
+compression static probe:
+--- no_error_log
+[error]
