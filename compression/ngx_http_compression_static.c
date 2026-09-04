@@ -114,6 +114,23 @@ typedef struct {
     ngx_http_compression_static_bad_t
                    bad[NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS];
     ngx_uint_t     bad_next;
+
+    /*
+     * Log rate limit for the directio hard-error probe arm (parent
+     * #320). NOT memoized in the ring above: that ring is keyed on
+     * file identity, and this failure is a configuration mismatch
+     * (directio_alignment against the device), not a property of the
+     * file -- caching it there would keep suppressing after the
+     * operator fixed the alignment, with no config-tied invalidation.
+     * A per-worker window instead: the first hit logs, later hits
+     * inside the window are counted, and the next emitted line
+     * reports the count. Cycle-owned like everything else here (the
+     * #103 rule): a reload's workers start at zero and log the first
+     * hit again, so a new misalignment can never hide behind a stale
+     * window.
+     */
+    time_t         dio_err_window_start;
+    ngx_uint_t     dio_err_suppressed;
     ngx_uint_t     bad_count;   /* slots ever populated, capped at SLOTS
                                  * (parent #321 P7): the common never-
                                  * populated worker skips the scan, and a
@@ -489,6 +506,46 @@ ngx_http_compression_static_dio_buf_release(
 }
 
 
+#define NGX_HTTP_COMPRESSION_STATIC_DIO_ERR_WINDOW  60
+
+/*
+ * Returns the number of hits suppressed before this one (0 for the
+ * first in a window, or when a window just rolled over), or
+ * (ngx_uint_t) -1 when this hit is itself suppressed. ngx_time() is
+ * nginx's per-iteration cached clock; a step backwards (`now < start`,
+ * an administrative or NTP jump) forces a rollover rather than
+ * extending suppression indefinitely through a negative difference.
+ */
+static ngx_uint_t
+ngx_http_compression_static_dio_err_should_log(
+    ngx_http_compression_static_main_conf_t *smcf, ngx_log_t *log)
+{
+    time_t      now;
+    ngx_uint_t  suppressed;
+
+    now = ngx_time();
+
+    if (smcf->dio_err_window_start == 0
+        || now < smcf->dio_err_window_start
+        || now - smcf->dio_err_window_start
+           >= NGX_HTTP_COMPRESSION_STATIC_DIO_ERR_WINDOW)
+    {
+        suppressed = smcf->dio_err_suppressed;
+        smcf->dio_err_window_start = now;
+        smcf->dio_err_suppressed = 0;
+        return suppressed;
+    }
+
+    smcf->dio_err_suppressed++;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
+                   "compression static: directio probe error suppressed "
+                   "(%ui so far this window)", smcf->dio_err_suppressed);
+
+    return (ngx_uint_t) -1;
+}
+
+
 static ngx_uint_t
 ngx_http_compression_static_bad_cached(
     ngx_http_compression_static_main_conf_t *smcf, ngx_str_t *path,
@@ -584,6 +641,7 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
     uint64_t    window, skip;
     ngx_int_t   probe_rc;
     ngx_uint_t  frames, scratch, have_block, reuse, malformed;
+    ngx_uint_t  dio_suppressed;
     off_t       pos, base, have_base;
     ngx_log_t  *log;
 
@@ -746,11 +804,35 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
 
         if (n < 0 || avail < 4) {
             if (of->is_directio) {
-                ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
-                              "compression static: %uz-byte aligned probe "
-                              "on directio file \"%V\" returned %z — "
-                              "declining; check directio_alignment against "
-                              "the device geometry", align, path, n);
+                /*
+                 * Once per window, with the suppressed count folded
+                 * into the next emitted line (parent #320): this fires
+                 * on every request to a misaligned sidecar, 1:1 with
+                 * traffic, and the operator needs the first line, not
+                 * the ten-thousandth.
+                 */
+                dio_suppressed =
+                    ngx_http_compression_static_dio_err_should_log(smcf, log);
+
+                if (dio_suppressed == 0) {
+                    ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                                  "compression static: %uz-byte aligned "
+                                  "probe on directio file \"%V\" returned "
+                                  "%z — declining; check directio_alignment "
+                                  "against the device geometry",
+                                  align, path, n);
+
+                } else if (dio_suppressed != (ngx_uint_t) -1) {
+                    ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                                  "compression static: %uz-byte aligned "
+                                  "probe on directio file \"%V\" returned "
+                                  "%z — declining; check directio_alignment "
+                                  "against the device geometry (%ui more "
+                                  "such probes in the last %d seconds)",
+                                  align, path, n, dio_suppressed,
+                                  NGX_HTTP_COMPRESSION_STATIC_DIO_ERR_WINDOW);
+                }
+
                 probe_rc = NGX_DECLINED;
                 goto probe_done;
             }

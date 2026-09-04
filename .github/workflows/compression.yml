@@ -153,6 +153,9 @@ jobs:
       - name: max_length abort diagnostics contract (declared vs unknown length)
         run: bash compression/tools/test_max_length_diagnostics.sh
 
+      - name: directio hard-error log rate limiter (parent #320)
+        run: bash compression/tools/test_dio_err_ratelimit_unit.sh
+
       - name: Static filter-order policy (anchor after the last compressor)
         run: sh compression/tools/test_static_filter_order.sh
 

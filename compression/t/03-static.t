@@ -682,14 +682,16 @@ Accept-Encoding: zstd
 --- response_body_like eval
 qr/^(?:identity fallback
 ){3}\s*$/
+--- error_log eval
+qr/\[error\] .*frame header\) returned \d+, client/
 --- grep_error_log eval
-qr/\[(?:error|crit)\] |frame header\) returned|cached malformed verdict/
+qr/frame header\) returned|cached malformed verdict/
 --- grep_error_log_out
-[error] 
 frame header) returned
 cached malformed verdict
 cached malformed verdict
 --- no_error_log
+[crit]
 [alert]
 
 
