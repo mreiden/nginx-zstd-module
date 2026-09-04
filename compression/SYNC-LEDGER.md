@@ -330,9 +330,10 @@ mreiden/ngx_brotli commits.
 
 ### Batch: #309–#322 (2026-09-02 → 2026-09-04)
 
-phase0 synced through master 8fdd0b1 (#310) in his 16f1db5; master is
-12 commits ahead (#311–#322) and the next sync is his. The 🔜 ports
-below wait for it, so the shared headers move together. RFC #312
+phase0 synced through master 427608e (#326) in b6f1386 (2026-09-04, ours:
+README's Bump row was the only conflict; proven on the ext4 clone with 938
+assertions across the ten suites plus the seam, filter-order, ratio and
+max-length tool tests). The 🔜 ports below run against that tree. RFC #312
 (dict-file I/O consolidation) awaits his shape choice.
 
 | # | subject | disposition | brotli? | notes |
