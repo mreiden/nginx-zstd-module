@@ -40,6 +40,7 @@ Legend: ✅ done · 🔜 queued · 🔎 needs inspection · ➖ n/a
 | 175 | 9852547 | perf(dcz): single-pass AD+SFS header collect | WRINKLES (already present) | ➖ | match_dict()'s one header walk already collects AD and SFS together |
 | 176 | 4f8cef6 | perf: fuse chain-copy and tail-track | ✅ f0c143e | 🔎 | single-pass input-chain append + tail track; committed with #157 |
 | 177 | 2979ca0 | perf: pack CCtx memory profile into 64-bit key | WRINKLES (N/A here) | ➖ | CCtx-ring-key-specific; no ring |
+| 178 | — | perf: did_len shift expression | ➖ closed unmerged | ➖ | never merged upstream; nothing to mirror |
 | 179 | c66cdeb | perf: HEAD fast path in static handler | ✅ 8e2d216 | ➖ static | HEAD returns after send_header (Vary/CE already set); TEST 34 pins header parity |
 | 180 | ab77ca2 | feat: markdownlint config + fixes | Skip (repo infra) | — | |
 | 181 | 569001a | refactor: extract token validation from bypass_vary | WRINKLES (N/A here) | ➖ | compression_bypass_vary is a plain ngx_conf_set_str_slot — no token validation to extract |
@@ -227,22 +228,37 @@ standalone PR (ours included where they round-tripped).
 
 | # | subject | disposition | brotli? | notes |
 |---|---------|-------------|---------|-------|
+| 193 | (ours) dict read-to-completion, clear O_NONBLOCK | ➖ closed in favour of #195 | ➖ | our upstream filing of the #165 finding; his #195 landed the fix |
+| 194 | testkit harness pin 5f7986c | ➖ N/A | ➖ | pin lineage; phase0 adopted the harness at 9864052 → b4d8ca9 (#306/#309) |
+| 195 | read dictionary files to completion | ✅ 6943086 (+ unit 43d7bf2) | 🔎 | dict.c cites #195; the fork's loader is not yet audited for the same short-read path |
+| 196 | writer-legal zero-size last_buf on a terminal empty frame | WRINKLES | ➖ | the content-less terminal case already ships ngx_calloc_buf (a real special buf), never a zero-size temp buf |
 | 197 | directio probe offset for skippable prefix | ✅ (earlier) | ➖ | $skip_dio fixture pins it in 03-static.t |
 | 198 | verify supplied dict hashes | ✅ e6d6e1c era | YES | verify-default; see #220 |
 | 199 | strict dict path walk | ✅ acb2598 lineage | YES | with #165 |
 | 200 | MINOR/NIT batch (byte counter, Vary dedup, helpers) | ✅ where applicable | ◑ | adopted piecemeal across phase-3 commits |
+| 201 | pin the lenient non-q Accept-Encoding parameter parse (m5) | ✅ contract pinned | ➖ | 09-ae-parser.t cites #201/m5: `foo=bar` is skipped, not refused |
 | 202 | Vary from usable sidecar, probe before acceptance | ✅ 4561880 | YES 4f59f21-era | round-4 ruling |
+| 203/204 | CCtx INVALID profile sentinel (n12; #203 closed for #204) | ➖ N/A | ➖ | no CCtx ring (#155 lineage) |
+| 205, 221 | testkit fault sites (PALLOC, refPrefix failure) | DEFERRED | ➖ | joined to the #192 testkit item |
+| 206, 216, 219, 228 | CI: apt cache, soak gate, leak positive control, gcc-multilib | ➖ N/A | ➖ | his CI estate |
 | 207 | $bytes_* via %uL | ✅ by construction | ➖ | variables print %uL (module.c:1247) |
 | 208–213, 233 | perf cluster (probe cap, block reuse, gate hoist) | ✅ b9d4717 (+cdda5b5 for #261) | ➖ | probe-read pass: 64 KB alignment clamp, cycle-owned scratch, 58-byte read-ahead reuse, probe_done discipline |
 | 214 | Test::Nginx @0.32 pin | ✅ dff9033 → superseded by #249 row | YES 6ecfbf8 | |
 | 215 | chained Accept-Encoding negotiation | ✅ aef9c95 (with #275) | YES 6987f6a | whole-field walk; refusal-only gzip veto via gzip_tested/gzip_ok, absence does not latch |
+| 217, 223 | perf-stat recipe, dcz lookup workload bench | ➖ N/A | ➖ | tooling |
 | 218 | prove ZSTD_freeCCtxParams exits | ➖ N/A | ➖ | no config-time cctx estimator here (#164/#240 lineage) |
 | 220 | (ours) dict trust-hashes opt-in | ✅ e6d6e1c | YES 127d5f2 | |
 | 222 | dict bypass main-request gate | ✅ f5ed798 | ➖ | his review fixed our subrequest hole |
+| 224 | remove CodeRabbit config | ➖ N/A | ➖ | |
+| 225 | skip superseded libzstd parameters per dictionary mode | WRINKLES | ➖ | #225 drops the level/windowLog a CDict supersedes; refPrefix carries no parameters, so every one ours sets is live |
+| 226 | single-pass Accept-Encoding parameter scan | 🔎 | 🔎 | our parser was written to #142's boundary rules; whether its parameter scan is one pass is unverified — check alongside #315 |
+| 227 | 32-bit off_t hardening of the streaming max_length cap | 🔎 | 🔎 | ours compares in off_t (module.c:2764) but the directive slot is ssize_t — same class; verify on an ILP32 build |
 | 229 | output-side zero-delta advance guard | WRINKLES | ➖ | input side already guarded (module.c:2550); ob->last provably non-NULL; sanitized CI would trap |
 | 230 | (ours) filterless bypass warning | ✅ merged upstream | ➖ | |
+| 231/232 | style: log-text and doc-comment sweeps, named magic numbers | ➖ N/A | ➖ | nothing to port |
 | 234–236 | perf leftovers | ◑ partial N/A | ➖ | per earlier survey |
 | 237 | ZSTD_STATIC_LINKING_ONLY out of dynamic ABI | ✅ c73a5f3 (taken further) | ➖ | one accepted import, self-defined TU |
+| 238 | README accuracy | ➖ docs | ➖ | |
 | 239 | servroot gitignore | ✅ | ➖ | .gitignore analog |
 | 240 | cctx budget test pin | ➖ N/A | ➖ | no zstd_max_cctx_memory here |
 | 241 | static handler decomposition | ➖ N/A | ➖ | architecture differs; nothing to decompose |
@@ -311,8 +327,29 @@ mreiden/ngx_brotli commits.
 | 301/308 | (ours) start without an http block | ✅ merged fe5db23; compression already passed | ➖ | binary gate test_no_http_block.sh |
 | 303 | static/dynamic order agreement; anchor match | ✅ 92fee0b padding, then the shared selector adopted (CodeRabbit on #117) | YES 6cbbe05 (fork stays standalone) | registration order is chain order REVERSED, so anchoring after the last compressor makes this filter run FIRST and supersede a co-built standalone zstd/brotli; auto/reorder.sh layers a zstd-filter anchor over his selector; tools/test_static_filter_order.sh pins five shapes |
 | 306 | harness pin "bump" to 9864052 | ⚠ NOT taken | ➖ | a rewind: 9864052 predates #235 (testkit main is linear); the gitlink was held forward at b4d8ca9 in 6730af6; repaired upstream by our #309 (merged 93df1b2) — the next sync met it as a no-op |
+
+### Batch: #309–#322 (2026-09-02 → 2026-09-04)
+
+phase0 synced through master 8fdd0b1 (#310) in his 16f1db5; master is
+12 commits ahead (#311–#322) and the next sync is his. The 🔜 ports
+below wait for it, so the shared headers move together. Still open:
+#323 (gitignore, N/A), #324 (Vary-walk fusion — expected N/A, Vary is
+by construction here; confirm at merge), #325 (positive frame-probe
+verdict cache — port candidate onto the cycle-owned memo). RFC #312
+(dict-file I/O consolidation) awaits his shape choice.
+
+| # | subject | disposition | brotli? | notes |
+|---|---------|-------------|---------|-------|
+| 309 | (ours) harness pin forward to b4d8ca9 (repairs #306) | ✅ merged 93df1b2; phase0 had held it forward (6730af6) | ➖ | |
 | 310 | (ours) ratio split header | ✅ merged 8fdd0b1; adopted 8e52294 | 🔎 at handover (fork keeps its verbatim copy) | our copy deleted; fixture includes the header, routing check bound to the handler body (the review's cardboard-lock finding); found and wired the parent's unwired #294 fixture; compression-side seam gate tools/test_shared_header_seam.sh |
-| 317 | (ours, OPEN) EVP probe sees a prepared OpenSSL tree on MSVC | ✅ 3c5f7b2 (phase0 had it first) | YES c0b96d6 | configure runs auto/modules before auto/lib/conf, so CORE_INCS lacks the OpenSSL dir at probe time; MSVC installs under $OPENSSL/openssl/include, not .openssl/ — found on the Windows build-script rig |
+| 311 | prove the CDict hoist is a wire-format change | ➖ N/A | ➖ | bench; our backend is refPrefix zero-copy with no CDict to hoist (#170/#171 lineage) |
 | 313 | (ours) manual pins: nginx 1.31.5, pcre2 10.48 (Windows + harness) | ✅ merged dae83c1 (phase0 already at 1.31.5, a8265cc) | ➖ | eilandert's question there ("does bump.yml cover this?") became #319 |
-| 318 | (ours, OPEN, rebased onto #313) build-windows.sh: pins file, module-derived library builds, fail-fast fetch | ➖ upstream tooling (phase0 unaffected) | ➖ | ci/tools/windows-pins.sh = single source of Windows pins (loud guard, no defaults; carries OpenSSL 4.0.2 where master had 4.0.1); WITH_COMPRESSION toggle ready for compression/ landing; enabler for #319. CodeRabbit rounds: verify() cache poisoning was real (download to .part, then verify BEFORE promoting into the slot; a wrong download is never cached); enable-static-vcruntime is a no-op under no-shared (static libs already /MT /Zl, same CRT as nginx's -MT) — recorded as a comment; source extraction now marker-guarded (extract_complete: an unmarked tree is re-extracted IN PLACE — complete whatever was there, non-members like objs/ and the OpenSSL pre-build kept; the last-member shortcut was unsound, tar continues past write errors) |
-| 319 | (ours, OPEN, stacked on #318) bump-versions.sh learns the harness and Windows pins; windows-build.yml reads windows-pins.sh | ➖ upstream tooling (phase0 unaffected) | ➖ (fork has no Windows pins, resolves mainline at run time) | eilandert asked for it on #313; harness pin in both workflows must agree, release-API pins move forward only, nginx digests through the PGP path; resolve phase (all network) before apply phase (all edits) after CodeRabbit; that test found master's script pins the EMPTY-file digest (e3b0c442…) when the angie fetch fails (set -e not inherited by `$(...)`) — fixed with fetch_or_die + inherit_errexit; apply phase edits STAGED copies installed together (a mutator failing on the second file edits nothing); nasm in the presence check (not discovery); test_bump_versions.sh 5→13 cases and now run by build-test.yml; live: re-derives the three hand-recorded digests |
+| 314 | static: fail closed on duplicate Available-Dictionary; stale-errno probe log | ◑ (a) N/A by design, (b) 🔜 | ➖ | (a) no static→filter handoff here, and match_dict already counts and refuses duplicates; (b) our static probe logs CRIT with ngx_errno for a short read that succeeded (static.c:745) — ERR with errno 0 when n >= 0 |
+| 315 | chain walker parses each field line once (`_ex` out-params) | 🔜 | 🔜 | fold_line_weight still calls the single-line parser twice (ae.h:514/524); the fork's fold the same (common.h:406/416), and its fuzz extraction regex needs the `_ex` name as his did |
+| 316 | strict dict walk vets ancestor directories | 🔜 security | 🔜 security | ours (dict.c) and the fork's walk check the leaf only; twin his fixture pairs |
+| 317 | (ours) EVP probe sees a prepared OpenSSL tree on MSVC | ✅ merged 44ff884; phase0 had it first (3c5f7b2) | YES c0b96d6 | configure runs auto/modules before auto/lib/conf, so CORE_INCS lacks the OpenSSL dir at probe time; MSVC installs under $OPENSSL/openssl/include, not .openssl/ — found on the Windows build-script rig |
+| 318 | (ours) build-windows.sh: pins file, module-derived library builds, fail-fast fetch | ✅ merged 5fd237e (phase0 unaffected) | ➖ | ci/tools/windows-pins.sh = single source of Windows pins (loud guard, no defaults; carries OpenSSL 4.0.2 where master had 4.0.1); WITH_COMPRESSION toggle ready for compression/ landing; enabler for #319. CodeRabbit rounds: verify() cache poisoning was real (download to .part, then verify BEFORE promoting into the slot; a wrong download is never cached); enable-static-vcruntime is a no-op under no-shared (static libs already /MT /Zl, same CRT as nginx's -MT) — recorded as a comment; source extraction now marker-guarded (extract_complete: an unmarked tree is re-extracted IN PLACE — complete whatever was there, non-members like objs/ and the OpenSSL pre-build kept; the last-member shortcut was unsound, tar continues past write errors) |
+| 319 | (ours) bump-versions.sh learns the harness and Windows pins; windows-build.yml reads windows-pins.sh | ✅ merged dcaedab (phase0 unaffected) | ➖ (fork has no Windows pins, resolves mainline at run time) | eilandert asked for it on #313; harness pin in both workflows must agree, release-API pins move forward only, nginx digests through the PGP path; resolve phase (all network) before apply phase (all edits) after CodeRabbit; that test found master's script pins the EMPTY-file digest (e3b0c442…) when the angie fetch fails (set -e not inherited by `$(...)`) — fixed with fetch_or_die + inherit_errexit; apply phase edits STAGED copies installed together (a mutator failing on the second file edits nothing); nasm in the presence check (not discovery); test_bump_versions.sh 5→13 cases and now run by build-test.yml; live: re-derives the three hand-recorded digests |
+| 320 | rate-limit the directio probe hard-error log | 🔜 | ➖ N/A | his window counter is file-static; ours goes in the cycle-owned static main conf beside the dio scratch (#103 rule) |
+| 321 | A33 micro sweep P7–P11 | ◑ P7 🔜, P8 🔎, P9 via sync, P10/P11 N/A | ➖ | P7 bounds the bad-verdict scan by populated slots (our bad[64] memo can take it); P8 lowcase_key memcmp for Available-Dictionary (our walk uses strncasecmp, module.c:500); P9 changes the shared cache-control header's directive_end signature — we call only the top-level no_transform() and the seam test counts the same three definitions, so his sync is safe; P10 Vary token walk N/A (Vary by construction); P11 loc-conf threading N/A (one fetch, module.c:1876) |
+| 322 | binary-search the dict negotiation lookup above 16 entries | 🔜 | 🔎 | match_dict is a linear memcmp over conf->dicts (module.c:610); a deployment with hundreds of dictionaries pays that per request, which is what his threshold targets; dicts inherit by pointer (module.c:1671), so only owned arrays get sorted, as his |
