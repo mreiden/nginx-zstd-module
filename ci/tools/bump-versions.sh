@@ -121,10 +121,12 @@ gh_api_json() { # path
 # the current stable's last release, so the first even-minor entry seen
 # is not necessarily the newest stable, and a long run of mainline and
 # legacy releases can push the real one to a later page. Every page is
-# read, up to the cap or a short page, and the newest of each line is
-# the highest version across all of them -- five pages of thirty is
-# several years of every line, so the cap bounds a broken feed, not a
-# real one, and costs at most five small requests a week.
+# read until a short page ends the list, and the newest of each line is
+# the highest version across all of them. The cap bounds a broken feed,
+# not a real one (the feed holds every release since nginx moved to
+# GitHub, 29 as of 2026-09 at roughly fifteen a year, so five pages of
+# thirty is about a decade away); reaching it with a full page is a
+# refusal, never a pick from what was read.
 NGINX_FEED_PAGE=30
 NGINX_FEED_PAGES=5
 
@@ -168,6 +170,14 @@ nginx_lines() {
             break   # a short page is the end of the list
         fi
     done
+    # The cap is not an end-of-list marker: a full last page means pages
+    # beyond it were never read and may hold a newer release of either
+    # line, so the answer is unknown, not "the best so far".
+    if [ "$count" -ge "$NGINX_FEED_PAGE" ]; then
+        echo "FATAL: the nginx release feed did not end within ${NGINX_FEED_PAGES} pages" \
+            "of ${NGINX_FEED_PAGE} -- refusing to pick from an incomplete read" >&2
+        return 1
+    fi
     printf '%s %s\n' "$even" "$odd"
 }
 

@@ -197,6 +197,15 @@ case "\$url" in
             endless)
                 # Every page is full and never shows a stable: the cap must end it.
                 full_page_of_mainline ;;
+            capped)
+                # Every page is full and carries BOTH parities, newer than the
+                # pins: a read that stops at the cap must not pick from them.
+                echo "["
+                for i in \$(seq 1 15); do
+                    echo " {\"tag_name\": \"release-1.30.\$((i + 4))\", \"draft\": false, \"prerelease\": false},"
+                    echo " {\"tag_name\": \"release-1.31.\$((i + 4))\", \"draft\": false, \"prerelease\": false}\$([ "\$i" -lt 15 ] && echo ,)"
+                done
+                echo "]" ;;
             *)
                 echo "[{\"tag_name\": \"release-1.28.0\", \"draft\": false, \"prerelease\": false},"
                 echo " {\"tag_name\": \"release-1.33.0\", \"draft\": true, \"prerelease\": false},"
@@ -416,13 +425,11 @@ sed -i '/^SHA_NASM=/d' "$SANDBOX/ci/tools/windows-pins.sh"
 before_pins="$(cat "$SANDBOX/ci/tools/windows-pins.sh")"
 before_matrix="$(cat "$SANDBOX/.github/workflows/ci-deep.yml")"
 bindir="$(NEW_STABLE=1.30.5 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 if [ "$rc" -eq 0 ]; then
     bad "missing-nasm: script exited 0 with SHA_NASM missing from windows-pins.sh"
 elif [ "$before_pins" != "$(cat "$SANDBOX/ci/tools/windows-pins.sh")" ] || [ "$before_matrix" != "$(cat "$SANDBOX/.github/workflows/ci-deep.yml")" ]; then
@@ -458,13 +465,11 @@ for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml 
     before[$f]="$(cat "$SANDBOX/$f")"
 done
 bindir="$(NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
 for f in "${!before[@]}"; do
     [ "${before[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
@@ -512,13 +517,11 @@ for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml 
     before_feed[$f]="$(cat "$SANDBOX/$f")"
 done
 bindir="$(NGINX_FEED=html stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
 for f in "${!before_feed[@]}"; do
     [ "${before_feed[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
@@ -540,13 +543,11 @@ for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml 
     before_no_even[$f]="$(cat "$SANDBOX/$f")"
 done
 bindir="$(NGINX_FEED=no-even stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
 for f in "${!before_no_even[@]}"; do
     [ "${before_no_even[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
@@ -625,13 +626,11 @@ for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml 
     before_endless[$f]="$(cat "$SANDBOX/$f")"
 done
 bindir="$(NGINX_FEED=endless stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     CURL_ARGV_LOG="$argv_log" PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
 for f in "${!before_endless[@]}"; do
     [ "${before_endless[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
@@ -640,12 +639,41 @@ if [ "$rc" -eq 0 ]; then
     bad "feed-endless: script exited 0 without ever seeing a stable release"
 elif [ -n "$changed" ]; then
     bad "feed-endless: tracked file(s) changed:$changed"
-elif ! grep -Fq 'could not determine NEW_STABLE' "$SANDBOX/out.log"; then
+elif ! grep -Fq 'did not end within 5 pages' "$SANDBOX/out.log"; then
     bad "feed-endless: unexpected log: $(cat "$SANDBOX/out.log")"
 elif ! grep -q 'page=5' "$argv_log" || grep -q 'page=6' "$argv_log"; then
     bad "feed-endless: paging did not stop at the cap: $(grep -o 'page=[0-9]*' "$argv_log" | tr '\n' ' ')"
 else
-    ok "feed-endless: read five pages, no more, and failed closed by name"
+    ok "feed-endless: read five pages, no more, and refused the incomplete read"
+fi
+
+say "== case: every capped page full and carrying newer releases of both lines -- must refuse, not pick =="
+make_sandbox SANDBOX
+argv_log="$SANDBOX/curl.argv"
+declare -A before_capped=()
+for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
+    before_capped[$f]="$(cat "$SANDBOX/$f")"
+done
+bindir="$(NGINX_FEED=capped stub_bin "$SANDBOX")"
+rc=0
+(
+    cd "$SANDBOX"
+    CURL_ARGV_LOG="$argv_log" PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+) || rc=$?
+changed=""
+for f in "${!before_capped[@]}"; do
+    [ "${before_capped[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+done
+if [ "$rc" -eq 0 ]; then
+    bad "feed-capped: script exited 0 after reading only the capped pages"
+elif [ -n "$changed" ]; then
+    bad "feed-capped: tracked file(s) changed from an incomplete read:$changed"
+elif ! grep -Fq 'did not end within 5 pages' "$SANDBOX/out.log"; then
+    bad "feed-capped: unexpected log: $(cat "$SANDBOX/out.log")"
+elif grep -q 'bump nginx stable' "$SANDBOX/out.log"; then
+    bad "feed-capped: a bump was resolved from the incomplete read: $(cat "$SANDBOX/out.log")"
+else
+    ok "feed-capped: refused at the cap with both lines visible on every page, edited nothing"
 fi
 
 say "== case: install failure on the SECOND changed file rolls back the first =="
@@ -655,13 +683,11 @@ for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml 
     before_install[$f]="$(cat "$SANDBOX/$f")"
 done
 bindir="$(NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     BUMP_VERSIONS_TEST_FAIL_INSTALL_AT=2 PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
 for f in "${!before_install[@]}"; do
     [ "${before_install[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
@@ -683,13 +709,11 @@ for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml 
     before_interrupt[$f]="$(cat "$SANDBOX/$f")"
 done
 bindir="$(NEW_STABLE=1.30.5 NEW_ANGIE=1.13.0 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     BUMP_VERSIONS_TEST_INTERRUPT_INSTALL_AT=1 PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 changed=""
 for f in "${!before_interrupt[@]}"; do
     [ "${before_interrupt[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
@@ -726,13 +750,11 @@ EOF
 before_matrix="$(cat "$SANDBOX/.github/workflows/ci-deep.yml")"
 before_build="$(cat "$SANDBOX/ci/tools/ci-build.sh")"
 bindir="$(NEW_STABLE=1.30.5 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 after_matrix="$(cat "$SANDBOX/.github/workflows/ci-deep.yml")"
 after_build="$(cat "$SANDBOX/ci/tools/ci-build.sh")"
 if [ "$rc" -eq 0 ]; then
@@ -752,13 +774,11 @@ before_pins="$(cat "$SANDBOX/ci/tools/windows-pins.sh")"
 before_matrix="$(cat "$SANDBOX/.github/workflows/ci-deep.yml")"
 # A stable bump is pending too: the pins check must run before it lands.
 bindir="$(NEW_STABLE=1.30.5 NEW_PCRE2=10.48 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 if [ "$rc" -eq 0 ]; then
     bad "pins-drift: script exited 0 with a pin missing from windows-pins.sh"
 elif [ "$before_pins" != "$(cat "$SANDBOX/ci/tools/windows-pins.sh")" ] \
@@ -776,13 +796,11 @@ sed -i 's/HARNESS_NGINX_VERSION: "1.31.4"/HARNESS_NGINX_VERSION: "1.31.3"/' "$SA
 before_arms="$(cat "$SANDBOX/.github/workflows/harness-fault-arms.yml")"
 before_pins="$(cat "$SANDBOX/ci/tools/windows-pins.sh")"
 bindir="$(NEW_MAINLINE=1.31.5 stub_bin "$SANDBOX")"
-set +e
+rc=0
 (
     cd "$SANDBOX"
     PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
+) || rc=$?
 if [ "$rc" -eq 0 ]; then
     bad "harness-drift: script exited 0 with the two harness pins disagreeing"
 elif [ "$before_arms" != "$(cat "$SANDBOX/.github/workflows/harness-fault-arms.yml")" ] \
