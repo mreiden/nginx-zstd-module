@@ -167,6 +167,15 @@ case "\$url" in
                 echo "<html>Mainline version nginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gz</html>" ;;
             no-even)
                 echo "[{\"tag_name\": \"release-${NEW_MAINLINE:-$CUR_MAINLINE}\", \"draft\": false, \"prerelease\": false}]" ;;
+            malformed-only)
+                echo '[{"tag_name": "release-9.98.1", "prerelease": false},'
+                echo ' {"tag_name": "release-9.98.2", "draft": 0, "prerelease": false},'
+                echo ' {"tag_name": "release-9.98.3", "draft": "false", "prerelease": false},'
+                echo ' {"tag_name": "release-9.98.4", "draft": null, "prerelease": false},'
+                echo ' {"tag_name": "release-9.98.5", "draft": false},'
+                echo ' {"tag_name": "release-9.98.6", "draft": false, "prerelease": 0},'
+                echo ' {"tag_name": "release-9.98.7", "draft": false, "prerelease": "false"},'
+                echo ' {"tag_name": "release-9.98.8", "draft": false, "prerelease": null}]' ;;
             paged)
                 # Stable only appears on page two, behind a full page of mainline.
                 if [ "\$page" = 1 ]; then
@@ -210,6 +219,14 @@ case "\$url" in
                 echo "[{\"tag_name\": \"release-1.28.0\", \"draft\": false, \"prerelease\": false},"
                 echo " {\"tag_name\": \"release-1.33.0\", \"draft\": true, \"prerelease\": false},"
                 echo " {\"tag_name\": \"release-1.33.1\", \"draft\": false, \"prerelease\": true},"
+                echo " {\"tag_name\": \"release-9.98.1\", \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-9.98.2\", \"draft\": 0, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-9.98.3\", \"draft\": \"false\", \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-9.98.4\", \"draft\": null, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-9.98.5\", \"draft\": false},"
+                echo " {\"tag_name\": \"release-9.98.6\", \"draft\": false, \"prerelease\": 0},"
+                echo " {\"tag_name\": \"release-9.98.7\", \"draft\": false, \"prerelease\": \"false\"},"
+                echo " {\"tag_name\": \"release-9.98.8\", \"draft\": false, \"prerelease\": null},"
                 echo " {\"tag_name\": \"v9.9.9\", \"draft\": false, \"prerelease\": false},"
                 echo " {\"tag_name\": \"release-${NEW_STABLE:-$CUR_STABLE}\", \"draft\": false, \"prerelease\": false},"
                 echo " {\"tag_name\": \"release-${NEW_MAINLINE:-$CUR_MAINLINE}\", \"draft\": false, \"prerelease\": false}]" ;;
@@ -560,6 +577,33 @@ elif ! grep -Fq 'could not determine NEW_STABLE' "$SANDBOX/out.log"; then
     bad "feed-no-even: unexpected log: $(cat "$SANDBOX/out.log")"
 else
     ok "feed-no-even: failed closed instead of pinning a mainline release as stable"
+fi
+
+say "== case: nginx feed with only schema-invalid release records fails closed without edits =="
+make_sandbox SANDBOX
+declare -A before_malformed=()
+for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
+    before_malformed[$f]="$(sha256sum "$SANDBOX/$f" | awk '{print $1}')"
+done
+bindir="$(NGINX_FEED=malformed-only stub_bin "$SANDBOX")"
+rc=0
+(
+    cd "$SANDBOX"
+    PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+) || rc=$?
+changed=""
+for f in "${!before_malformed[@]}"; do
+    [ "${before_malformed[$f]}" = "$(sha256sum "$SANDBOX/$f" | awk '{print $1}')" ] \
+        || changed="$changed $f"
+done
+if [ "$rc" -eq 0 ]; then
+    bad "feed-malformed: script exited 0 with no schema-valid nginx release"
+elif [ -n "$changed" ]; then
+    bad "feed-malformed: tracked file(s) changed despite the invalid feed:$changed"
+elif ! grep -Fq 'could not determine NEW_STABLE' "$SANDBOX/out.log"; then
+    bad "feed-malformed: unexpected log: $(cat "$SANDBOX/out.log")"
+else
+    ok "feed-malformed: rejected missing and non-boolean eligibility flags and edited nothing"
 fi
 
 say "== case: branch transition -- a new even-minor stable above the mainline line moves stable only =="

@@ -145,7 +145,8 @@ def parse(v):
     m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", v)
     return tuple(int(x) for x in m.groups()) if m else None
 for r in releases:
-    if not isinstance(r, dict) or r.get("draft") or r.get("prerelease"):
+    if (not isinstance(r, dict) or r.get("draft") is not False
+            or r.get("prerelease") is not False):
         continue
     m = re.fullmatch(r"release-(\d+\.\d+\.\d+)", str(r.get("tag_name", "")))
     if not m:
