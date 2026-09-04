@@ -112,45 +112,64 @@ gh_api_json() { # path
 # headings a parser has to know by name, and a renamed heading is a
 # refusal at best. The stable and mainline lines follow nginx's own
 # versioning rule -- even minor is stable, odd minor is mainline -- so
-# each line's newest release is the newest of its parity. Thirty releases
-# span more than a year of every line, so the newest of each is always on
-# the first page. Tarballs and signatures still come from nginx.org (the
-# pinned URLs do not change); only "what is newest" moves here.
-NGINX_RELEASES="$(gh_api_json 'repos/nginx/nginx/releases?per_page=30')"
+# each line's newest release is the newest of its parity. Tarballs and
+# signatures still come from nginx.org (the pinned URLs do not change);
+# only "what is newest" moves here.
+#
+# The feed is newest-first and paged. A long run of mainline and legacy
+# releases can push the last stable off the first page, so pages are read
+# until both parities have been seen (the newest of each is the highest
+# version across every page read), the list ends (a short page), or the
+# cap is reached -- five pages of thirty is several years of every line,
+# so the cap is a bound on a broken feed, not a limit a real one meets.
+NGINX_FEED_PAGE=30
+NGINX_FEED_PAGES=5
 
 NGINX_LINE_PY=$(cat <<'PYEOF'
 import json, re, sys
-want_even = sys.argv[1] == "even"
+# argv: current best even, current best odd ("-" when none yet).
+# stdout: "<best even> <best odd> <entries on this page>", "-" when none.
+best = {"even": sys.argv[1], "odd": sys.argv[2]}
 try:
     releases = json.load(sys.stdin)
 except ValueError:
     sys.exit("FATAL: the nginx release feed is not JSON -- refusing to guess")
 if not isinstance(releases, list):
     sys.exit("FATAL: the nginx release feed is not a release list -- refusing to guess")
-best = None
+def parse(v):
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", v)
+    return tuple(int(x) for x in m.groups()) if m else None
 for r in releases:
     if not isinstance(r, dict) or r.get("draft") or r.get("prerelease"):
         continue
-    m = re.fullmatch(r"release-(\d+)\.(\d+)\.(\d+)", str(r.get("tag_name", "")))
+    m = re.fullmatch(r"release-(\d+\.\d+\.\d+)", str(r.get("tag_name", "")))
     if not m:
         continue
-    v = tuple(int(x) for x in m.groups())
-    if (v[1] % 2 == 0) != want_even:
-        continue
-    if best is None or v > best:
-        best = v
-# No release of this parity on the page yields a blank, which the
-# blank-version check below reports by name.
-print("%d.%d.%d" % best if best else "")
+    v = parse(m.group(1))
+    line = "even" if v[1] % 2 == 0 else "odd"
+    cur = parse(best[line]) if best[line] != "-" else None
+    if cur is None or v > cur:
+        best[line] = "%d.%d.%d" % v
+print(best["even"], best["odd"], len(releases))
 PYEOF
 )
 
-nginx_line_version() { # even (stable) | odd (mainline)
-    printf '%s' "$NGINX_RELEASES" | python3 -c "$NGINX_LINE_PY" "$1"
+# Prints "<stable> <mainline>" with "-" for a line the feed did not show,
+# which the blank-version check below reports by name.
+nginx_lines() {
+    local page even="-" odd="-" json count
+    for ((page = 1; page <= NGINX_FEED_PAGES; page++)); do
+        json="$(gh_api_json "repos/nginx/nginx/releases?per_page=${NGINX_FEED_PAGE}&page=${page}")"
+        read -r even odd count < <(printf '%s' "$json" | python3 -c "$NGINX_LINE_PY" "$even" "$odd")
+        if [ "$even" != "-" ] && [ "$odd" != "-" ]; then
+            break
+        fi
+        if [ "$count" -lt "$NGINX_FEED_PAGE" ]; then
+            break   # the list ended before both lines appeared
+        fi
+    done
+    printf '%s %s\n' "$even" "$odd"
 }
-
-latest_nginx_stable() { nginx_line_version even; }
-latest_nginx_mainline() { nginx_line_version odd; }
 
 # The version carried by OWNER/REPO's latest GitHub release tag, whatever
 # the tag's prefix (v1.3.2, pcre2-10.48, openssl-4.0.2).
@@ -166,8 +185,9 @@ latest_zlib() { gh_latest_tag madler/zlib; }
 latest_openssl() { gh_latest_tag openssl/openssl; }
 latest_zstd() { gh_latest_tag facebook/zstd; }
 
-NEW_STABLE="$(latest_nginx_stable)"
-NEW_MAINLINE="$(latest_nginx_mainline)"
+read -r NEW_STABLE NEW_MAINLINE < <(nginx_lines)
+[ "$NEW_STABLE" != "-" ] || NEW_STABLE=""
+[ "$NEW_MAINLINE" != "-" ] || NEW_MAINLINE=""
 NEW_ANGIE="$(latest_angie)"
 NEW_PCRE2="$(latest_pcre2)"
 NEW_ZLIB="$(latest_zlib)"

@@ -147,15 +147,41 @@ if [ -n "\$fail_url" ]; then
     case "\$url" in *"\$fail_url"*) echo "curl: (22) stub: \$url unreachable" >&2; exit 22 ;; esac
 fi
 case "\$url" in
-    *api.github.com/repos/nginx/nginx/releases?per_page=30*)
+    *api.github.com/repos/nginx/nginx/releases?per_page=30\&page=*)
+        page="\${url##*page=}"
         # The feed as GitHub serves it, plus decoys every case must ignore:
         # a legacy line listed FIRST (order must not matter), a draft and a
         # prerelease newer than everything, and a tag of another shape.
+        # A full page (30 entries) tells the script there may be more.
+        full_page_of_mainline() { # 30 odd-minor entries older than the mainline pin
+            local i sep=""
+            echo "["
+            for i in \$(seq 1 30); do
+                echo " \${sep}{\"tag_name\": \"release-1.29.\$i\", \"draft\": false, \"prerelease\": false}"
+                sep=","
+            done
+            echo "]"
+        }
         case "\$nginx_feed" in
             html)
                 echo "<html>Mainline version nginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gz</html>" ;;
             no-even)
                 echo "[{\"tag_name\": \"release-${NEW_MAINLINE:-$CUR_MAINLINE}\", \"draft\": false, \"prerelease\": false}]" ;;
+            paged)
+                # Stable only appears on page two, behind a full page of mainline.
+                if [ "\$page" = 1 ]; then
+                    echo "[{\"tag_name\": \"release-${NEW_MAINLINE:-$CUR_MAINLINE}\", \"draft\": false, \"prerelease\": false},"
+                    for i in \$(seq 1 28); do
+                        echo " {\"tag_name\": \"release-1.29.\$i\", \"draft\": false, \"prerelease\": false},"
+                    done
+                    echo " {\"tag_name\": \"release-1.29.30\", \"draft\": false, \"prerelease\": false}]"
+                else
+                    echo "[{\"tag_name\": \"release-1.28.0\", \"draft\": false, \"prerelease\": false},"
+                    echo " {\"tag_name\": \"release-${NEW_STABLE:-$CUR_STABLE}\", \"draft\": false, \"prerelease\": false}]"
+                fi ;;
+            endless)
+                # Every page is full and never shows a stable: the cap must end it.
+                full_page_of_mainline ;;
             *)
                 echo "[{\"tag_name\": \"release-1.28.0\", \"draft\": false, \"prerelease\": false},"
                 echo " {\"tag_name\": \"release-1.33.0\", \"draft\": true, \"prerelease\": false},"
@@ -534,6 +560,57 @@ if run_case transition NEW_STABLE=1.32.0; then
     fi
 else
     bad "transition: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
+fi
+
+say "== case: stable only on page two of the feed is still found =="
+make_sandbox SANDBOX
+argv_log="$SANDBOX/curl.argv"
+bindir="$(NGINX_FEED=paged NEW_STABLE=1.30.5 stub_bin "$SANDBOX")"
+if (
+    cd "$SANDBOX"
+    CURL_ARGV_LOG="$argv_log" PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+); then
+    if grep -q 'version: "1.30.5"' "$SANDBOX/.github/workflows/ci-deep.yml" \
+        && grep -q '\["1.30.5"\]' "$SANDBOX/ci/tools/ci-build.sh" \
+        && grep -q 'releases?per_page=30&page=2' "$argv_log" \
+        && ! grep -q 'releases?per_page=30&page=3' "$argv_log"; then
+        ok "feed-page-two: read page two, found the stable there, stopped paging"
+    else
+        bad "feed-page-two: unexpected result: $(cat "$SANDBOX/out.log"); pages: $(grep -o 'page=[0-9]*' "$argv_log" | tr '\n' ' ')"
+    fi
+else
+    bad "feed-page-two: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
+fi
+
+say "== case: a feed that never shows a stable stops at the page cap and fails closed =="
+make_sandbox SANDBOX
+argv_log="$SANDBOX/curl.argv"
+declare -A before_endless=()
+for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
+    before_endless[$f]="$(cat "$SANDBOX/$f")"
+done
+bindir="$(NGINX_FEED=endless stub_bin "$SANDBOX")"
+set +e
+(
+    cd "$SANDBOX"
+    CURL_ARGV_LOG="$argv_log" PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+)
+rc=$?
+set -e
+changed=""
+for f in "${!before_endless[@]}"; do
+    [ "${before_endless[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+done
+if [ "$rc" -eq 0 ]; then
+    bad "feed-endless: script exited 0 without ever seeing a stable release"
+elif [ -n "$changed" ]; then
+    bad "feed-endless: tracked file(s) changed:$changed"
+elif ! grep -Fq 'could not determine NEW_STABLE' "$SANDBOX/out.log"; then
+    bad "feed-endless: unexpected log: $(cat "$SANDBOX/out.log")"
+elif ! grep -q 'page=5' "$argv_log" || grep -q 'page=6' "$argv_log"; then
+    bad "feed-endless: paging did not stop at the cap: $(grep -o 'page=[0-9]*' "$argv_log" | tr '\n' ' ')"
+else
+    ok "feed-endless: read five pages, no more, and failed closed by name"
 fi
 
 say "== case: install failure on the SECOND changed file rolls back the first =="
