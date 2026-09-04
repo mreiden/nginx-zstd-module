@@ -1,6 +1,7 @@
 use Test::Nginx::Socket;
 use Digest::SHA qw(sha256_hex);
 use File::Temp qw(tempdir);
+use File::Basename qw(dirname);
 
 # Phase-1a store rules as a regression suite: every config-load rule
 # from the shell matrix, plus the $compression_dicts_hashed witness
@@ -13,19 +14,49 @@ our $dict_a  = "const shared = 'store fixture material, dictionary A';\n" x 40;
 # strict-walk fixtures (parent #199): an out-of-servroot tempdir whose
 # ABSOLUTE path goes into the config verbatim, with a real directory
 # and a symlinked alias to it — the walk must refuse the alias at the
-# intermediate component and accept the real chain.
-# Guarded, not die-on-failure (CodeRabbit round 5): only TESTs 26/27
+# intermediate component and accept the real chain — plus (parent
+# #316) a world-writable and a sticky world-writable parent, which the
+# walk must refuse as ancestors.
+#
+# NOT under /tmp: /tmp is 1777, and the walk now vets every ancestor,
+# so a fixture there would fail its positive control for the /tmp's
+# sake, not the test's. The tempdir goes under $HOME, and the whole
+# ancestor chain is checked to be root- or self-owned and not
+# group/world-writable; a host where it is not (a shared /home, a
+# drvfs mount) skips these tests rather than failing them for a reason
+# that is not what they test.
+# Guarded, not die-on-failure (CodeRabbit round 5): only the walk tests
 # consume this fixture, and a host that cannot symlink (a Windows-side
 # checkout without SeCreateSymbolicLink, a restricted tmp) must skip
-# those two via skip_eval instead of killing all 33 tests at file scope.
+# them via skip_eval instead of killing the whole file at file scope.
 our $walkdir;
 our $have_walk = eval {
-    $walkdir = tempdir(CLEANUP => 1);
+    my $base = $ENV{HOME};
+    die "no HOME for a vetted fixture base\n" unless defined $base && -d $base;
+    $walkdir = tempdir(DIR => $base, CLEANUP => 1);
+    for (my $d = $walkdir; ; $d = dirname($d)) {
+        my @st = stat($d) or die "stat $d: $!";
+        die "ancestor $d owned by uid $st[4], neither root nor uid $>\n"
+            if $st[4] != 0 && $st[4] != $>;
+        die sprintf("ancestor %s is mode %04o, writable by group or other\n", $d, $st[2] & 07777)
+            if $st[2] & 022;
+        last if $d eq '/';
+    }
     mkdir "$walkdir/real" or die "mkdir: $!";
     open my $h, '>', "$walkdir/real/w.dict" or die "spew: $!";
     print $h "strict walk fixture dictionary contents\n" x 20;
     close $h;
     symlink("$walkdir/real", "$walkdir/link") or die "symlink: $!";
+    for my $arm (['open', 0777], ['sticky', 01777]) {
+        my ($name, $mode) = @$arm;
+        mkdir "$walkdir/$name" or die "mkdir $name: $!";
+        open my $f, '>', "$walkdir/$name/w.dict" or die "spew $name: $!";
+        print $f "strict walk fixture dictionary contents\n" x 20;
+        close $f;
+        chmod $mode, "$walkdir/$name" or die "chmod $name: $!";
+        my @st = stat("$walkdir/$name");
+        die "chmod $name did not stick\n" if ($st[2] & 07777) != $mode;
+    }
     1;
 } || 0;
 our $dict_b  = "let other = 'store fixture material, dictionary B';\n" x 40;
@@ -535,6 +566,60 @@ GET /t
 ok
 --- no_error_log
 [error]
+
+=== TEST 27a: strict mode refuses a world-writable PARENT directory
+# parent #316 (A33-F2): both leaf checks pass — the file is self-owned
+# 0644 — but its parent is 0777, so any local user could rename() a
+# different file into the leaf position; the walk refuses the ancestor,
+# not the leaf. TEST 27c loads the identical file with strict off.
+--- skip_eval: 3: !$::have_walk
+--- http_config eval
+"compression_dict_strict_path on;
+ compression_dict_file $::walkdir/open/w.dict;"
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+directory component "open" of
+writable by group or other
+--- no_error_log
+[alert]
+
+
+=== TEST 27b: strict mode refuses a STICKY world-writable parent too
+# parent #316: no sticky-bit exemption. A 1777 parent stops other users
+# deleting the file, but still lets any of them create the next path
+# component beside it — the steering the walk exists to refuse.
+--- skip_eval: 3: !$::have_walk
+--- http_config eval
+"compression_dict_strict_path on;
+ compression_dict_file $::walkdir/sticky/w.dict;"
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+directory component "sticky" of
+no sticky-bit exemption
+--- no_error_log
+[alert]
+
+
+=== TEST 27c: the same file under the world-writable parent loads with strict off
+# Positive control for 27a/27b: default mode leaf-checks the file only,
+# so the ancestor's mode is not its concern and the server starts.
+--- skip_eval: 3: !$::have_walk
+--- http_config eval
+"compression_dict_file $::walkdir/open/w.dict;"
+--- config
+    location /t { return 200 "ok\n"; }
+--- request
+GET /t
+--- error_code: 200
+--- response_body
+ok
+--- no_error_log
+[error]
+
 
 === TEST 28: trust_hashes on — the zero-hashing fast path, restored
 # The old TEST 2 contract, now behind the flag (parent #220): a

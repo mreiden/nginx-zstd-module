@@ -101,9 +101,13 @@ opts every dictionary load into a stricter trust model — the path is resolved
 one component at a time with `openat(O_NOFOLLOW)`, so a symlink
 anywhere in it (a `current -> releases/N` deploy layout included,
 which is why the default stays off) is refused rather than followed,
-`.`/`..` components are rejected, and the file must be owned by the
-loading principal or root and not be group/other-writable. It must
-precede every `compression_dict_file` it applies to; declaring it
+`.`/`..` components are rejected, and the file AND every directory
+on the way to it must be owned by the loading principal or root and
+not be group/other-writable (parent #316: no sticky-bit exemption, so
+a dictionary under `/tmp` is refused — an ancestor a local user can
+write into lets that user rename a file of their choosing into the
+leaf's place). It must precede every `compression_dict_file` it
+applies to; declaring it
 after one is a config-load error rather than a silently unvetted
 load. And `compression_dict_assume_secure_transport on;`
 (`http`/`server`/`location`, default off, parent #158) is the

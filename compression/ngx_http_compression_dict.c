@@ -72,7 +72,13 @@ static ngx_int_t ngx_http_compression_dicts_hashed_variable(
  * traversed, and the leaf is then opened relative to the verified
  * parent fd — so the whole resolution, not just its last step, is
  * symlink-free and TOCTOU-safe against a component swap racing the
- * walk.
+ * walk. Every directory fd the walk opens (the root included) is also
+ * vetted for ownership and mode before it is trusted as the base of the
+ * next openat() (parent #316): an ancestor a local user owns, or can
+ * write into, lets that user rename() a root-owned 0644 file into the
+ * leaf position and pass both leaf checks while steering what strict
+ * mode loads, so an unvetted component is the same gap the walk closes
+ * for symlinks.
  *
  * Absolute paths only. The directive handler has already run the path
  * through ngx_conf_full_name(), so a dictionary path reaching here is
@@ -82,6 +88,59 @@ static ngx_int_t ngx_http_compression_dicts_hashed_variable(
  *
  * Returns the leaf fd, or NGX_INVALID_FILE having logged the reason.
  */
+/*
+ * fstat() one directory fd opened during the strict walk and refuse it
+ * under the rule the leaf checks apply (parent #316, A33-F2): owned by
+ * neither root nor the loading principal, or writable by group or
+ * other. Deliberately no sticky-bit exemption: a sticky world-writable
+ * ancestor (a /tmp-style directory) still lets an unprivileged user
+ * create the next path component, which is exactly the steering this
+ * refuses. `label` names the component for the diagnostic ("/" for the
+ * root fd, the component bytes otherwise).
+ */
+static ngx_int_t
+ngx_http_compression_check_strict_dir(ngx_conf_t *cf, int fd,
+    const char *label, ngx_str_t *path)
+{
+    struct stat  st;
+
+    if (fstat(fd, &st) < 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           "fstat(\"%s\") failed while resolving \"%V\" "
+                           "under \"compression_dict_strict_path on\"",
+                           label, path);
+        return NGX_ERROR;
+    }
+
+    if (st.st_uid != 0 && st.st_uid != geteuid()) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "directory component \"%s\" of \"%V\" is owned "
+                           "by uid %uD, neither root nor the loading "
+                           "principal (uid %uD); refused by "
+                           "\"compression_dict_strict_path on\": that "
+                           "owner can rename a different file into this "
+                           "directory and steer what a later privileged "
+                           "reload loads", label, path,
+                           (uint32_t) st.st_uid, (uint32_t) geteuid());
+        return NGX_ERROR;
+    }
+
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "directory component \"%s\" of \"%V\" is "
+                           "writable by group or other (no sticky-bit "
+                           "exemption: a sticky world-writable directory "
+                           "still lets an unprivileged user create the "
+                           "next component); refused by "
+                           "\"compression_dict_strict_path on\"",
+                           label, path);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
 static ngx_fd_t
 ngx_http_compression_open_dict_strict(ngx_conf_t *cf, ngx_str_t *path,
     int flags)
@@ -108,6 +167,18 @@ ngx_http_compression_open_dict_strict(ngx_conf_t *cf, ngx_str_t *path,
                            "open(\"/\") failed while resolving \"%V\" "
                            "under \"compression_dict_strict_path on\"",
                            path);
+        return NGX_INVALID_FILE;
+    }
+
+    /*
+     * The root fd is a walked component like any other: vet it before
+     * it is trusted as the base of every openat() below. On most
+     * systems "/" is root-owned 0755 and this is a no-op; a container
+     * or chroot base that fails it is exactly the layout strict mode
+     * is meant to refuse.
+     */
+    if (ngx_http_compression_check_strict_dir(cf, fd, "/", path) != NGX_OK) {
+        ngx_close_file(fd);
         return NGX_INVALID_FILE;
     }
 
@@ -223,6 +294,19 @@ ngx_http_compression_open_dict_strict(ngx_conf_t *cf, ngx_str_t *path,
 
             if (last) {
                 return fd;
+            }
+
+            /*
+             * A directory fd that will be trusted as the base for the
+             * next openat(): vet it before it is used for anything
+             * else, same rule as the root fd above.
+             */
+            if (ngx_http_compression_check_strict_dir(cf, fd, (char *) comp,
+                                                      path)
+                != NGX_OK)
+            {
+                ngx_close_file(fd);
+                return NGX_INVALID_FILE;
             }
 
             start = p;
