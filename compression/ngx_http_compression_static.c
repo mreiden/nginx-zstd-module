@@ -114,6 +114,11 @@ typedef struct {
     ngx_http_compression_static_bad_t
                    bad[NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS];
     ngx_uint_t     bad_next;
+    ngx_uint_t     bad_count;   /* slots ever populated, capped at SLOTS
+                                 * (parent #321 P7): the common never-
+                                 * populated worker skips the scan, and a
+                                 * partly filled ring scans only what it
+                                 * holds; saturation and wrap unchanged */
 } ngx_http_compression_static_main_conf_t;
 
 
@@ -492,11 +497,11 @@ ngx_http_compression_static_bad_cached(
     ngx_uint_t                          i;
     ngx_http_compression_static_bad_t  *e;
 
-    if (path->len >= NGX_MAX_PATH) {
+    if (path->len >= NGX_MAX_PATH || smcf->bad_count == 0) {
         return 0;
     }
 
-    for (i = 0; i < NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS; i++) {
+    for (i = 0; i < smcf->bad_count; i++) {
         e = &smcf->bad[i];
 
         if (e->valid && e->uniq == of->uniq && e->mtime == of->mtime
@@ -528,7 +533,14 @@ ngx_http_compression_static_bad_remember(
     e->size = of->size;
     e->len = path->len;
     ngx_memcpy(e->path, path->data, path->len);
-    e->valid = 1;
+
+    if (!e->valid) {
+        e->valid = 1;
+
+        if (smcf->bad_count < NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS) {
+            smcf->bad_count++;
+        }
+    }
 
     smcf->bad_next++;
     if (smcf->bad_next == NGX_HTTP_COMPRESSION_STATIC_BAD_SLOTS) {
@@ -743,10 +755,31 @@ ngx_http_compression_static_check_zstd(ngx_http_request_t *r,
                 goto probe_done;
             }
 
-            ngx_log_error(NGX_LOG_CRIT, log, ngx_errno,
-                          "compression static: "
-                          NGX_HTTP_COMPRESSION_STATIC_PREAD_NAME
-                          "(\"%V\", frame header) returned %z", path, n);
+            /*
+             * n >= 0 is a read that succeeded and returned too few
+             * bytes (a sidecar of nothing but skippable frames: n == 0
+             * at offset == size): errno is stale then, so it is logged
+             * at ERR with errno 0 and memoized as a malformed verdict
+             * like any other deterministic shape (parent #314). A
+             * genuine read failure keeps CRIT and the real ngx_errno,
+             * and stays transient.
+             */
+            if (n >= 0) {
+                ngx_log_error(NGX_LOG_ERR, log, 0,
+                              "compression static: "
+                              NGX_HTTP_COMPRESSION_STATIC_PREAD_NAME
+                              "(\"%V\", frame header) returned %z",
+                              path, n);
+                malformed = 1;
+
+            } else {
+                ngx_log_error(NGX_LOG_CRIT, log, ngx_errno,
+                              "compression static: "
+                              NGX_HTTP_COMPRESSION_STATIC_PREAD_NAME
+                              "(\"%V\", frame header) returned %z",
+                              path, n);
+            }
+
             probe_rc = NGX_DECLINED;
             goto probe_done;
         }

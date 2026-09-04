@@ -651,6 +651,48 @@ is not a zstd frame
 
 
 
+=== TEST 22d: a short read that SUCCEEDED is an [error] with no errno, and is memoized
+# parent #314 (A33-F4a): a sidecar whose skippable frame is followed by
+# two stray bytes reads cleanly but leaves fewer than four bytes at the
+# frame position. That is a property of the file, not a read failure:
+# logged once at [error] with errno 0 (a [crit] with a stale ngx_errno
+# was the old shape), memoized like any other malformed verdict, and
+# served as identity. Same triple-include shape as TEST 44.
+--- log_level: debug
+--- user_files eval
+[ [ "page/short.shtml" => '<!--#include virtual="/st/short.txt" --><!--#include virtual="/st/short.txt" --><!--#include virtual="/st/short.txt" -->' ],
+  [ "st/short.txt" => "identity fallback
+" ],
+  [ "st/short.txt.zst" => "P*M" . (" " x 4) . "(µ" ] ]
+--- config
+    location /page/ {
+        ssi on;
+        default_type text/html;
+        root html;
+    }
+    location /st/ {
+        compression_static on;
+        compression_static_order zstd;
+        root html;
+    }
+--- request
+GET /page/short.shtml
+--- more_headers
+Accept-Encoding: zstd
+--- response_body_like eval
+qr/^(?:identity fallback
+){3}\s*$/
+--- grep_error_log eval
+qr/\[(?:error|crit)\] |frame header\) returned|cached malformed verdict/
+--- grep_error_log_out
+[error] 
+frame header) returned
+cached malformed verdict
+cached malformed verdict
+--- no_error_log
+[alert]
+
+
 === TEST 23: the window check runs UNDER DIRECTIO (aligned probe witness)
 # the property the parent's #101 review pinned: oversized windows are a
 # systematic build-pipeline product, so O_DIRECT must not skip the
