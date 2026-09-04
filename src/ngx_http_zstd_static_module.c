@@ -155,6 +155,13 @@ typedef struct {
 static ngx_http_zstd_static_bad_cache_t
     ngx_http_zstd_static_bad_cache[NGX_HTTP_ZSTD_STATIC_BAD_CACHE_SLOTS];
 static ngx_uint_t  ngx_http_zstd_static_bad_cache_next;
+/*
+ * Count of valid entries ever remembered, capped at SLOTS.  Lets the
+ * common never-populated path (this worker has not yet hit a truncated
+ * or mismatched .zst) skip the ring scan entirely instead of walking
+ * NGX_HTTP_ZSTD_STATIC_BAD_CACHE_SLOTS empty slots on every request.
+ */
+static ngx_uint_t  ngx_http_zstd_static_bad_cache_count;
 
 /*
  * Log rate limit for the directio hard-error probe arm (see the
@@ -761,10 +768,26 @@ ngx_http_zstd_static_should_bypass(ngx_http_request_t *r)
             i = 0;
         }
 
-        if (headers[i].key.len == sizeof("Available-Dictionary") - 1
-            && ngx_strncasecmp(headers[i].key.data,
-                               (u_char *) "Available-Dictionary",
-                               sizeof("Available-Dictionary") - 1) == 0)
+        /*
+         * Case-SENSITIVE ngx_memcmp against a lowercase literal when nginx
+         * supplied lowcase_key. Headers inserted by another module may leave
+         * that optional pointer NULL, so retain the case-folding fallback.
+         * Core-parsed headers already carry the folded form (see
+         * ngx_http_zstd_collect_dcz_headers() in the filter module for
+         * the per-protocol citations), so re-folding with
+         * ngx_strncasecmp() would redo work nginx has already done, once
+         * per header per request.
+         */
+        if (headers[i].key.len == sizeof("available-dictionary") - 1
+            && ((headers[i].lowcase_key != NULL
+                 && ngx_memcmp(headers[i].lowcase_key,
+                               "available-dictionary",
+                               sizeof("available-dictionary") - 1) == 0)
+                || (headers[i].lowcase_key == NULL
+                    && ngx_strncasecmp(headers[i].key.data,
+                                       (u_char *) "Available-Dictionary",
+                                       sizeof("Available-Dictionary") - 1)
+                       == 0)))
         {
             avail_dict_count++;
             if (avail_dict_count > 1) {
@@ -804,7 +827,11 @@ ngx_http_zstd_static_bad_cached(ngx_str_t *path, ngx_open_file_info_t *of)
         return 0;
     }
 
-    for (i = 0; i < NGX_HTTP_ZSTD_STATIC_BAD_CACHE_SLOTS; i++) {
+    if (ngx_http_zstd_static_bad_cache_count == 0) {
+        return 0;
+    }
+
+    for (i = 0; i < ngx_http_zstd_static_bad_cache_count; i++) {
         entry = &ngx_http_zstd_static_bad_cache[i];
 
         if (entry->valid && entry->uniq == of->uniq
@@ -836,7 +863,16 @@ ngx_http_zstd_static_bad_remember(ngx_str_t *path, ngx_open_file_info_t *of)
     entry->size = of->size;
     entry->len = path->len;
     ngx_memcpy(entry->path, path->data, path->len);
-    entry->valid = 1;
+
+    if (!entry->valid) {
+        entry->valid = 1;
+
+        if (ngx_http_zstd_static_bad_cache_count
+            < NGX_HTTP_ZSTD_STATIC_BAD_CACHE_SLOTS)
+        {
+            ngx_http_zstd_static_bad_cache_count++;
+        }
+    }
 
     ngx_http_zstd_static_bad_cache_next++;
     if (ngx_http_zstd_static_bad_cache_next
