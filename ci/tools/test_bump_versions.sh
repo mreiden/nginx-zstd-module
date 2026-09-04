@@ -130,15 +130,13 @@ stub_bin() {
     mkdir -p "$bindir"
     cat >"$bindir/curl" <<EOF
 #!/bin/bash
-# Fake nginx.org download page / GitHub release APIs / tarball fetch.
+# Fake GitHub release APIs (nginx included) / tarball fetch.
 [ -z "\${CURL_ARGV_LOG:-}" ] || printf '%s\n' "\$@" >>"\$CURL_ARGV_LOG"
 url=""
 out=""
 prev=""
 fail_url="${FAIL_URL:-}"
-omit_stable_heading="${OMIT_STABLE_HEADING:-0}"
-omit_stable_tarball="${OMIT_STABLE_TARBALL:-0}"
-omit_legacy_heading="${OMIT_LEGACY_HEADING:-0}"
+nginx_feed="${NGINX_FEED:-json}"
 for a in "\$@"; do
     case "\$a" in http*) url="\$a" ;; esac
     [ "\$prev" = "-o" ] && out="\$a"
@@ -149,16 +147,23 @@ if [ -n "\$fail_url" ]; then
     case "\$url" in *"\$fail_url"*) echo "curl: (22) stub: \$url unreachable" >&2; exit 22 ;; esac
 fi
 case "\$url" in
-    *nginx.org/en/download.html*)
-        if [ "\$omit_stable_heading" = 1 ]; then
-            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gz nginx-${NEW_STABLE:-$CUR_STABLE}.tar.gz"
-        elif [ "\$omit_stable_tarball" = 1 ]; then
-            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionLegacy versionnginx-1.28.0.tar.gz"
-        elif [ "\$omit_legacy_heading" = 1 ]; then
-            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionLegacy nginx-1.28.0.tar.gz"
-        else
-            echo "Mainline versionnginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gzStable versionnginx-${NEW_STABLE:-$CUR_STABLE}.tar.gzLegacy versionnginx-1.28.0.tar.gz"
-        fi
+    *api.github.com/repos/nginx/nginx/releases?per_page=30*)
+        # The feed as GitHub serves it, plus decoys every case must ignore:
+        # a legacy line listed FIRST (order must not matter), a draft and a
+        # prerelease newer than everything, and a tag of another shape.
+        case "\$nginx_feed" in
+            html)
+                echo "<html>Mainline version nginx-${NEW_MAINLINE:-$CUR_MAINLINE}.tar.gz</html>" ;;
+            no-even)
+                echo "[{\"tag_name\": \"release-${NEW_MAINLINE:-$CUR_MAINLINE}\", \"draft\": false, \"prerelease\": false}]" ;;
+            *)
+                echo "[{\"tag_name\": \"release-1.28.0\", \"draft\": false, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-1.33.0\", \"draft\": true, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-1.33.1\", \"draft\": false, \"prerelease\": true},"
+                echo " {\"tag_name\": \"v9.9.9\", \"draft\": false, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-${NEW_STABLE:-$CUR_STABLE}\", \"draft\": false, \"prerelease\": false},"
+                echo " {\"tag_name\": \"release-${NEW_MAINLINE:-$CUR_MAINLINE}\", \"draft\": false, \"prerelease\": false}]" ;;
+        esac
         exit 0 ;;
     *api.github.com/repos/webserver-llc/angie/releases/latest*)
         echo "{\"tag_name\": \"${NEW_ANGIE:-$CUR_ANGIE}\"}"
@@ -459,13 +464,13 @@ else
     bad "token-argv: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
 fi
 
-say "== case: missing stable section heading fails closed without edits =="
+say "== case: nginx feed is not JSON (HTML came back) fails closed without edits =="
 make_sandbox SANDBOX
-declare -A before_heading=()
+declare -A before_feed=()
 for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
-    before_heading[$f]="$(cat "$SANDBOX/$f")"
+    before_feed[$f]="$(cat "$SANDBOX/$f")"
 done
-bindir="$(OMIT_STABLE_HEADING=1 stub_bin "$SANDBOX")"
+bindir="$(NGINX_FEED=html stub_bin "$SANDBOX")"
 set +e
 (
     cd "$SANDBOX"
@@ -474,26 +479,26 @@ set +e
 rc=$?
 set -e
 changed=""
-for f in "${!before_heading[@]}"; do
-    [ "${before_heading[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+for f in "${!before_feed[@]}"; do
+    [ "${before_feed[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
 done
 if [ "$rc" -eq 0 ]; then
-    bad "missing-heading: script exited 0 after the stable heading disappeared"
+    bad "feed-not-json: script exited 0 on an HTML answer from the release feed"
 elif [ -n "$changed" ]; then
-    bad "missing-heading: tracked file(s) changed despite the parse failure:$changed"
-elif ! grep -Fq 'has no "Stable version" section -- refusing to guess' "$SANDBOX/out.log"; then
-    bad "missing-heading: unexpected log: $(cat "$SANDBOX/out.log")"
+    bad "feed-not-json: tracked file(s) changed despite the feed failure:$changed"
+elif ! grep -Fq 'the nginx release feed is not JSON' "$SANDBOX/out.log"; then
+    bad "feed-not-json: unexpected log: $(cat "$SANDBOX/out.log")"
 else
-    ok "missing-heading: failed closed, named the missing section, and edited nothing"
+    ok "feed-not-json: failed closed, named the bad feed, and edited nothing"
 fi
 
-say "== case: stable section without a tarball cannot borrow the legacy release =="
+say "== case: nginx feed with no even-minor release cannot invent a stable =="
 make_sandbox SANDBOX
-declare -A before_empty_section=()
+declare -A before_no_even=()
 for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
-    before_empty_section[$f]="$(cat "$SANDBOX/$f")"
+    before_no_even[$f]="$(cat "$SANDBOX/$f")"
 done
-bindir="$(OMIT_STABLE_TARBALL=1 stub_bin "$SANDBOX")"
+bindir="$(NGINX_FEED=no-even stub_bin "$SANDBOX")"
 set +e
 (
     cd "$SANDBOX"
@@ -502,45 +507,33 @@ set +e
 rc=$?
 set -e
 changed=""
-for f in "${!before_empty_section[@]}"; do
-    [ "${before_empty_section[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
+for f in "${!before_no_even[@]}"; do
+    [ "${before_no_even[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
 done
 if [ "$rc" -eq 0 ]; then
-    bad "empty-section: script exited 0 after the stable tarball disappeared"
+    bad "feed-no-even: script exited 0 with no stable release in the feed"
 elif [ -n "$changed" ]; then
-    bad "empty-section: tracked file(s) changed despite the parse failure:$changed"
+    bad "feed-no-even: tracked file(s) changed despite the missing line:$changed"
 elif ! grep -Fq 'could not determine NEW_STABLE' "$SANDBOX/out.log"; then
-    bad "empty-section: unexpected log: $(cat "$SANDBOX/out.log")"
+    bad "feed-no-even: unexpected log: $(cat "$SANDBOX/out.log")"
 else
-    ok "empty-section: failed closed instead of borrowing the legacy tarball"
+    ok "feed-no-even: failed closed instead of pinning a mainline release as stable"
 fi
 
-say "== case: missing next-section boundary cannot expose a later tarball =="
-make_sandbox SANDBOX
-declare -A before_missing_boundary=()
-for f in .github/workflows/ci-deep.yml .github/workflows/harness-fault-arms.yml ci/tools/ci-build.sh ci/tools/windows-pins.sh; do
-    before_missing_boundary[$f]="$(cat "$SANDBOX/$f")"
-done
-bindir="$(OMIT_LEGACY_HEADING=1 stub_bin "$SANDBOX")"
-set +e
-(
-    cd "$SANDBOX"
-    PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
-)
-rc=$?
-set -e
-changed=""
-for f in "${!before_missing_boundary[@]}"; do
-    [ "${before_missing_boundary[$f]}" = "$(cat "$SANDBOX/$f")" ] || changed="$changed $f"
-done
-if [ "$rc" -eq 0 ]; then
-    bad "missing-boundary: script exited 0 after the legacy heading disappeared"
-elif [ -n "$changed" ]; then
-    bad "missing-boundary: tracked file(s) changed despite the parse failure:$changed"
-elif ! grep -Fq 'has no "Legacy version" boundary after "Stable version"' "$SANDBOX/out.log"; then
-    bad "missing-boundary: unexpected log: $(cat "$SANDBOX/out.log")"
+say "== case: branch transition -- a new even-minor stable above the mainline line moves stable only =="
+if run_case transition NEW_STABLE=1.32.0; then
+    if grep -q 'version: "1.32.0"' "$SANDBOX/.github/workflows/ci-deep.yml" \
+        && grep -q '\["1.32.0"\]' "$SANDBOX/ci/tools/ci-build.sh" \
+        && [ "$(harness_line 1.31.4 ci-deep.yml)" = 1 ] \
+        && [ "$(harness_line 1.31.4 harness-fault-arms.yml)" = 1 ] \
+        && [ "$(pins_line VER_NGINX)" = "VER_NGINX=1.31.4" ] \
+        && ! grep -q '1.33' "$SANDBOX/.github/workflows/ci-deep.yml"; then
+        ok "transition: stable moved to 1.32.0; mainline pins stayed on 1.31.4; the draft/prerelease 1.33.x were ignored"
+    else
+        bad "transition: unexpected result: $(cat "$SANDBOX/out.log")"
+    fi
 else
-    ok "missing-boundary: failed closed instead of exposing a later tarball"
+    bad "transition: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
 fi
 
 say "== case: install failure on the SECOND changed file rolls back the first =="

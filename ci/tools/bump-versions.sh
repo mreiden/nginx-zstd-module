@@ -33,8 +33,9 @@
 # nginx mainline in the build-flavors matrix (label: mainline) and the
 # NGINX_VERSION: "" of build-test.yml / ci-deep.yml are resolved at CI run
 # time by each workflow's own nginx.org scrape (build-test.yml's `resolve`
-# job, ci-deep.yml's per-job "Resolve latest mainline nginx" steps), so they
-# carry no static pin. The harness and Windows jobs pin mainline statically
+# job, ci-deep.yml's per-job "Resolve latest mainline nginx" steps -- those
+# take the highest version on the page, not a section), so they carry no
+# static pin. The harness and Windows jobs pin mainline statically
 # -- a fault-injection harness and a Windows binary want a build that does
 # not change under them between runs -- and those are the mainline pins
 # bumped here.
@@ -84,63 +85,78 @@ HARNESS_FILES=(".github/workflows/ci-deep.yml" ".github/workflows/harness-fault-
 
 # --- discover latest versions -------------------------------------------
 
-# nginx.org/en/download.html lists Mainline then Stable then Legacy, each as
-# its own section header followed by a table whose first tarball link is that
-# section's current release -- no JSON feed exists, so parse the one page
-# nginx itself treats as authoritative. Fetched once, parsed per section.
-NGINX_PAGE="$(curl -fsSL https://nginx.org/en/download.html)"
-
-nginx_section_version() { # "Mainline version" | "Stable version"
-    local section="$1" next tail
-    tail="${NGINX_PAGE#*"$section"}"
-    if [ "$tail" = "$NGINX_PAGE" ]; then
-        echo "FATAL: nginx.org/en/download.html has no \"$section\" section -- refusing to guess" >&2
+# GET an api.github.com path. The runners share an egress IP, so the
+# unauthenticated API allowance (60/hr) is routinely exhausted and the call
+# 403s; GH_TOKEN, when present, buys the far larger authenticated quota. The
+# header goes in through stdin so the token never appears in curl's process
+# arguments on a shared runner.
+gh_api_json() { # path
+    local json
+    if [ -n "${GH_TOKEN:-}" ]; then
+        json="$(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" \
+            | curl --config - -fsSL "https://api.github.com/$1")" || json=""
+    else
+        json="$(curl -fsSL "https://api.github.com/$1")" || json=""
+    fi
+    if [ -z "$json" ]; then
+        echo "error: could not query https://api.github.com/$1 (rate limit? set GH_TOKEN)" >&2
         return 1
     fi
-    case "$section" in
-        "Mainline version") next="Stable version" ;;
-        "Stable version") next="Legacy version" ;;
-        *)
-            echo "FATAL: unsupported nginx section \"$section\"" >&2
-            return 1
-            ;;
-    esac
-    if [ "${tail#*"$next"}" = "$tail" ]; then
-        echo "FATAL: nginx.org/en/download.html has no \"$next\" boundary after \"$section\" -- refusing to guess" >&2
-        return 1
-    fi
-    # Do not borrow a tarball from the next section when this section is
-    # present but empty or its markup has drifted.
-    tail="${tail%%"$next"*}"
-    # A section with no tarball link yields a blank, which the blank-version
-    # check below reports by name (|| true: keep that message under -e).
-    echo "$tail" \
-        | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' | head -1 \
-        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
+    printf '%s\n' "$json"
 }
 
-latest_nginx_stable() { nginx_section_version "Stable version"; }
-latest_nginx_mainline() { nginx_section_version "Mainline version"; }
+# nginx publishes every release on GitHub as a Release (not just a tag):
+# `release-X.Y.Z`, non-draft, carrying the same signed tarball nginx.org
+# serves (byte-identical, same .asc, verified by ci/tools/keys). That is a
+# structured feed; nginx.org/en/download.html is HTML whose section
+# headings a parser has to know by name, and a renamed heading is a
+# refusal at best. The stable and mainline lines follow nginx's own
+# versioning rule -- even minor is stable, odd minor is mainline -- so
+# each line's newest release is the newest of its parity. Thirty releases
+# span more than a year of every line, so the newest of each is always on
+# the first page. Tarballs and signatures still come from nginx.org (the
+# pinned URLs do not change); only "what is newest" moves here.
+NGINX_RELEASES="$(gh_api_json 'repos/nginx/nginx/releases?per_page=30')"
+
+NGINX_LINE_PY=$(cat <<'PYEOF'
+import json, re, sys
+want_even = sys.argv[1] == "even"
+try:
+    releases = json.load(sys.stdin)
+except ValueError:
+    sys.exit("FATAL: the nginx release feed is not JSON -- refusing to guess")
+if not isinstance(releases, list):
+    sys.exit("FATAL: the nginx release feed is not a release list -- refusing to guess")
+best = None
+for r in releases:
+    if not isinstance(r, dict) or r.get("draft") or r.get("prerelease"):
+        continue
+    m = re.fullmatch(r"release-(\d+)\.(\d+)\.(\d+)", str(r.get("tag_name", "")))
+    if not m:
+        continue
+    v = tuple(int(x) for x in m.groups())
+    if (v[1] % 2 == 0) != want_even:
+        continue
+    if best is None or v > best:
+        best = v
+# No release of this parity on the page yields a blank, which the
+# blank-version check below reports by name.
+print("%d.%d.%d" % best if best else "")
+PYEOF
+)
+
+nginx_line_version() { # even (stable) | odd (mainline)
+    printf '%s' "$NGINX_RELEASES" | python3 -c "$NGINX_LINE_PY" "$1"
+}
+
+latest_nginx_stable() { nginx_line_version even; }
+latest_nginx_mainline() { nginx_line_version odd; }
 
 # The version carried by OWNER/REPO's latest GitHub release tag, whatever
 # the tag's prefix (v1.3.2, pcre2-10.48, openssl-4.0.2).
 gh_latest_tag() {
     local repo="$1" json
-    # The runners share an egress IP, so the unauthenticated API allowance
-    # (60/hr) is routinely exhausted and this call 403s. Send GH_TOKEN when
-    # one is present -- authenticated requests get their own, far larger quota.
-    if [ -n "${GH_TOKEN:-}" ]; then
-        # Read the header from stdin so the token never appears in curl's
-        # process arguments on a shared runner.
-        json="$(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" \
-            | curl --config - -fsSL "https://api.github.com/repos/${repo}/releases/latest")" || json=""
-    else
-        json="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest")" || json=""
-    fi
-    if [ -z "$json" ]; then
-        echo "error: could not query the ${repo} release API (rate limit? set GH_TOKEN)" >&2
-        return 1
-    fi
+    json="$(gh_api_json "repos/${repo}/releases/latest")" || return 1
     echo "$json" | grep -m1 '"tag_name"' | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 || true
 }
 
