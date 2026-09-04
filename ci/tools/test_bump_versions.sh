@@ -179,6 +179,21 @@ case "\$url" in
                     echo "[{\"tag_name\": \"release-1.28.0\", \"draft\": false, \"prerelease\": false},"
                     echo " {\"tag_name\": \"release-${NEW_STABLE:-$CUR_STABLE}\", \"draft\": false, \"prerelease\": false}]"
                 fi ;;
+            legacy-first)
+                # Page one is full and carries a recently created LEGACY even
+                # release beside the mainline; the newer stable line is on
+                # page two. Stopping at "both parities seen" would pin the
+                # legacy release as stable.
+                if [ "\$page" = 1 ]; then
+                    echo "[{\"tag_name\": \"release-${NEW_MAINLINE:-$CUR_MAINLINE}\", \"draft\": false, \"prerelease\": false},"
+                    echo " {\"tag_name\": \"release-1.28.9\", \"draft\": false, \"prerelease\": false},"
+                    for i in \$(seq 1 27); do
+                        echo " {\"tag_name\": \"release-1.29.\$i\", \"draft\": false, \"prerelease\": false},"
+                    done
+                    echo " {\"tag_name\": \"release-1.29.30\", \"draft\": false, \"prerelease\": false}]"
+                else
+                    echo "[{\"tag_name\": \"release-${NEW_STABLE:-$CUR_STABLE}\", \"draft\": false, \"prerelease\": false}]"
+                fi ;;
             endless)
                 # Every page is full and never shows a stable: the cap must end it.
                 full_page_of_mainline ;;
@@ -574,12 +589,32 @@ if (
         && grep -q '\["1.30.5"\]' "$SANDBOX/ci/tools/ci-build.sh" \
         && grep -q 'releases?per_page=30&page=2' "$argv_log" \
         && ! grep -q 'releases?per_page=30&page=3' "$argv_log"; then
-        ok "feed-page-two: read page two, found the stable there, stopped paging"
+        ok "feed-page-two: read page two, found the stable there, stopped at the short page"
     else
         bad "feed-page-two: unexpected result: $(cat "$SANDBOX/out.log"); pages: $(grep -o 'page=[0-9]*' "$argv_log" | tr '\n' ' ')"
     fi
 else
     bad "feed-page-two: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
+fi
+
+say "== case: a legacy even-minor release on page one must not hide the newer stable on page two =="
+make_sandbox SANDBOX
+argv_log="$SANDBOX/curl.argv"
+bindir="$(NGINX_FEED=legacy-first NEW_STABLE=1.30.5 stub_bin "$SANDBOX")"
+if (
+    cd "$SANDBOX"
+    CURL_ARGV_LOG="$argv_log" PATH="$bindir:$PATH" bash ci/tools/bump-versions.sh >"$SANDBOX/out.log" 2>&1
+); then
+    if grep -q 'version: "1.30.5"' "$SANDBOX/.github/workflows/ci-deep.yml" \
+        && grep -q '\["1.30.5"\]' "$SANDBOX/ci/tools/ci-build.sh" \
+        && ! grep -q '1.28.9' "$SANDBOX/out.log" \
+        && grep -q 'releases?per_page=30&page=2' "$argv_log"; then
+        ok "feed-legacy-first: read past a page that already had both parities; stable is 1.30.5, not the legacy 1.28.9"
+    else
+        bad "feed-legacy-first: unexpected result: $(cat "$SANDBOX/out.log"); pages: $(grep -o 'page=[0-9]*' "$argv_log" | tr '\n' ' ')"
+    fi
+else
+    bad "feed-legacy-first: script exited non-zero unexpectedly: $(cat "$SANDBOX/out.log")"
 fi
 
 say "== case: a feed that never shows a stable stops at the page cap and fails closed =="

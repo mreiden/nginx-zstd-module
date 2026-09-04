@@ -116,12 +116,15 @@ gh_api_json() { # path
 # signatures still come from nginx.org (the pinned URLs do not change);
 # only "what is newest" moves here.
 #
-# The feed is newest-first and paged. A long run of mainline and legacy
-# releases can push the last stable off the first page, so pages are read
-# until both parities have been seen (the newest of each is the highest
-# version across every page read), the list ends (a short page), or the
-# cap is reached -- five pages of thirty is several years of every line,
-# so the cap is a bound on a broken feed, not a limit a real one meets.
+# The feed is paged and ordered by creation time, not by version: a
+# security release of an older line (1.28.x) can be created months after
+# the current stable's last release, so the first even-minor entry seen
+# is not necessarily the newest stable, and a long run of mainline and
+# legacy releases can push the real one to a later page. Every page is
+# read, up to the cap or a short page, and the newest of each line is
+# the highest version across all of them -- five pages of thirty is
+# several years of every line, so the cap bounds a broken feed, not a
+# real one, and costs at most five small requests a week.
 NGINX_FEED_PAGE=30
 NGINX_FEED_PAGES=5
 
@@ -161,11 +164,8 @@ nginx_lines() {
     for ((page = 1; page <= NGINX_FEED_PAGES; page++)); do
         json="$(gh_api_json "repos/nginx/nginx/releases?per_page=${NGINX_FEED_PAGE}&page=${page}")"
         read -r even odd count < <(printf '%s' "$json" | python3 -c "$NGINX_LINE_PY" "$even" "$odd")
-        if [ "$even" != "-" ] && [ "$odd" != "-" ]; then
-            break
-        fi
         if [ "$count" -lt "$NGINX_FEED_PAGE" ]; then
-            break   # the list ended before both lines appeared
+            break   # a short page is the end of the list
         fi
     done
     printf '%s %s\n' "$even" "$odd"
