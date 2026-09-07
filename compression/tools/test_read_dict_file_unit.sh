@@ -24,7 +24,10 @@ tr -d '\r' < "ngx_http_compression_dict.c" > "$SRC"
 # Locate the definition by its signature line (the `static ssize_t` return
 # type sits on the line above it, this file's house style), so extraction
 # survives unrelated edits but fails loudly if the function is renamed.
-SIG_LINE="$(grep -n '^ngx_http_compression_read_dict_file(ngx_fd_t fd, u_char \*buf, size_t size)$' "$SRC" | head -1 | cut -d: -f1)"
+# Each locate pipeline ends in `|| true`: under pipefail a missing pattern
+# would otherwise kill the script at the assignment, one line before the
+# diagnostic that names what went missing.
+SIG_LINE="$(grep -n '^ngx_http_compression_read_dict_file(ngx_fd_t fd, u_char \*buf, size_t size)$' "$SRC" | head -1 | cut -d: -f1 || true)"
 if [ -z "$SIG_LINE" ]; then
     echo "FAIL: could not locate ngx_http_compression_read_dict_file()'s definition in $SRC" >&2
     exit 1
@@ -37,7 +40,11 @@ if ! sed -n "${START_LINE}p" "$SRC" | grep -q '^static ssize_t$'; then
 fi
 
 # First "^}" at column 0 after START_LINE closes the function.
-REL_END="$(tail -n "+${START_LINE}" "$SRC" | grep -n '^}' | head -1 | cut -d: -f1)"
+REL_END="$(tail -n "+${START_LINE}" "$SRC" | grep -n '^}' | head -1 | cut -d: -f1 || true)"
+if [ -z "$REL_END" ]; then
+    echo "FAIL: could not find the closing brace of ngx_http_compression_read_dict_file() in $SRC" >&2
+    exit 1
+fi
 END_LINE=$((START_LINE + REL_END - 1))
 
 {

@@ -16,7 +16,10 @@ OUT="$(mktemp -d "${TMPDIR:-/tmp}/compression-dio-ratelimit.XXXXXX")"
 trap 'rm -rf "$OUT"' EXIT
 
 SIG='ngx_http_compression_static_dio_err_should_log('
-SIG_LINE="$(grep -n "^${SIG}" "$SRC" | head -1 | cut -d: -f1)"
+# Each locate pipeline ends in `|| true`: under pipefail a missing pattern
+# would otherwise kill the script at the assignment, one line before the
+# diagnostic that names what went missing.
+SIG_LINE="$(grep -n "^${SIG}" "$SRC" | head -1 | cut -d: -f1 || true)"
 if [ -z "$SIG_LINE" ]; then
     echo "FAIL: could not locate ${SIG}) in $SRC" >&2
     exit 1
@@ -26,9 +29,13 @@ if ! sed -n "${START_LINE}p" "$SRC" | grep -q '^static ngx_uint_t$'; then
     echo "FAIL: line $START_LINE of $SRC is not the function's 'static ngx_uint_t' return line" >&2
     exit 1
 fi
-REL_END="$(tail -n "+${START_LINE}" "$SRC" | grep -n '^}' | head -1 | cut -d: -f1)"
+REL_END="$(tail -n "+${START_LINE}" "$SRC" | grep -n '^}' | head -1 | cut -d: -f1 || true)"
+if [ -z "$REL_END" ]; then
+    echo "FAIL: could not find the closing brace of ${SIG}) in $SRC" >&2
+    exit 1
+fi
 END_LINE=$((START_LINE + REL_END - 1))
-WINDOW_LINE="$(grep -n '^#define NGX_HTTP_COMPRESSION_STATIC_DIO_ERR_WINDOW' "$SRC" | head -1 | cut -d: -f1)"
+WINDOW_LINE="$(grep -n '^#define NGX_HTTP_COMPRESSION_STATIC_DIO_ERR_WINDOW' "$SRC" | head -1 | cut -d: -f1 || true)"
 if [ -z "$WINDOW_LINE" ]; then
     echo "FAIL: could not locate the window constant in $SRC" >&2
     exit 1

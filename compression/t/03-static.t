@@ -663,7 +663,7 @@ is not a zstd frame
 [ [ "page/short.shtml" => '<!--#include virtual="/st/short.txt" --><!--#include virtual="/st/short.txt" --><!--#include virtual="/st/short.txt" -->' ],
   [ "st/short.txt" => "identity fallback
 " ],
-  [ "st/short.txt.zst" => "P*M" . (" " x 4) . "(µ" ] ]
+  [ "st/short.txt.zst" => "P*M\x18" . ("\x00" x 4) . "\x28\xB5" ] ]
 --- config
     location /page/ {
         ssi on;

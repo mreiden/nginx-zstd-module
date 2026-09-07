@@ -55,6 +55,24 @@ our $many_cfg = join("
                      map { "    compression_dict_file html/many_$_.dict;" } 1..19);
 our @many_files = ([ "app.dict" => $dict ], map { [ "many_$_.dict" => $many[$_ - 1] ] } 1..19);
 
+# the threshold itself: sixteen entries stay on the linear scan, seventeen
+# take the binary search (nelts > 16). The two paths are indistinguishable
+# from the wire, so these pin that neither side of the boundary loses an
+# entry: the last-declared dictionary at sixteen, and at seventeen the
+# highest-sorting digest, the search's upper edge.
+our @many16_files = ([ "app.dict" => $dict ], map { [ "many_$_.dict" => $many[$_ - 1] ] } 1..15);
+our $many16_cfg   = join("
+", "    compression_dict_file html/app.dict;",
+                         map { "    compression_dict_file html/many_$_.dict;" } 1..15);
+our $last16_raw   = sha256($many[14]);
+our $last16_b64   = encode_base64($last16_raw, "");
+our @many17_files = ([ "app.dict" => $dict ], map { [ "many_$_.dict" => $many[$_ - 1] ] } 1..16);
+our $many17_cfg   = join("
+", "    compression_dict_file html/app.dict;",
+                         map { "    compression_dict_file html/many_$_.dict;" } 1..16);
+our $hi17_raw     = (sort { $a cmp $b } ($raw, map { sha256($many[$_ - 1]) } 1..16))[-1];
+our $hi17_b64     = encode_base64($hi17_raw, "");
+
 # dcz: 40-byte skippable frame (magic 0x184D2A5E LE, size 0x20 LE,
 # SHA-256), then the zstd magic of the checksummed stream
 our $dcz_re = qr/^\x5E\x2A\x4D\x18\x20\x00\x00\x00\Q$raw\E\x28\xB5\x2F\xFD/s;
@@ -1155,5 +1173,62 @@ qq{Accept-Encoding: zstd, dcz
 Available-Dictionary: :$::odd_b64:}
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+=== TEST 33: sixteen dictionaries: at the threshold the lookup is still the linear scan
+# nelts == 16 is not above the threshold. The last-declared dictionary
+# is the one a scan that stopped a step early would miss.
+--- user_files eval
+\@::many16_files
+--- http_config eval
+$::many16_cfg
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        return 200 "negotiation fixture body, long enough to compress meaningfully
+";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz
+Available-Dictionary: :$::last16_b64:}
+--- response_headers
+Content-Encoding: dcz
+--- response_body_like eval
+qr/^\x5E\x2A\x4D\x18\x20\x00\x00\x00\Q$::last16_raw\E\x28\xB5\x2F\xFD/s
+--- no_error_log
+[error]
+
+
+=== TEST 34: seventeen dictionaries: one past the threshold, the search reaches its upper edge
+# nelts == 17 is the first count that binary-searches. The highest
+# digest sorts last, so it is the entry a search whose upper bound was
+# off by one would never probe.
+--- user_files eval
+\@::many17_files
+--- http_config eval
+$::many17_cfg
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        return 200 "negotiation fixture body, long enough to compress meaningfully
+";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz
+Available-Dictionary: :$::hi17_b64:}
+--- response_headers
+Content-Encoding: dcz
+--- response_body_like eval
+qr/^\x5E\x2A\x4D\x18\x20\x00\x00\x00\Q$::hi17_raw\E\x28\xB5\x2F\xFD/s
 --- no_error_log
 [error]

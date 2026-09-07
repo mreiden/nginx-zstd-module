@@ -19,14 +19,20 @@ trap 'rm -rf "$OUT"' EXIT
 extract_function() {
     local signature="$1" label="$2" sig start rel end
 
-    sig="$(grep -n "^${signature}" "$SRC" | head -1 | cut -d: -f1)"
+    # `|| true` so a missing pattern reaches the diagnostic below instead
+    # of ending the script at the assignment under pipefail.
+    sig="$(grep -n "^${signature}" "$SRC" | head -1 | cut -d: -f1 || true)"
     if [ -z "$sig" ]; then
         echo "FAIL: could not locate $label in $SRC" >&2
         exit 1
     fi
 
     start=$((sig - 1))
-    rel="$(tail -n "+${start}" "$SRC" | grep -n '^}' | head -1 | cut -d: -f1)"
+    rel="$(tail -n "+${start}" "$SRC" | grep -n '^}' | head -1 | cut -d: -f1 || true)"
+    if [ -z "$rel" ]; then
+        echo "FAIL: could not find the closing brace of $label in $SRC" >&2
+        exit 1
+    fi
     end=$((start + rel - 1))
     sed -n "${start},${end}p" "$SRC"
 }

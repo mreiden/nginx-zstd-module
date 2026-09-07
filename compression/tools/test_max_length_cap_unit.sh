@@ -23,7 +23,10 @@ OUT="$(mktemp -d "${TMPDIR:-/tmp}/compression-max-length-cap.XXXXXX")"
 trap 'rm -rf "$OUT"' EXIT
 
 SIG='ngx_http_compression_max_length_exceeded(uint64_t bytes_in, ssize_t max_length)'
-SIG_LINE="$(grep -nF "$SIG" "$SRC" | head -1 | cut -d: -f1)"
+# Each locate pipeline ends in `|| true`: under pipefail a missing pattern
+# would otherwise kill the script at the assignment, one line before the
+# diagnostic that names what went missing.
+SIG_LINE="$(grep -nF "$SIG" "$SRC" | head -1 | cut -d: -f1 || true)"
 if [ -z "$SIG_LINE" ]; then
     echo "FAIL: could not locate ${SIG} in $SRC" >&2
     exit 1
@@ -33,7 +36,11 @@ if ! sed -n "${START_LINE}p" "$SRC" | tr -d '\r' | grep -q '^static ngx_flag_t$'
     echo "FAIL: line $START_LINE of $SRC is not the predicate's 'static ngx_flag_t' return line" >&2
     exit 1
 fi
-REL_END="$(tail -n "+${START_LINE}" "$SRC" | tr -d '\r' | grep -n '^}' | head -1 | cut -d: -f1)"
+REL_END="$(tail -n "+${START_LINE}" "$SRC" | tr -d '\r' | grep -n '^}' | head -1 | cut -d: -f1 || true)"
+if [ -z "$REL_END" ]; then
+    echo "FAIL: could not find the closing brace of ${SIG} in $SRC" >&2
+    exit 1
+fi
 END_LINE=$((START_LINE + REL_END - 1))
 
 {
