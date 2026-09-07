@@ -70,7 +70,7 @@ jobs:
           sudo apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update
           sudo apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 install -y \
             build-essential libzstd-dev libbrotli-dev libpcre2-dev \
-            zlib1g-dev zstd brotli wget curl cpanminus
+            zlib1g-dev zstd brotli wget curl cpanminus gcc-multilib
 
       - name: Cache nginx source tarball
         id: nginx-tarball
@@ -155,6 +155,11 @@ jobs:
 
       - name: directio hard-error log rate limiter (parent #320)
         run: bash compression/tools/test_dio_err_ratelimit_unit.sh
+
+      - name: max_length cap predicate, native and 32-bit off_t (parent #227)
+        env:
+          REQUIRE_M32: "1"
+        run: bash compression/tools/test_max_length_cap_unit.sh
 
       - name: Static filter-order policy (anchor after the last compressor)
         run: sh compression/tools/test_static_filter_order.sh

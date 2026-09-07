@@ -577,18 +577,37 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
             i = 0;
         }
 
-        if (h[i].key.len == sizeof("Available-Dictionary") - 1
-            && ngx_strncasecmp(h[i].key.data,
-                               (u_char *) "Available-Dictionary",
-                               sizeof("Available-Dictionary") - 1) == 0)
+        /*
+         * Case-SENSITIVE ngx_memcmp against the lowercase literal when
+         * nginx supplied lowcase_key: core-parsed request headers carry
+         * the folded form already, so re-folding with ngx_strncasecmp()
+         * redoes work nginx did, once per header per request (parent
+         * #321 P8). A header inserted by another module may leave that
+         * optional pointer NULL, so the folding compare stays as the
+         * fallback.
+         */
+        if (h[i].key.len == sizeof("available-dictionary") - 1
+            && ((h[i].lowcase_key != NULL
+                 && ngx_memcmp(h[i].lowcase_key, "available-dictionary",
+                               sizeof("available-dictionary") - 1) == 0)
+                || (h[i].lowcase_key == NULL
+                    && ngx_strncasecmp(h[i].key.data,
+                                       (u_char *) "Available-Dictionary",
+                                       sizeof("Available-Dictionary") - 1)
+                       == 0)))
         {
             ad = &h[i];
             ad_n++;
 
-        } else if (h[i].key.len == sizeof("Sec-Fetch-Site") - 1
-                   && ngx_strncasecmp(h[i].key.data,
-                                      (u_char *) "Sec-Fetch-Site",
-                                      sizeof("Sec-Fetch-Site") - 1) == 0)
+        } else if (h[i].key.len == sizeof("sec-fetch-site") - 1
+                   && ((h[i].lowcase_key != NULL
+                        && ngx_memcmp(h[i].lowcase_key, "sec-fetch-site",
+                                      sizeof("sec-fetch-site") - 1) == 0)
+                       || (h[i].lowcase_key == NULL
+                           && ngx_strncasecmp(h[i].key.data,
+                                              (u_char *) "Sec-Fetch-Site",
+                                              sizeof("Sec-Fetch-Site") - 1)
+                              == 0)))
         {
             sfs = &h[i];
             sfs_n++;
@@ -2626,6 +2645,30 @@ ngx_http_compression_consume_in_link(ngx_http_request_t *r,
 }
 
 
+
+/*
+ * Length-independent input cap, checked per iteration of the streaming
+ * body filter (parent #227). Split out so a unit fixture
+ * (compression/tools/test_max_length_cap_unit.sh) extracts it verbatim and
+ * drives it against bytes_in > INT32_MAX on a genuine 32-bit off_t build
+ * (plain -m32, no _FILE_OFFSET_BITS override): the one shape where the
+ * signed-cast form this replaced, `(off_t) bytes_in > (off_t) max_length`,
+ * could truncate the uint64_t accumulator through a narrower off_t and
+ * answer wrongly. nginx normally builds with largefile support, which
+ * widens off_t to 64 bits even on a 32-bit platform, so this is 32-bit
+ * off_t hardening rather than a gap in a stock build. bytes_in is
+ * unsigned and max_length is ssize_t; NGX_CONF_UNSET (-1) means no cap,
+ * and the >= 0 guard defends against sentinel drift in the field, not
+ * against user input (ngx_conf_set_size_slot refuses a negative literal).
+ */
+static ngx_flag_t
+ngx_http_compression_max_length_exceeded(uint64_t bytes_in, ssize_t max_length)
+{
+    return max_length != NGX_CONF_UNSET
+           && max_length >= 0
+           && bytes_in > (uint64_t) max_length;
+}
+
 static ngx_int_t
 ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
@@ -2844,8 +2887,8 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                  * request — protecting the worker beats completing one
                  * runaway response.
                  */
-                if (ctx->max_length != NGX_CONF_UNSET
-                    && (off_t) ctx->bytes_in > (off_t) ctx->max_length)
+                if (ngx_http_compression_max_length_exceeded(ctx->bytes_in,
+                                                             ctx->max_length))
                 {
                     /*
                      * Name the shape truthfully (parent #283): a
