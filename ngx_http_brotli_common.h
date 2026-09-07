@@ -93,11 +93,13 @@ ngx_http_brotli_skip_quoted(u_char *p, u_char *end)
  * (the caller re-scans to the next ',').
  */
 static ngx_int_t
-ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
+ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char **pp)
 {
+    u_char     *p = *pp;
     u_char     *end = ae->data + ae->len;
     ngx_int_t   q = 1000;   /* no q parameter → q=1 */
     ngx_int_t   q_seen = 0; /* reject a second "q" parameter (RFC 9110) */
+    ngx_int_t   quoted_name = 0;    /* DQUOTE seen inside a parameter name */
 
     while (p < end && *p == ';') {
 
@@ -116,6 +118,9 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
                && *p != '=' && *p != ';' && *p != ','
                && *p != ' ' && *p != '\t')
         {
+            if (*p == '"') {
+                quoted_name = 1;
+            }
             p++;
         }
         nend = p;
@@ -128,7 +133,7 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
          * rule; this copy had drifted without it).
          */
         if (nend == nstart) {
-            return -1;
+            goto malformed;
         }
 
         is_q = (nend - nstart == 1
@@ -150,12 +155,12 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
                  * Strict qvalue grammar. Leading digit must be 0 or 1.
                  */
                 if (q_seen) {
-                    return -1;          /* repeated "q" parameter */
+                    goto malformed;     /* repeated "q" parameter */
                 }
                 q_seen = 1;
 
                 if (p >= end) {
-                    return -1;          /* "q=" with no value */
+                    goto malformed;     /* "q=" with no value */
                 }
 
                 if (*p == '0') {
@@ -197,7 +202,7 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
                     }
 
                 } else {
-                    return -1;          /* leading digit not 0 or 1 */
+                    goto malformed;     /* leading digit not 0 or 1 */
                 }
 
                 /*
@@ -209,7 +214,7 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
                 if (p < end
                     && *p != ' ' && *p != '\t' && *p != ';' && *p != ',')
                 {
-                    return -1;
+                    goto malformed;
                 }
 
             } else {
@@ -231,7 +236,7 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
         } else {
             /* parameter present without a value */
             if (is_q) {
-                return -1;              /* "q" with no "=value" is malformed */
+                goto malformed;         /* "q" with no "=value" is malformed */
             }
         }
 
@@ -246,8 +251,20 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
          * element rather than silently accepting it.
          */
         if (p < end && *p != ';' && *p != ',') {
-            return -1;
+            goto malformed;
         }
+    }
+
+    goto done;
+
+malformed:
+
+    q = -1;
+
+done:
+
+    if (!quoted_name) {
+        *pp = p;
     }
 
     return q;
@@ -340,7 +357,7 @@ ngx_http_brotli_coding_weight_ex(ngx_str_t *ae, const char *coding,
 
         q = 1000;       /* no parameters → q=1 */
         if (p < end && *p == ';') {
-            q = ngx_http_brotli_eval_qvalue(ae, p);
+            q = ngx_http_brotli_eval_qvalue(ae, &p);
         }
 
         if (q >= 0) {
