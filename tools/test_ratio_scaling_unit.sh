@@ -21,13 +21,20 @@ trap 'rm -rf "$OUT"' EXIT
 SRC="$OUT/brotli_src.c"
 tr -d '\r' < "filter/ngx_http_brotli_filter_module.c" > "$SRC"
 
+# Each locate pipeline ends in `|| true`: under pipefail a missing pattern
+# would otherwise kill the script at the assignment, one line before the
+# diagnostic that names what went missing.
 START_LINE="$(grep -n '^static void ngx_http_brotli_ratio_parts(uint64_t bytes_in, uint64_t bytes_out,$' \
-              "$SRC" | head -1 | cut -d: -f1)"
+              "$SRC" | head -1 | cut -d: -f1 || true)"
 if [ -z "$START_LINE" ]; then
     echo "FAIL: could not locate ngx_http_brotli_ratio_parts() in the filter" >&2
     exit 1
 fi
-REL_END="$(tail -n "+${START_LINE}" "$SRC" | grep -n '^}' | head -1 | cut -d: -f1)"
+REL_END="$(tail -n "+${START_LINE}" "$SRC" | grep -n '^}' | head -1 | cut -d: -f1 || true)"
+if [ -z "$REL_END" ]; then
+    echo "FAIL: could not find the closing brace of ngx_http_brotli_ratio_parts()" >&2
+    exit 1
+fi
 END_LINE=$((START_LINE + REL_END - 1))
 
 {

@@ -40,8 +40,14 @@ if [ -z "$START_LINE" ]; then
     exit 1
 fi
 
-# First "^}" at column 0 after START_LINE closes the function.
-REL_END="$(tail -n "+${START_LINE}" "$SRC" | grep -n '^}' | head -1 | cut -d: -f1)"
+# First "^}" at column 0 after START_LINE closes the function. `|| true`
+# so a miss reaches the diagnostic instead of ending the script at the
+# assignment under pipefail.
+REL_END="$(tail -n "+${START_LINE}" "$SRC" | grep -n '^}' | head -1 | cut -d: -f1 || true)"
+if [ -z "$REL_END" ]; then
+    echo "FAIL: could not find the closing brace of ngx_http_brotli_read_dict_file()" >&2
+    exit 1
+fi
 END_LINE=$((START_LINE + REL_END - 1))
 
 {
