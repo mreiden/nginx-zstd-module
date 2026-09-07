@@ -94,11 +94,13 @@ ngx_http_compression_parse_q_fraction(u_char *end, u_char **p)
 
 
 static ngx_int_t
-ngx_http_compression_eval_qvalue(ngx_str_t *ae, u_char *p)
+ngx_http_compression_eval_qvalue(ngx_str_t *ae, u_char **pp)
 {
+    u_char     *p = *pp;
     u_char     *end = ae->data + ae->len;
     ngx_int_t   q = 1000;   /* no q parameter → q=1 */
     ngx_int_t   q_seen = 0;
+    ngx_int_t   quoted_name = 0;    /* DQUOTE seen inside a parameter name */
 
     while (p < end && *p == ';') {
 
@@ -116,6 +118,9 @@ ngx_http_compression_eval_qvalue(ngx_str_t *ae, u_char *p)
                && *p != '=' && *p != ';' && *p != ','
                && *p != ' ' && *p != '\t')
         {
+            if (*p == '"') {
+                quoted_name = 1;
+            }
             p++;
         }
         nend = p;
@@ -128,7 +133,7 @@ ngx_http_compression_eval_qvalue(ngx_str_t *ae, u_char *p)
          * accepting it here would split the defer decision.)
          */
         if (nend == nstart) {
-            return -1;
+            goto malformed;
         }
 
         is_q = (nend - nstart == 1
@@ -147,12 +152,12 @@ ngx_http_compression_eval_qvalue(ngx_str_t *ae, u_char *p)
 
             if (is_q) {
                 if (q_seen) {
-                    return -1;          /* repeated "q" parameter */
+                    goto malformed;     /* repeated "q" parameter */
                 }
                 q_seen = 1;
 
                 if (p >= end) {
-                    return -1;          /* "q=" with no value */
+                    goto malformed;     /* "q=" with no value */
                 }
 
                 if (*p == '0') {
@@ -179,13 +184,13 @@ ngx_http_compression_eval_qvalue(ngx_str_t *ae, u_char *p)
                     }
 
                 } else {
-                    return -1;          /* leading digit not 0 or 1 */
+                    goto malformed;     /* leading digit not 0 or 1 */
                 }
 
                 if (p < end
                     && *p != ' ' && *p != '\t' && *p != ';' && *p != ',')
                 {
-                    return -1;          /* trailing junk (q=1x, q=0.0001) */
+                    goto malformed;     /* trailing junk (q=1x, q=0.0001) */
                 }
 
             } else {
@@ -200,7 +205,7 @@ ngx_http_compression_eval_qvalue(ngx_str_t *ae, u_char *p)
 
         } else {
             if (is_q) {
-                return -1;              /* "q" with no "=value" */
+                goto malformed;         /* "q" with no "=value" */
             }
         }
 
@@ -209,8 +214,20 @@ ngx_http_compression_eval_qvalue(ngx_str_t *ae, u_char *p)
         }
 
         if (p < end && *p != ';' && *p != ',') {
-            return -1;
+            goto malformed;
         }
+    }
+
+    goto done;
+
+malformed:
+
+    q = -1;
+
+done:
+
+    if (!quoted_name) {
+        *pp = p;
     }
 
     return q;
@@ -298,7 +315,7 @@ ngx_http_compression_coding_weight_ex(ngx_str_t *ae, ngx_str_t *coding,
 
         q = 1000;
         if (p < end && *p == ';') {
-            q = ngx_http_compression_eval_qvalue(ae, p);
+            q = ngx_http_compression_eval_qvalue(ae, &p);
         }
 
         if (q >= 0) {
@@ -309,6 +326,14 @@ ngx_http_compression_coding_weight_ex(ngx_str_t *ae, ngx_str_t *coding,
             }
         }
 
+        /*
+         * Quote-aware skip to the next element. After a well-formed
+         * parameter list this is a no-op: eval_qvalue has already
+         * advanced `p` to that comma (parent #226). It still does real
+         * work for a malformed element (p sits on the offending byte)
+         * and for a DQUOTE inside a parameter name (p is still on the
+         * ';', so the skip reproduces the historical result).
+         */
         while (p < end && *p != ',') {
             if (*p == '"') {
                 p = ngx_http_compression_skip_quoted(p, end);
