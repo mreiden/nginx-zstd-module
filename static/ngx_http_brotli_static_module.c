@@ -21,6 +21,20 @@ typedef struct {
   ngx_uint_t enable;
 } configuration_t;
 
+/* Cycle-owned. any_enabled is the conservative "could this cycle serve a
+   .br sidecar" latch for init() (zstd siblings' #182): set at directive
+   PARSE time by set_enable_slot() whenever "brotli_static" is parsed as
+   "on" or "always" anywhere in the config, so the always-declining
+   content-phase handler is appended only when some location could use
+   it. "brotli_static" takes no NGX_HTTP_LIF_CONF, so there is no "if"
+   conf to reason about; parse time is still the safe side (a false
+   positive costs the handler's early return, a false negative would
+   silently stop sidecars being served). Independent of the filter
+   module's own bit. */
+typedef struct {
+  ngx_flag_t any_enabled;
+} main_configuration_t;
+
 static ngx_conf_enum_t kBrotliStaticEnum[] = {
     {ngx_string("off"), NGX_HTTP_BROTLI_STATIC_OFF},
     {ngx_string("on"), NGX_HTTP_BROTLI_STATIC_ON},
@@ -32,8 +46,11 @@ static ngx_conf_enum_t kBrotliStaticEnum[] = {
 /* >> Forward declarations */
 
 static ngx_int_t handler(ngx_http_request_t* req);
+static void* create_main_conf(ngx_conf_t* root_cfg);
 static void* create_conf(ngx_conf_t* root_cfg);
 static char* merge_conf(ngx_conf_t* root_cfg, void* parent, void* child);
+static char* set_enable_slot(ngx_conf_t* root_cfg, ngx_command_t* cmd,
+                             void* conf);
 static ngx_int_t init(ngx_conf_t* root_cfg);
 
 /* << Forward declarations*/
@@ -44,7 +61,7 @@ static ngx_command_t kCommands[] = {
     {ngx_string("brotli_static"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
          NGX_CONF_TAKE1,
-     ngx_conf_set_enum_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     set_enable_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(configuration_t, enable), &kBrotliStaticEnum},
     ngx_null_command};
 
@@ -52,8 +69,8 @@ static ngx_http_module_t kModuleContext = {
     NULL, /* preconfiguration */
     init, /* postconfiguration */
 
-    NULL, /* create main configuration */
-    NULL, /* init main configuration */
+    create_main_conf, /* create main configuration */
+    NULL,             /* init main configuration */
 
     NULL, /* create server configuration */
     NULL, /* merge server configuration */
@@ -321,9 +338,46 @@ static char* merge_conf(ngx_conf_t* root_cfg, void* parent, void* child) {
   return NGX_CONF_OK;
 }
 
+static void* create_main_conf(ngx_conf_t* root_cfg) {
+  /* pcalloc: any_enabled starts clear and only set_enable_slot() sets it */
+  return ngx_pcalloc(root_cfg->pool, sizeof(main_configuration_t));
+}
+
+/* "brotli_static off|on|always": the stock enum slot plus the parse-time
+   any_enabled latch (see main_configuration_t). ngx_conf_set_enum_slot()
+   accepts exactly the three enum entries, so by the time this runs the
+   argument is one of them; only the literal "off" leaves the bit clear. */
+static char* set_enable_slot(ngx_conf_t* root_cfg, ngx_command_t* cmd,
+                             void* conf) {
+  ngx_str_t* value;
+  char* rc;
+  main_configuration_t* main_cfg;
+
+  rc = ngx_conf_set_enum_slot(root_cfg, cmd, conf);
+  if (rc != NGX_CONF_OK) return rc;
+
+  value = root_cfg->args->elts;
+  if (value[1].len == 3 && ngx_strncmp(value[1].data, "off", 3) == 0) {
+    return NGX_CONF_OK;
+  }
+
+  main_cfg = ngx_http_conf_get_module_main_conf(root_cfg,
+                                                ngx_http_brotli_static_module);
+  main_cfg->any_enabled = 1;
+
+  return NGX_CONF_OK;
+}
+
 static ngx_int_t init(ngx_conf_t* root_cfg) {
   ngx_http_core_main_conf_t* core_cfg;
   ngx_http_handler_pt* handler_slot;
+  main_configuration_t* main_cfg;
+
+  /* Off everywhere: nothing could serve a sidecar, so do not append the
+     always-declining content-phase handler (zstd siblings' #182). */
+  main_cfg = ngx_http_conf_get_module_main_conf(root_cfg,
+                                                ngx_http_brotli_static_module);
+  if (main_cfg == NULL || !main_cfg->any_enabled) return NGX_OK;
 
   core_cfg = ngx_http_conf_get_module_main_conf(root_cfg, ngx_http_core_module);
   handler_slot =

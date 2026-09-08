@@ -937,3 +937,88 @@ Accept-Encoding: br;;q=1, br
 Content-Encoding: br
 --- no_error_log
 [error]
+
+
+
+=== TEST 39: brotli off everywhere: identity served, the variables still resolve
+# zstd siblings' #182: with "brotli" off in every location the filter
+# hooks are not installed at all. Black-box, that is indistinguishable
+# from "installed and declining", which is the point of the change; what
+# this block pins is that nothing else moved -- the response is identity
+# with no Vary, and $brotli_ratio still registers (the variables are
+# wired regardless of the hooks), so a log_format naming it loads.
+--- http_config
+    brotli off;
+--- config
+    location /t {
+        add_header X-Ratio "r=$brotli_ratio";
+        default_type text/html;
+        return 200 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+!Content-Encoding
+!Vary
+X-Ratio: r=
+--- response_body
+brotli filter body: negotiation matrix fixture text
+--- no_error_log
+[error]
+
+
+
+=== TEST 40: "brotli on" only inside an "if" block still installs the hooks
+# The latch must fire for the NGX_HTTP_LIF_CONF conf a rewrite-phase
+# "if" synthesizes, which the location-conf merge walk does not provably
+# visit: http-level off, one if-block on. A latch that only saw
+# main/srv/loc confs would leave the hooks uninstalled and serve identity
+# here.
+--- http_config
+    brotli off;
+--- config
+    location /t {
+        if ($arg_br) {
+            brotli on;
+        }
+        brotli_min_length 8;
+        default_type text/html;
+        return 200 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t?br=1
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+Vary: Accept-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 41: brotli_static off everywhere: the sidecar is not served
+# The static module's own latch: off in every location means the
+# content-phase handler is never appended, and a .br sibling on disk is
+# simply not consulted -- the request serves the identity file.
+--- http_config
+    brotli_static off;
+    brotli off;
+--- config
+    location /st/ {
+        root html;
+    }
+--- user_files eval
+[ [ "st/hello.js" => $::src ], [ "st/hello.js.br" => $::br ] ]
+--- request
+GET /st/hello.js
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+!Content-Encoding
+--- response_body eval
+$::src
+--- no_error_log
+[error]

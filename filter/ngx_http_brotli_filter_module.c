@@ -183,6 +183,8 @@ static void* ngx_http_brotli_create_conf(ngx_conf_t* cf);
 static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
                                         void* child);
 static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf);
+static char* ngx_http_brotli_set_enable_slot(ngx_conf_t* cf,
+                                             ngx_command_t* cmd, void* conf);
 
 static char* ngx_http_brotli_parse_wbits(ngx_conf_t* cf, void* post,
                                          void* data);
@@ -260,6 +262,19 @@ typedef struct {
      touches it, and only during parse. */
   void* dcb_evp_md_ctx;
   ngx_flag_t dcb_evp_md_ctx_attempted;
+
+  /* Conservative "could this cycle serve a brotli response" latch for
+     ngx_http_brotli_filter_init() (zstd siblings' #182). Set at directive
+     PARSE time by ngx_http_brotli_set_enable_slot() whenever "brotli" is
+     parsed as anything but an explicit "off" anywhere in the config --
+     main, srv, loc, or the NGX_HTTP_LIF_CONF conf synthesized for a
+     rewrite-phase "if" block, which the location-conf merge walk does
+     not provably visit. A false positive (hooks installed, every merged
+     location off) costs the two no-op calls this is about; a false
+     negative would silently drop compression for a live location, so
+     parse time is the safe side. Never read at request time; the
+     $brotli_* variables are registered regardless. */
+  ngx_flag_t any_enabled;
 } ngx_http_brotli_main_conf_t;
 
 /* Configuration literals. */
@@ -274,7 +289,7 @@ static ngx_command_t ngx_http_brotli_filter_commands[] = {
     {ngx_string("brotli"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
          NGX_HTTP_LIF_CONF | NGX_CONF_FLAG,
-     ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     ngx_http_brotli_set_enable_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_brotli_conf_t, enable), NULL},
 
     /* Deprecated, unused. */
@@ -1551,8 +1566,41 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
   return NGX_CONF_OK;
 }
 
-/* Prepend to filter chain. */
+/* "brotli on|off" (zstd siblings' #182): the stock flag slot plus a
+   parse-time latch of the cycle-global any_enabled bit, so
+   ngx_http_brotli_filter_init() can skip installing the filter hooks
+   when the module is off in every location. ngx_conf_set_flag_slot()
+   accepts exactly "on" and "off", so by the time this runs value[1] is
+   one of the two; only the literal "off" leaves the bit clear. */
+static char* ngx_http_brotli_set_enable_slot(ngx_conf_t* cf,
+                                             ngx_command_t* cmd, void* conf) {
+  ngx_str_t* value;
+  char* rc;
+  ngx_http_brotli_main_conf_t* bmcf;
+
+  rc = ngx_conf_set_flag_slot(cf, cmd, conf);
+  if (rc != NGX_CONF_OK) return rc;
+
+  value = cf->args->elts;
+  if (value[1].len == 3 && ngx_strncmp(value[1].data, "off", 3) == 0) {
+    return NGX_CONF_OK;
+  }
+
+  bmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_brotli_filter_module);
+  bmcf->any_enabled = 1;
+
+  return NGX_CONF_OK;
+}
+
+/* Prepend to filter chain -- unless "brotli" is off everywhere, in which
+   case a build that carries the module pays no per-response NULL-ctx
+   pass through it (see any_enabled). */
 static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf) {
+  ngx_http_brotli_main_conf_t* bmcf;
+
+  bmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_brotli_filter_module);
+  if (bmcf == NULL || !bmcf->any_enabled) return NGX_OK;
+
   ngx_http_next_header_filter = ngx_http_top_header_filter;
   ngx_http_top_header_filter = ngx_http_brotli_header_filter;
 

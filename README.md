@@ -66,6 +66,12 @@ against current nginx. Differences from upstream:
   — which keys on that flag and flattens Vary — folds rather than
   doubles the line; exactly one `Vary: Accept-Encoding` in every state;
   `brotli_static always` still sends no Vary since it does not vary).
+- **No hooks when off everywhere** (zstd siblings' #182): the filter's
+  header/body hooks and the static module's content-phase handler are
+  installed only when `brotli` / `brotli_static` is parsed as anything
+  but `off` somewhere in the config (an `if` block counts), so a build
+  that carries the modules but never enables them pays no per-response
+  pass through them. Behaviour is otherwise unchanged.
 - **Tests:** a Test::Nginx regression suite (`t/`) covering the
   negotiation matrix, bypass, caps, and the static-module fallback
   regression, run in CI alongside the roundtrip smoke tool and the fuzz
