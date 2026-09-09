@@ -40,7 +40,7 @@
 
 
 /*
- * ITS OWN MODULE since the split (Mark's packaging call, gzip_static /
+ * ITS OWN MODULE since the split (the packaging call, gzip_static /
  * parent-pair precedent): static serving must ship as a
  * dependency-free .so — this TU calls no compression library, so a
  * static-only deployment (CDN edge, internal artifact host) loads a

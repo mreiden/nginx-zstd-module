@@ -510,7 +510,7 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     /*
      * Optional arguments in either order: a 64-hex sha256 and/or the
-     * "optional" keyword — the operator-insistence demotion (Mark's
+     * "optional" keyword — the operator-insistence demotion (the
      * outage scenario, an INTENTIONAL DEVIATION from the RFC's
      * fail-fatal rule): a dictionary that cannot be loaded as
      * declared warns and degrades instead of refusing to start the

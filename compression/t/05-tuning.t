@@ -376,7 +376,7 @@ qr/compression: create zstd level 1 window_bits 0/
 
 
 === TEST 19: unpledged stream at level 22 stays browser-decodable (the cap)
-# INTENTIONAL DEVIATION from the parent (Mark's call): with no
+# INTENTIONAL DEVIATION from the parent: with no
 # Content-Length to pledge, the frame header declares the parameter
 # window — level 22 defaults to 128m, which every browser rejects.
 # When compression_window is unset the effective window caps at the

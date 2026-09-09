@@ -309,7 +309,7 @@ typedef struct {
 
 /*
  * The FILTER module's location configuration. Since the module split
- * (Mark's packaging call: the static module must be a dependency-free
+ * (the packaging call: the static module must be a dependency-free
  * .so, and the pair replaces existing split-format modules) the
  * static handler is its own ngx_module_t with its own private conf in
  * static.c — this struct is the filter's alone again.

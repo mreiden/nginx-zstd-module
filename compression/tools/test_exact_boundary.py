@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pin the FINISH-lands-exactly-at-ob->end boundary deterministically.
 
-The idea (Mark's, inverted): the compressed size of a response cannot
+The idea, inverted: the compressed size of a response cannot
 be controlled precisely, but for a DETERMINISTIC input it is a
 deterministic value C — and the OUTPUT BUFFER size is an operator
 directive. So instead of generating content that hits a fixed

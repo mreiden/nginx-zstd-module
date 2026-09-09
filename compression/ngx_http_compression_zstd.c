@@ -107,7 +107,7 @@ ngx_http_compression_zstd_create(ngx_http_request_t *r,
      * The window is a per-request memory CEILING (parent
      * zstd_window_log semantics) when the operator set it. When they
      * did NOT, the effective window is capped at the browser limit —
-     * an INTENTIONAL DEVIATION from the parent (Mark's call, 2026-08-19):
+     * an INTENTIONAL DEVIATION from the parent (decided 2026-08-19):
      * on an UNPLEDGED stream (chunked proxying, SSI — no
      * Content-Length) the frame header declares the parameter's
      * window, and every browser rejects anything above 8 MB (RFC 8878

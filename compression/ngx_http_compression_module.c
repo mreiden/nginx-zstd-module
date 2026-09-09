@@ -2127,7 +2127,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
          * never runs the encoder.
          */
         /*
-         * Protocol floor (Mark's call, gzip_http_version parity,
+         * Protocol floor (gzip_http_version parity,
          * default 1.1): an RFC 1945-era client is gzip-at-best, and
          * HTTP/1.0 frequently means an ancient intermediary. Skipping
          * WITHOUT a latch is a deferral — core gzip below applies its
