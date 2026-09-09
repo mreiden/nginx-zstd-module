@@ -47,6 +47,13 @@
    IIUC, buffered == some data passed to filter has not been pushed further. */
 #define NGX_HTTP_BROTLI_BUFFERED NGX_HTTP_GZIP_BUFFERED
 
+/* 410 Gone joined gzip's 403/404 carve-outs in nginx 1.31.6
+   (nginx/nginx#1466, which also added this macro); defined here for
+   the nginx versions before it. */
+#ifndef NGX_HTTP_GONE
+#define NGX_HTTP_GONE 410
+#endif
+
 /* One RFC 9842 dictionary, loaded at config parse. `bytes` is the raw
    file content in cf->pool (worker-lifetime; old workers keep their
    forked copy across a reload until they drain), prepared per request
@@ -535,10 +542,13 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
     return ngx_http_next_header_filter(r);
   }
 
-  /* Only compress OK / forbidden / not found responses. */
+  /* Only compress OK / forbidden / not found / gone responses -- the
+     set core gzip compresses (410 joined it in nginx 1.31.6,
+     nginx/nginx#1466). */
   if (r->headers_out.status != NGX_HTTP_OK &&
       r->headers_out.status != NGX_HTTP_FORBIDDEN &&
-      r->headers_out.status != NGX_HTTP_NOT_FOUND) {
+      r->headers_out.status != NGX_HTTP_NOT_FOUND &&
+      r->headers_out.status != NGX_HTTP_GONE) {
     return ngx_http_next_header_filter(r);
   }
 

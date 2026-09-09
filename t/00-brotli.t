@@ -1022,3 +1022,47 @@ Accept-Encoding: br
 $::src
 --- no_error_log
 [error]
+
+
+
+=== TEST 42: a 410 Gone response is compressed like 403/404
+# The status set is core gzip's, which gained 410 in nginx 1.31.6
+# (nginx/nginx#1466): a removed resource's error page is as
+# compressible as a 404's.
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        default_type text/html;
+        return 410 "brotli filter body: this resource is gone for good\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- error_code: 410
+--- response_headers
+Content-Encoding: br
+Vary: Accept-Encoding
+--- no_error_log
+[error]
+
+
+
+=== TEST 43: a 409 response stays uncompressed (the status set is a list, not a range)
+--- config
+    location /t {
+        brotli on;
+        brotli_min_length 8;
+        default_type text/html;
+        return 409 "brotli filter body: negotiation matrix fixture text\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: br
+--- error_code: 409
+--- response_headers
+!Content-Encoding
+--- no_error_log
+[error]
