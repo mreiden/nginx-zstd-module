@@ -2100,11 +2100,16 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     }
 
     /*
-     * PHASE3: the parent zstd filter's status set — every 2xx except
-     * 204/205 (no body by definition) and 206 (ranges address the
-     * ENCODED representation; compressing a slice would corrupt it),
-     * plus 403 and 404, whose bodies are often the most-served
-     * compressible content on a busy origin.
+     * status not eligible: < 200, bodyless 204/205, 206 Partial Content,
+     * or any > 299 except 403/404/410 (which carry compressible error
+     * bodies; the set core gzip compresses as of nginx 1.31.6).
+     *
+     * 206 is excluded (matching nginx's gzip filter): an upstream 206 has
+     * a Content-Range computed against its selected representation.
+     * Applying a new content coding here would invalidate that
+     * Content-Range (RFC 9110 §14.1.2 requires ranges for an encoded
+     * representation to be computed against the encoded byte sequence),
+     * and the filter only clears Accept-Ranges, not Content-Range.
      */
     if (r->headers_out.status < NGX_HTTP_OK
         || r->headers_out.status == NGX_HTTP_NO_CONTENT
