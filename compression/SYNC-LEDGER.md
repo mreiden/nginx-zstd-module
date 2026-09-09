@@ -44,7 +44,7 @@ Legend: ✅ done · 🔜 queued · 🔎 needs inspection · ➖ n/a
 | 179 | c66cdeb | perf: HEAD fast path in static handler | ✅ 8e2d216 | ➖ static | HEAD returns after send_header (Vary/CE already set); TEST 34 pins header parity |
 | 180 | ab77ca2 | feat: markdownlint config + fixes | Skip (repo infra) | — | |
 | 181 | 569001a | refactor: extract token validation from bypass_vary | WRINKLES (N/A here) | ➖ | compression_bypass_vary is a plain ngx_conf_set_str_slot — no token validation to extract |
-| 182 | 944e6ae | perf: skip hook reg when off everywhere | ✅ f16223c | both | parse-time any_enabled latch in both modules (static grew a main conf); behavior unchanged, existing suite is the coverage |
+| 182 | 944e6ae | perf: skip hook reg when off everywhere | ✅ f16223c | YES b581707 | parse-time any_enabled latch in both compression modules (static grew a main conf); behavior unchanged, existing suite is the coverage. Fork twin (2026-09-08): both brotli modules latch the same way, t/00 TESTs 39-41, mutants never-latched / skips-if-confs killed |
 | 183 | 04ada99 | config_bench: scale points | Skip (CI tooling) | — | |
 | 184 | fbaca91 | perf: dynamically cacheable $zstd_ratio etc. | ✅ 0681ed1 | both | per-call no_cacheable; existing 00 TESTs 24a/24b cover the path |
 | 185 | ec468ae | warn: couple bypass predicates to cache key | ✅ 34be27c | both | committed with #167 (shared merge) |
