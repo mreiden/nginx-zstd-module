@@ -491,6 +491,51 @@ Content-Encoding: zstd
 
 
 
+=== TEST 20b2: a 410 body is eligible (core gzip parity as of nginx 1.31.6)
+# nginx/nginx#1466 added 410 Gone to gzip's 403/404 carve-outs: a
+# removed resource's error page is as compressible as a 404's
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 410 "this 410 body is long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 410
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 20b3: a 409 body is NOT eligible (the carve-outs are a list, not a range)
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        return 409 "this 409 body is long enough to compress\n";
+    }
+--- request
+GET /t
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 409
+--- raw_response_headers_unlike: Content-Encoding
+--- no_error_log
+[error]
+
+
+
 === TEST 20c: a 500 body is NOT eligible (outside the status set)
 --- config
     location /t {

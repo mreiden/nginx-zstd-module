@@ -175,6 +175,16 @@ static ngx_conf_enum_t  ngx_http_compression_http_version_enum[] = {
  */
 #define NGX_HTTP_COMPRESSION_LEVEL_UNSET  (-NGX_MAX_INT_T_VALUE - 1)
 
+/*
+ * 410 Gone is compressed like 403/404: an error status whose body is
+ * as compressible as a 404's, and the set core gzip compresses as of
+ * nginx 1.31.6 (nginx/nginx#1466, which also added this macro). Defined
+ * here for the nginx versions before it.
+ */
+#ifndef NGX_HTTP_GONE
+#define NGX_HTTP_GONE  410
+#endif
+
 
 static ngx_command_t  ngx_http_compression_commands[] = {
 
@@ -2102,7 +2112,8 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         || r->headers_out.status == NGX_HTTP_PARTIAL_CONTENT
         || (r->headers_out.status > 299
             && r->headers_out.status != NGX_HTTP_FORBIDDEN
-            && r->headers_out.status != NGX_HTTP_NOT_FOUND)
+            && r->headers_out.status != NGX_HTTP_NOT_FOUND
+            && r->headers_out.status != NGX_HTTP_GONE)
         /*
          * NO r->header_only skip (parent-audit find): a HEAD response
          * must advertise the same Content-Encoding its GET would
