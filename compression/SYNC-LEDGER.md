@@ -177,7 +177,7 @@ Legend: ✅ done · 🔜 queued · 🔎 needs inspection · ➖ n/a
   window-up-sizing unlanded, #188 note); the window_cmd loop is over
   power-of-two size *values*, a different job. Rows 2/3/4 are N/A here:
   the module deliberately does NOT skip r->header_only (a HEAD must
-  advertise the GET's Content-Encoding — parent-audit find, so row 2's
+  advertise the Content-Encoding a GET would have — parent-audit find, so row 2's
   reorder has nothing to reorder), never had the repeated ngx_buf_size()
   row 3 factors (grep: zero uses), and holds output in an ngx_buf_t*
   (ctx->ob) rather than the value-struct ctx->buffer_out row 4's
@@ -313,7 +313,7 @@ mreiden/ngx_brotli commits.
 | 284 | runtime libzstd feature floors | ✅ 95b6dfa | ➖ N/A | shares ../src/ngx_http_zstd_version.h; negative-level latch + init_module in the zstd backend TU; no target-cblock knob; NULL http conf is a pass (→ #308). Fork: no version-gated directives |
 | 285 | docs: zstd_static always contract | ➖ docs | ➖ | |
 | 286 | portability + config probes | ✅ 95b6dfa (F10/F11/F12) | YES 6cbbe05 | EVP header probe replaces the blind auto/have (the grafted bug was verbatim in both); reorder sources filter/reorder-static.sh fail-closed (fork inlines the checks); F8 was already our shape; C89 hunks have no analog |
-| 287 | memoize malformed sidecar verdicts | ✅ 6e7d945 | ➖ N/A (validates no content) | cycle-owned in the static main conf, not file statics; deterministic verdicts only; TEST 44 = one SSI page including the malformed .zst three times (pipelined requests were not deterministic) |
+| 287 | memoize malformed sidecar verdicts | ✅ 6e7d945 | ➖ N/A (validates no content) | cycle-owned in the static main conf, not file-scope static variables; deterministic verdicts only; TEST 44 = one SSI page including the malformed .zst three times (pipelined requests were not deterministic) |
 | 288 | (ours) #278 claims narrowed; CI seam guard | ✅ merged; script on tree via sync | ➖ | his #291 improved it: counts definitions, scans ci/, stages the real fixture-redirect drift |
 | 289 | (ours) no-transform detection header | ✅ merged 709e49d; adopted 8e52294 | 🔎 at handover | our transplant deleted (inline-seg_end shape) for the parent's header; coverage lives in test_encoding.py upstream, 07-bypass here |
 | 290 | terminal observability | ◑ casts only (6e7d945) | ➖ | aborted flag N/A: done is set only on a successful FINISH (fork: ctx->success) |

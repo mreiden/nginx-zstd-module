@@ -38,8 +38,8 @@ our $have_walk = eval {
         my @st = stat($d) or die "stat $d: $!";
         die "ancestor $d owned by uid $st[4], neither root nor uid $>\n"
             if $st[4] != 0 && $st[4] != $>;
-        die sprintf("ancestor %s is mode %04o, writable by group or other\n", $d, $st[2] & 07777)
-            if $st[2] & 022;
+        die sprintf("ancestor %s is mode %04o, writable by group or other\n", $d, $st[2] & oct('07777'))
+            if $st[2] & oct('022');
         last if $d eq '/';
     }
     mkdir "$walkdir/real" or die "mkdir: $!";
@@ -47,7 +47,7 @@ our $have_walk = eval {
     print $h "strict walk fixture dictionary contents\n" x 20;
     close $h;
     symlink("$walkdir/real", "$walkdir/link") or die "symlink: $!";
-    for my $arm (['open', 0777], ['sticky', 01777]) {
+    for my $arm (['open', oct('0777')], ['sticky', oct('01777')]) {
         my ($name, $mode) = @$arm;
         mkdir "$walkdir/$name" or die "mkdir $name: $!";
         open my $f, '>', "$walkdir/$name/w.dict" or die "spew $name: $!";
@@ -55,7 +55,7 @@ our $have_walk = eval {
         close $f;
         chmod $mode, "$walkdir/$name" or die "chmod $name: $!";
         my @st = stat("$walkdir/$name");
-        die "chmod $name did not stick\n" if ($st[2] & 07777) != $mode;
+        die "chmod $name did not stick\n" if ($st[2] & oct('07777')) != $mode;
     }
     1;
 } || 0;
@@ -252,7 +252,7 @@ conflicting sha256
 
 === TEST 10: duplicate detection survives store growth (WRINKLES 14)
 # six dictionaries force the pointer array past its initial capacity;
-# re-declaring the FIRST afterwards must still be caught — the
+# redeclaring the FIRST afterwards must still be caught — the
 # value-array store silently accepted this after growth relocated the
 # entries out from under the list's aliases
 --- user_files eval

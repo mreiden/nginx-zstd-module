@@ -89,7 +89,7 @@ ngx_free_chain(ngx_pool_t *pool, ngx_chain_t *cl)
     pool->chain = cl;
 }
 
-/* Forward declarations matching the production statics. */
+/* Forward declarations matching the production static functions. */
 static ngx_int_t ngx_http_compression_retain_input(ngx_http_request_t *r,
     ngx_http_compression_ctx_t *ctx, ngx_chain_t *in);
 static ngx_buf_t *ngx_http_compression_next_in_buf(

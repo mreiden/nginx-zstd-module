@@ -31,6 +31,7 @@ fresh sizes every run. WRINKLES records that framing.
 Requires: python3 stdlib, the ``zstd`` and ``brotli`` CLIs, and an
 nginx binary with the compression module compiled in.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -56,8 +57,8 @@ CASES = [
     (65536, 31000),
 ]
 
-SHORT_DELAY = 0.01   # between ordinary chunks: distinct upstream writes
-LONG_DELAY = 0.35    # at the witness positions: the arrival evidence
+SHORT_DELAY = 0.01  # between ordinary chunks: distinct upstream writes
+LONG_DELAY = 0.35  # at the witness positions: the arrival evidence
 
 
 def long_positions(nchunks: int) -> set[int]:
@@ -68,16 +69,16 @@ def long_positions(nchunks: int) -> set[int]:
     produce them)."""
     if nchunks <= 4:
         return set(range(1, nchunks))
-    return {max(1, nchunks // 4), max(1, nchunks // 2),
-            max(1, (3 * nchunks) // 4)}
+    return {max(1, nchunks // 4), max(1, nchunks // 2), max(1, (3 * nchunks) // 4)}
 
 
 def witness_required(nchunks: int) -> int:
     return min(2, max(1, nchunks - 1))
 
+
 CODINGS = {
     "zstd": {"decode": ["zstd", "-d", "-q", "-c"], "loc": "zs"},
-    "br":   {"decode": ["brotli", "-d", "-c"],     "loc": "br"},
+    "br": {"decode": ["brotli", "-d", "-c"], "loc": "br"},
 }
 
 
@@ -118,21 +119,22 @@ class _Handler(socketserver.StreamRequestHandler):
                 break
         m = re.match(r"GET /[a-z]+/s/(\d+)/(\d+) ", line)
         if not m:
-            self.wfile.write(b"HTTP/1.1 404 Not Found\r\n"
-                             b"Content-Length: 0\r\n\r\n")
+            self.wfile.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
             return
         total, chunk = int(m.group(1)), int(m.group(2))
         data = fixture_bytes(total)
         nchunks = (total + chunk - 1) // chunk
         longs = long_positions(nchunks)
-        self.wfile.write(b"HTTP/1.1 200 OK\r\n"
-                         b"Content-Type: application/octet-stream\r\n"
-                         b"Transfer-Encoding: chunked\r\n\r\n")
+        self.wfile.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/octet-stream\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+        )
         self.wfile.flush()
         sent = 0
         i = 0
         while sent < total:
-            piece = data[sent:sent + chunk]
+            piece = data[sent : sent + chunk]
             self.wfile.write(b"%X\r\n" % len(piece) + piece + b"\r\n")
             self.wfile.flush()
             sent += len(piece)
@@ -154,14 +156,14 @@ def wait_port(port: int, timeout: float = 10.0) -> None:
     raise RuntimeError(f"nothing listening on 127.0.0.1:{port}")
 
 
-def timed_get(port: int, path: str, coding: str,
-              timeout: float = 60.0) -> tuple[bytes, list[float]]:
+def timed_get(
+    port: int, path: str, coding: str, timeout: float = 60.0
+) -> tuple[bytes, list[float]]:
     """HTTP/1.0 GET (no chunked framing on the client side: body runs
     to EOF) returning (body, arrival timestamps per read)."""
     s = socket.create_connection(("127.0.0.1", port), timeout)
     s.settimeout(timeout)
-    req = (f"GET {path} HTTP/1.0\r\n"
-           f"Host: t\r\nAccept-Encoding: {coding}\r\n\r\n")
+    req = f"GET {path} HTTP/1.0\r\nHost: t\r\nAccept-Encoding: {coding}\r\n\r\n"
     s.sendall(req.encode("latin1"))
     raw = b""
     stamps: list[float] = []
@@ -177,18 +179,19 @@ def timed_get(port: int, path: str, coding: str,
     m = re.search(r"(?im)^content-encoding:\s*(\S+)", headers)
     got = m.group(1) if m else None
     if got != coding:
-        raise RuntimeError(f"{path}: Content-Encoding {got!r}, "
-                           f"wanted {coding!r}")
+        raise RuntimeError(f"{path}: Content-Encoding {got!r}, wanted {coding!r}")
     return body, stamps
 
 
 def decode(coding: str, blob: bytes) -> bytes:
-    r = subprocess.run(CODINGS[coding]["decode"], input=blob,
-                       capture_output=True, check=False)
+    r = subprocess.run(
+        CODINGS[coding]["decode"], input=blob, capture_output=True, check=False
+    )
     if r.returncode != 0:
         raise RuntimeError(
             f"{coding} decode failed (truncated/corrupt stream): "
-            + r.stderr.decode("utf-8", "replace").strip())
+            + r.stderr.decode("utf-8", "replace").strip()
+        )
     return r.stdout
 
 
@@ -200,12 +203,14 @@ def main() -> int:
 
     v = subprocess.run([str(nginx), "-V"], capture_output=True, text=True, check=False)
     if "compression" not in v.stderr:
-        raise RuntimeError("nginx -V shows no compression module "
-                           "(--add-module=.../compression missing?)")
+        raise RuntimeError(
+            "nginx -V shows no compression module "
+            "(--add-module=.../compression missing?)"
+        )
 
     os.umask(0o022)
     with tempfile.TemporaryDirectory(prefix="compression-flush-") as td:
-        os.chmod(td, 0o755)   # root-run: workers must enter the prefix
+        os.chmod(td, 0o755)  # root-run: workers must enter the prefix
         root = pathlib.Path(td)
         (root / "logs").mkdir()
 
@@ -215,7 +220,7 @@ def main() -> int:
             wait_port(args.backend_port)
 
             locs = "".join(
-                f"""        location /{c['loc']}/ {{
+                f"""        location /{c["loc"]}/ {{
             compression on;
             compression_order {name};
             compression_http_version 1.0;
@@ -227,10 +232,13 @@ def main() -> int:
             proxy_set_header Connection "";
             proxy_buffering off;
         }}
-""" for name, c in CODINGS.items())
+"""
+                for name, c in CODINGS.items()
+            )
 
             conf = root / "nginx.conf"
-            conf.write_text(f"""worker_processes 1;
+            conf.write_text(
+                f"""worker_processes 1;
 error_log {root}/logs/error.log warn;
 pid {root}/nginx.pid;
 events {{ worker_connections 64; }}
@@ -241,12 +249,24 @@ http {{
         listen 127.0.0.1:{args.port};
 {locs}    }}
 }}
-""", encoding="utf-8")
+""",
+                encoding="utf-8",
+            )
 
             proc = subprocess.Popen(
-                [str(nginx), "-p", str(root), "-c", str(conf),
-                 "-g", "daemon off; master_process off;"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                [
+                    str(nginx),
+                    "-p",
+                    str(root),
+                    "-c",
+                    str(conf),
+                    "-g",
+                    "daemon off; master_process off;",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
             try:
                 wait_port(args.port)
                 failures: list[str] = []
@@ -265,29 +285,36 @@ http {{
                             failures.append(
                                 f"{label}: decoded {len(plain)}B, "
                                 f"expected {len(expected)}B "
-                                f"({'TRUNCATION' if len(plain) != len(expected) else 'CORRUPTION'})")
+                                f"({'TRUNCATION' if len(plain) != len(expected) else 'CORRUPTION'})"
+                            )
                             continue
                         nchunks = (total + chunk - 1) // chunk
                         need = witness_required(nchunks)
-                        gaps = sum(1 for a, b in zip(stamps, stamps[1:])
-                                   if b - a > LONG_DELAY * 0.5)
+                        gaps = sum(
+                            1
+                            # Keep this helper runnable on Python <3.10.
+                            for a, b in zip(stamps, stamps[1:])  # noqa: RUF007
+                            if b - a > LONG_DELAY * 0.5
+                        )
                         if gaps < need:
                             failures.append(
                                 f"{label}: {gaps}/{need} inter-segment "
                                 f"gaps > {LONG_DELAY * 0.5:.2f}s — output "
                                 f"was buffered to FINISH instead of "
-                                f"flushing mid-stream")
+                                f"flushing mid-stream"
+                            )
 
                 if failures:
-                    sys.stderr.write(
-                        f"flush-paths FAILED ({len(failures)}):\n")
+                    sys.stderr.write(f"flush-paths FAILED ({len(failures)}):\n")
                     for f in failures[:20]:
                         sys.stderr.write(f"  - {f}\n")
                     return 1
 
-                print(f"OK: {len(CODINGS) * len(CASES)} unbuffered-proxy "
-                      f"responses flushed mid-stream and decoded "
-                      f"byte-exact for both codings")
+                print(
+                    f"OK: {len(CODINGS) * len(CASES)} unbuffered-proxy "
+                    f"responses flushed mid-stream and decoded "
+                    f"byte-exact for both codings"
+                )
                 return 0
             finally:
                 proc.terminate()

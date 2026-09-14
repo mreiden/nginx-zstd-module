@@ -93,13 +93,13 @@ typedef struct {
     /*
      * Worker-lifetime directio scratch (parent #210). Cycle-owned ON
      * PURPOSE: the buffer is allocated from the cycle pool, and keeping
-     * its bookkeeping in file-scope statics would let an in-process
+     * its bookkeeping in file-scope static variables would let an in-process
      * cycle replacement ("master_process off" + SIGHUP) destroy that
-     * pool while statics retained valid-looking capacity — the next
+     * pool while those variables retained valid-looking capacity — the next
      * probe would then write into freed memory. In conf, metadata and
      * buffer share one lifetime: a new cycle starts from a pcalloc'd
      * conf and allocates afresh (the #103-era rule — module state lives
-     * in cycle-owned conf, never process statics).
+     * in cycle-owned conf, never process-wide static variables).
      */
     u_char        *dio_scratch;
     size_t         dio_scratch_cap;

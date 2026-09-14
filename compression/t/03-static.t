@@ -13,7 +13,15 @@ my $f = "$dir/fixture";
 open my $fh, '>', $f or die $!;
 binmode $fh; print $fh $src; close $fh;
 
-sub slurp { open my $h, '<', $_[0] or die "$_[0]: $!"; binmode $h; local $/; <$h> }
+sub slurp {
+    my ($path) = @_;
+    open my $h, '<', $path or die "$path: $!";
+    binmode $h;
+    local $/;
+    my $content = <$h>;
+    close $h or die "close $path: $!";
+    return $content;
+}
 
 system("zstd -q -f -o $f.zst $f") == 0        or die "zstd fixture";
 system("brotli -f -o $f.br $f") == 0          or die "brotli fixture";

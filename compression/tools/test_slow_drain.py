@@ -45,6 +45,7 @@ Requires an nginx binary built ``--with-debug`` (the witnesses are
 ngx_log_debug lines) with the compression module compiled in, plus
 the ``zstd`` and ``brotli`` CLIs.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -69,7 +70,7 @@ INTER_PART_GAP = 0.15
 
 CODINGS = {
     "zstd": {"decode": ["zstd", "-d", "-q", "-c"], "loc": "zs"},
-    "br":   {"decode": ["brotli", "-d", "-c"],     "loc": "br"},
+    "br": {"decode": ["brotli", "-d", "-c"], "loc": "br"},
 }
 
 DRAIN_WITNESSES = [
@@ -85,14 +86,21 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--nginx-binary", required=True)
     p.add_argument("--port", type=int, default=18192)
-    p.add_argument("--backend-port", type=int, default=18193,
-                   help="Mock slow-headers upstream port.")
-    p.add_argument("--log-level", choices=("debug", "warn"),
-                   default="debug",
-                   help="Location error_log level. Witnesses are only "
-                        "asserted at debug; use warn under sanitizer "
-                        "builds, where nginx core's own debug logging "
-                        "is fatal (nginx/nginx#1671).")
+    p.add_argument(
+        "--backend-port",
+        type=int,
+        default=18193,
+        help="Mock slow-headers upstream port.",
+    )
+    p.add_argument(
+        "--log-level",
+        choices=("debug", "warn"),
+        default="debug",
+        help="Location error_log level. Witnesses are only "
+        "asserted at debug; use warn under sanitizer "
+        "builds, where nginx core's own debug logging "
+        "is fatal (nginx/nginx#1671).",
+    )
     return p.parse_args()
 
 
@@ -148,9 +156,11 @@ class SlowHeaderBackend(threading.Thread):
                     if not piece:
                         break
                     buf += piece
-                conn.sendall(b"HTTP/1.1 200 OK\r\n"
-                             b"Content-Type: application/octet-stream\r\n"
-                             b"Connection: close\r\n\r\n")
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/octet-stream\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
                 time.sleep(HEADER_BODY_GAP)
                 half = len(self.body) // 2
                 conn.sendall(self.body[:half])
@@ -166,8 +176,9 @@ class SlowHeaderBackend(threading.Thread):
         self.srv.close()
 
 
-def http_get(port: int, path: str, coding: str, slow: bool,
-             timeout: float = 120.0) -> bytes:
+def http_get(
+    port: int, path: str, coding: str, slow: bool, timeout: float = 120.0
+) -> bytes:
     """GET path expecting Content-Encoding: <coding>; slow=True
     throttles reads through a small SO_RCVBUF to create real
     backpressure."""
@@ -178,8 +189,7 @@ def http_get(port: int, path: str, coding: str, slow: bool,
         # compressed response client-side and nginx never feels the
         # backpressure this test exists to create.
         s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
-    req = (f"GET {path} HTTP/1.0\r\n"
-           f"Host: t\r\nAccept-Encoding: {coding}\r\n\r\n")
+    req = f"GET {path} HTTP/1.0\r\nHost: t\r\nAccept-Encoding: {coding}\r\n\r\n"
     s.sendall(req.encode("latin1"))
     raw = b""
     while True:
@@ -194,25 +204,28 @@ def http_get(port: int, path: str, coding: str, slow: bool,
     headers = head.decode("latin1", "replace")
     status = headers.splitlines()[0] if headers else "<no response>"
     if " 200 " not in f"{status} ":
-        raise RuntimeError(f"{path}: expected 200, got {status!r} "
-                           f"({len(body)}B body)")
+        raise RuntimeError(f"{path}: expected 200, got {status!r} ({len(body)}B body)")
     m = re.search(r"(?im)^content-encoding:\s*(\S+)", headers)
     got = m.group(1) if m else None
     if got != coding:
-        raise RuntimeError(f"{path}: Content-Encoding {got!r}, "
-                           f"wanted {coding!r} (status {status!r}, "
-                           f"{len(body)}B body)")
+        raise RuntimeError(
+            f"{path}: Content-Encoding {got!r}, "
+            f"wanted {coding!r} (status {status!r}, "
+            f"{len(body)}B body)"
+        )
     return body
 
 
 def decode(coding: str, blob: bytes) -> bytes:
     """Decompress with the reference CLI; nonzero exit = truncation."""
-    r = subprocess.run(CODINGS[coding]["decode"], input=blob,
-                       capture_output=True, check=False)
+    r = subprocess.run(
+        CODINGS[coding]["decode"], input=blob, capture_output=True, check=False
+    )
     if r.returncode != 0:
         raise RuntimeError(
             f"{coding} decode failed (truncated/corrupt stream): "
-            + r.stderr.decode("utf-8", "replace").strip())
+            + r.stderr.decode("utf-8", "replace").strip()
+        )
     return r.stdout
 
 
@@ -227,8 +240,10 @@ def main() -> int:
     if "compression" not in v.stderr:
         raise RuntimeError("nginx -V shows no compression module")
     if "--with-debug" not in v.stderr:
-        raise RuntimeError("the witnesses are ngx_log_debug lines: "
-                           "this tool needs an nginx built --with-debug")
+        raise RuntimeError(
+            "the witnesses are ngx_log_debug lines: "
+            "this tool needs an nginx built --with-debug"
+        )
 
     proxy_body = fixture_bytes(2 * PROXY_PART)
     backend = SlowHeaderBackend(args.backend_port, proxy_body)
@@ -245,7 +260,7 @@ def main() -> int:
 
         lvl = args.log_level
         locs = "".join(
-            f"""        location /{c['loc']}/ {{
+            f"""        location /{c["loc"]}/ {{
             error_log {root}/logs/error.log {lvl};
             alias {html}/;
             compression on;
@@ -256,7 +271,7 @@ def main() -> int:
             compression_types application/octet-stream;
             gzip_vary on;
         }}
-        location /px-{c['loc']} {{
+        location /px-{c["loc"]} {{
             error_log {root}/logs/error.log {lvl};
             proxy_pass http://127.0.0.1:{args.backend_port};
             proxy_buffering off;
@@ -267,10 +282,13 @@ def main() -> int:
             compression_types application/octet-stream;
             gzip_vary on;
         }}
-""" for name, c in CODINGS.items())
+"""
+            for name, c in CODINGS.items()
+        )
 
         conf = root / "nginx.conf"
-        conf.write_text(f"""worker_processes 1;
+        conf.write_text(
+            f"""worker_processes 1;
 error_log {root}/logs/error.log warn;
 pid {root}/nginx.pid;
 events {{ worker_connections 64; }}
@@ -281,7 +299,9 @@ http {{
         listen 127.0.0.1:{args.port} sndbuf=16384;
 {locs}    }}
 }}
-""", encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
 
         # nginx's own stdout/stderr to a file, not a PIPE: nothing
         # drains a pipe here, and on failure the tail is the diagnosis.
@@ -291,9 +311,19 @@ http {{
         # would close it while nginx is still writing (master's shape).
         nlog = open(nlog_path, "w", encoding="utf-8")  # noqa: SIM115
         proc = subprocess.Popen(
-            [str(nginx), "-p", str(root), "-c", str(conf),
-             "-g", "daemon off; master_process off;"],
-            stdout=nlog, stderr=subprocess.STDOUT, text=True)
+            [
+                str(nginx),
+                "-p",
+                str(root),
+                "-c",
+                str(conf),
+                "-g",
+                "daemon off; master_process off;",
+            ],
+            stdout=nlog,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
 
         def alive_or_die(when: str) -> None:
             """Fail with nginx's captured output if the process exited —
@@ -303,8 +333,8 @@ http {{
                 nlog.flush()
                 tail = nlog_path.read_text("utf-8", "replace")[-2000:]
                 raise RuntimeError(
-                    f"nginx exited (rc={proc.returncode}) {when}; "
-                    f"output tail:\n{tail}")
+                    f"nginx exited (rc={proc.returncode}) {when}; output tail:\n{tail}"
+                )
 
         try:
             wait_port(args.port)
@@ -316,8 +346,7 @@ http {{
                 label = f"{name} slow-drain"
                 try:
                     t0 = time.time()
-                    body = http_get(args.port, f"/{c['loc']}/big", name,
-                                    slow=True)
+                    body = http_get(args.port, f"/{c['loc']}/big", name, slow=True)
                     took = time.time() - t0
                     plain = decode(name, body)
                 except Exception as exc:  # noqa: BLE001
@@ -327,10 +356,13 @@ http {{
                     failures.append(
                         f"{label}: decoded {len(plain)}B, expected "
                         f"{len(expected)}B — the pause/resume seams "
-                        f"corrupted or truncated the stream")
+                        f"corrupted or truncated the stream"
+                    )
                     continue
-                print(f"  {label}: {len(body)}B compressed drained in "
-                      f"{took:.1f}s, decoded byte-exact")
+                print(
+                    f"  {label}: {len(body)}B compressed drained in "
+                    f"{took:.1f}s, decoded byte-exact"
+                )
 
             alive_or_die("after the slow-drain scenario")
 
@@ -338,28 +370,29 @@ http {{
                 ok = 0
                 for i in range(PROXY_REPEAT):
                     try:
-                        body = http_get(args.port, f"/px-{c['loc']}",
-                                        name, slow=False)
+                        body = http_get(args.port, f"/px-{c['loc']}", name, slow=False)
                         if decode(name, body) != proxy_body:
-                            failures.append(
-                                f"{name} proxy #{i}: decode mismatch")
+                            failures.append(f"{name} proxy #{i}: decode mismatch")
                             break
                         ok += 1
                     except Exception as exc:  # noqa: BLE001
                         failures.append(f"{name} proxy #{i}: {exc}")
                         break
                 if ok:
-                    print(f"  {name} proxy: {ok}/{PROXY_REPEAT} "
-                          f"unbuffered responses decoded byte-exact")
+                    print(
+                        f"  {name} proxy: {ok}/{PROXY_REPEAT} "
+                        f"unbuffered responses decoded byte-exact"
+                    )
 
             alive_or_die("after the proxy scenario")
 
-            elog = (root / "logs" / "error.log").read_text(
-                "utf-8", "replace")
+            elog = (root / "logs" / "error.log").read_text("utf-8", "replace")
             if lvl != "debug":
-                print("  witnesses skipped (--log-level warn: sanitizer "
-                      "builds cannot log at debug — paths still forced, "
-                      "roundtrips still gate)")
+                print(
+                    "  witnesses skipped (--log-level warn: sanitizer "
+                    "builds cannot log at debug — paths still forced, "
+                    "roundtrips still gate)"
+                )
             # The upstream FLUSH special is unconditional per non-
             # buffered response, but only ZSTD's completion is
             # deterministically content-less: a fresh zstd encoder
@@ -375,8 +408,8 @@ http {{
             witness_floors = ()
             if lvl == "debug":
                 witness_floors = tuple(
-                    [(w, 1) for w in DRAIN_WITNESSES]
-                    + [(FLUSH_WITNESS, PROXY_REPEAT)])
+                    [(w, 1) for w in DRAIN_WITNESSES] + [(FLUSH_WITNESS, PROXY_REPEAT)]
+                )
             for witness, floor in witness_floors:
                 n = elog.count(witness)
                 if n < floor:
@@ -384,7 +417,8 @@ http {{
                         f"witness short: {witness!r} x{n}, expected at "
                         f"least x{floor} — the forced path did not run "
                         f"(geometry drift, or the filter's debug lines "
-                        f"changed)")
+                        f"changed)"
+                    )
                 else:
                     print(f"  witness: {witness!r} x{n}")
 
@@ -396,18 +430,23 @@ http {{
                 # evidence with the verdict.
                 nlog.flush()
                 sys.stderr.write("--- nginx stdout/stderr tail:\n")
-                sys.stderr.write(
-                    nlog_path.read_text("utf-8", "replace")[-2000:] + "\n")
+                sys.stderr.write(nlog_path.read_text("utf-8", "replace")[-2000:] + "\n")
                 sys.stderr.write("--- error.log tail (non-debug):\n")
-                sys.stderr.write("\n".join(
-                    ln for ln in elog.splitlines()
-                    if "[debug]" not in ln)[-3000:] + "\n")
+                sys.stderr.write(
+                    "\n".join(ln for ln in elog.splitlines() if "[debug]" not in ln)[
+                        -3000:
+                    ]
+                    + "\n"
+                )
                 return 1
 
-            proof = ("witnessed" if lvl == "debug"
-                     else "roundtripped (witnesses skipped)")
-            print(f"OK: both codings survived forced backpressure and "
-                  f"data-less flushes, {proof}, streams byte-exact")
+            proof = (
+                "witnessed" if lvl == "debug" else "roundtripped (witnesses skipped)"
+            )
+            print(
+                f"OK: both codings survived forced backpressure and "
+                f"data-less flushes, {proof}, streams byte-exact"
+            )
             return 0
         finally:
             proc.terminate()
