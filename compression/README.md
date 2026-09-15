@@ -106,7 +106,11 @@ on the way to it must be owned by the loading principal or root and
 not be group/other-writable (parent #316: no sticky-bit exemption, so
 a dictionary under `/tmp` is refused — an ancestor a local user can
 write into lets that user rename a file of their choosing into the
-leaf's place). It must precede every `compression_dict_file` it
+leaf's place). The path must name a file: a trailing `/` is refused as
+naming a directory, matching `open(2)`'s `ENOTDIR` (parent #330), and
+since a rejected reload keeps the previous worker generation serving,
+check `nginx -t` rather than assuming the reload took. It must precede
+every `compression_dict_file` it
 applies to; declaring it
 after one is a config-load error rather than a silently unvetted
 load. And `compression_dict_assume_secure_transport on;`

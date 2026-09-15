@@ -621,6 +621,26 @@ ok
 [error]
 
 
+=== TEST 27d: strict mode refuses a trailing separator as naming a directory
+# parent #330: open(2) on "/x/w.dict/" fails with ENOTDIR, the trailing
+# separator requiring a directory, but the walk used to open the last
+# component as the leaf and accept the regular file. The shared walk now
+# stops after vetting the directories before it and refuses the path as
+# naming a directory. TEST 27 loads the identical file without the
+# separator, so nothing but that rule rejects this.
+--- skip_eval: 3: !$::have_walk
+--- http_config eval
+"compression_dict_strict_path on;
+ compression_dict_file $::walkdir/real/w.dict/;"
+--- config
+    location /t { return 200 "x"; }
+--- must_die
+--- error_log
+names a directory, not a dictionary file
+--- no_error_log
+[alert]
+
+
 === TEST 28: trust_hashes on — the zero-hashing fast path, restored
 # The old TEST 2 contract, now behind the flag (parent #220): a
 # trusted literal contributes ZERO to the counter. Substituting the
