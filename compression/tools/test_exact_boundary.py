@@ -24,6 +24,7 @@ This upgrades what WRINKLES honestly called an unpinnable patrol into
 a pinned point, per coding. Requires an nginx built --with-debug with
 the compression module compiled in, plus the zstd and brotli CLIs.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -42,7 +43,7 @@ SIZE = 16384
 
 CODINGS = {
     "zstd": {"decode": ["zstd", "-d", "-q", "-c"]},
-    "br":   {"decode": ["brotli", "-d", "-c"]},
+    "br": {"decode": ["brotli", "-d", "-c"]},
 }
 
 WITNESS = "landed exactly at buffer end"
@@ -61,8 +62,7 @@ def parse_args() -> argparse.Namespace:
     # measured buffer sizing and the byte-exact decode oracles still
     # gate; only the witness-count assertion is skipped, and the
     # non-sanitized suites job still asserts it.
-    p.add_argument("--log-level", choices=("debug", "warn"),
-                   default="debug")
+    p.add_argument("--log-level", choices=("debug", "warn"), default="debug")
     return p.parse_args()
 
 
@@ -89,8 +89,11 @@ def wait_port(port: int, timeout: float = 10.0) -> None:
 def get(port: int, path: str, coding: str, timeout: float = 30.0) -> bytes:
     s = socket.create_connection(("127.0.0.1", port), timeout)
     s.settimeout(timeout)
-    s.sendall((f"GET {path} HTTP/1.0\r\nHost: t\r\n"
-               f"Accept-Encoding: {coding}\r\n\r\n").encode("latin1"))
+    s.sendall(
+        (f"GET {path} HTTP/1.0\r\nHost: t\r\nAccept-Encoding: {coding}\r\n\r\n").encode(
+            "latin1"
+        )
+    )
     raw = b""
     while True:
         piece = s.recv(65536)
@@ -99,33 +102,37 @@ def get(port: int, path: str, coding: str, timeout: float = 30.0) -> bytes:
         raw += piece
     s.close()
     head, _, body = raw.partition(b"\r\n\r\n")
-    m = re.search(r"(?im)^content-encoding:\s*(\S+)",
-                  head.decode("latin1", "replace"))
+    m = re.search(r"(?im)^content-encoding:\s*(\S+)", head.decode("latin1", "replace"))
     got = m.group(1) if m else None
     if got != coding:
-        raise RuntimeError(f"{path}: Content-Encoding {got!r}, "
-                           f"wanted {coding!r}")
+        raise RuntimeError(f"{path}: Content-Encoding {got!r}, wanted {coding!r}")
     return body
 
 
 def decode(coding: str, blob: bytes) -> bytes:
-    r = subprocess.run(CODINGS[coding]["decode"], input=blob,
-                       capture_output=True, check=False)
+    r = subprocess.run(
+        CODINGS[coding]["decode"], input=blob, capture_output=True, check=False
+    )
     if r.returncode != 0:
         raise RuntimeError(
             f"{coding} decode failed (truncated/corrupt stream): "
-            + r.stderr.decode("utf-8", "replace").strip())
+            + r.stderr.decode("utf-8", "replace").strip()
+        )
     return r.stdout
 
 
-def write_conf(root: pathlib.Path, port: int,
-               locations: dict[str, tuple[str, int]],
-               log_level: str = "debug") -> pathlib.Path:
+def write_conf(
+    root: pathlib.Path,
+    port: int,
+    locations: dict[str, tuple[str, int]],
+    log_level: str = "debug",
+) -> pathlib.Path:
     """locations: name -> (coding, buffer_size); size 0 = generous."""
     locs = ""
     for name, (coding, bsize) in locations.items():
-        bufs = f"compression_buffers 2 {bsize};" if bsize else \
-               "compression_buffers 2 1m;"
+        bufs = (
+            f"compression_buffers 2 {bsize};" if bsize else "compression_buffers 2 1m;"
+        )
         locs += f"""        location /{name}/ {{
             alias {root}/html/;
             compression on;
@@ -138,7 +145,8 @@ def write_conf(root: pathlib.Path, port: int,
         }}
 """
     conf = root / "nginx.conf"
-    conf.write_text(f"""worker_processes 1;
+    conf.write_text(
+        f"""worker_processes 1;
 error_log {root}/logs/error.log {log_level};
 pid {root}/nginx.pid;
 events {{ worker_connections 64; }}
@@ -149,16 +157,29 @@ http {{
         listen 127.0.0.1:{port};
 {locs}    }}
 }}
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     return conf
 
 
-def run_nginx(nginx: pathlib.Path, root: pathlib.Path,
-              conf: pathlib.Path) -> subprocess.Popen:
+def run_nginx(
+    nginx: pathlib.Path, root: pathlib.Path, conf: pathlib.Path
+) -> subprocess.Popen:
     return subprocess.Popen(
-        [str(nginx), "-p", str(root), "-c", str(conf),
-         "-g", "daemon off; master_process off;"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        [
+            str(nginx),
+            "-p",
+            str(root),
+            "-c",
+            str(conf),
+            "-g",
+            "daemon off; master_process off;",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
 
 
 def stop_nginx(proc: subprocess.Popen) -> None:
@@ -180,9 +201,11 @@ def main() -> int:
     if "compression" not in v.stderr:
         raise RuntimeError("nginx -V shows no compression module")
     if args.log_level == "debug" and "--with-debug" not in v.stderr:
-        raise RuntimeError("the witness is an ngx_log_debug line: this "
-                           "tool needs an nginx built --with-debug "
-                           "(or --log-level warn to skip the witness)")
+        raise RuntimeError(
+            "the witness is an ngx_log_debug line: this "
+            "tool needs an nginx built --with-debug "
+            "(or --log-level warn to skip the witness)"
+        )
 
     os.umask(0o022)
     with tempfile.TemporaryDirectory(prefix="compression-exact-") as td:
@@ -194,9 +217,9 @@ def main() -> int:
         (root / "html" / "fix").write_bytes(expected)
 
         # ── phase 1: measure C per coding with a generous buffer ────
-        conf = write_conf(root, args.port,
-                          {name: (name, 0) for name in CODINGS},
-                          args.log_level)
+        conf = write_conf(
+            root, args.port, {name: (name, 0) for name in CODINGS}, args.log_level
+        )
         proc = run_nginx(nginx, root, conf)
         c_of: dict[str, int] = {}
         try:
@@ -214,9 +237,13 @@ def main() -> int:
         locations: dict[str, tuple[str, int]] = {}
         exact: list[str] = []
         for name, c in c_of.items():
-            cases = {f"{name}-c": c,
-                     f"{name}-cm1": c - 1, f"{name}-cp1": c + 1,
-                     f"{name}-cm2": c - 2, f"{name}-cp2": c + 2}
+            cases = {
+                f"{name}-c": c,
+                f"{name}-cm1": c - 1,
+                f"{name}-cp1": c + 1,
+                f"{name}-cm2": c - 2,
+                f"{name}-cp2": c + 2,
+            }
             exact.append(f"{name}-c")
             if c % 2 == 0:
                 cases[f"{name}-half"] = c // 2
@@ -240,13 +267,13 @@ def main() -> int:
                 if plain != expected:
                     failures.append(
                         f"{loc} (B={b}): decoded {len(plain)}B != "
-                        f"{len(expected)}B source (boundary corruption)")
+                        f"{len(expected)}B source (boundary corruption)"
+                    )
         finally:
             stop_nginx(proc)
 
         if args.log_level == "debug":
-            elog = (root / "logs" / "error.log").read_text(
-                "utf-8", "replace")
+            elog = (root / "logs" / "error.log").read_text("utf-8", "replace")
             n = elog.count(WITNESS)
             # every exact-case FINISH plus, for the half cases, nothing
             # extra (the mid-op exact fill ships WITHOUT done, by design
@@ -256,13 +283,16 @@ def main() -> int:
                     f"witness {WITNESS!r} logged {n} times, expected >= "
                     f"{len(exact)} ({', '.join(exact)}) — the "
                     f"exact-boundary case did not execute (did PROCESS "
-                    f"emit early? fixture too large?)")
+                    f"emit early? fixture too large?)"
+                )
             else:
                 print(f"  witness: {WITNESS!r} x{n} across {exact}")
         else:
-            print(f"  witnesses skipped (--log-level {args.log_level}); "
-                  f"boundary still forced by measured sizing, decode "
-                  f"oracles gated above")
+            print(
+                f"  witnesses skipped (--log-level {args.log_level}); "
+                f"boundary still forced by measured sizing, decode "
+                f"oracles gated above"
+            )
 
         if failures:
             sys.stderr.write(f"exact-boundary FAILED ({len(failures)}):\n")
@@ -270,8 +300,10 @@ def main() -> int:
                 sys.stderr.write(f"  - {f}\n")
             return 1
 
-        print(f"OK: FINISH parked exactly on ob->end for "
-              f"{', '.join(exact)} and every neighbor decoded byte-exact")
+        print(
+            f"OK: FINISH parked exactly on ob->end for "
+            f"{', '.join(exact)} and every neighbor decoded byte-exact"
+        )
         return 0
 
 

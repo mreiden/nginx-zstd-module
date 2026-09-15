@@ -22,7 +22,8 @@ sub spew {
     open my $h, '>', $path or die "$path: $!";
     binmode $h;
     print $h $data;
-    close $h;
+    close $h or die "close $path: $!";
+    return;
 }
 
 sub slurp {
@@ -30,13 +31,15 @@ sub slurp {
     open my $h, '<', $path or die "$path: $!";
     binmode $h;
     local $/;
-    return <$h>;
+    my $content = <$h>;
+    close $h or die "close $path: $!";
+    return $content;
 }
 
 sub cli_decode {
     my ($cmd, $data) = @_;
     spew("$tmp/in", $data);
-    system("$cmd < $tmp/in > $tmp/out 2>/dev/null") == 0 or return undef;
+    system("$cmd < $tmp/in > $tmp/out 2>/dev/null") == 0 or return;
     return slurp("$tmp/out");
 }
 
@@ -44,11 +47,13 @@ sub cli_decode {
 # every roundtrip oracle downstream depends on these tools, and their
 # absence must not read as a compression bug.
 sub assert_decoders {
-    for my $tool (@_) {
+    my @tools = @_;
+    for my $tool (@tools) {
         system("$tool --version >/dev/null 2>&1") == 0
             or die "reference decoder '$tool' is not on PATH -- the "
                  . "roundtrip oracles cannot run without it";
     }
+    return;
 }
 
 1;

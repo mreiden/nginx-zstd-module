@@ -54,7 +54,7 @@ our %decoders = (
     # these blocks defend against is a corrupt prologue with a valid
     # stream behind it -- skip-36-and-decode is blind to exactly that.
     dcb  => sub {
-        return undef
+        return
             if substr($_[0], 0, 36) ne "\xff" . "DCB" . sha256($dict);
         return cli_decode("brotli -d -D $tmp/dict -c", substr($_[0], 36));
     },

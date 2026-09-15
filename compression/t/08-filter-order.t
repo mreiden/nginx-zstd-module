@@ -17,13 +17,29 @@ use File::Temp qw(tempdir);
 
 my $tmp = tempdir(CLEANUP => 1);
 
-sub spew { open my $h, '>', $_[0] or die "$_[0]: $!"; binmode $h; print $h $_[1]; close $h }
-sub slurp { open my $h, '<', $_[0] or die "$_[0]: $!"; binmode $h; local $/; <$h> }
+sub spew {
+    my ($path, $content) = @_;
+    open my $h, '>', $path or die "$path: $!";
+    binmode $h;
+    print $h $content;
+    close $h or die "close $path: $!";
+    return;
+}
+
+sub slurp {
+    my ($path) = @_;
+    open my $h, '<', $path or die "$path: $!";
+    binmode $h;
+    local $/;
+    my $content = <$h>;
+    close $h or die "close $path: $!";
+    return $content;
+}
 
 sub cli_decode {
     my ($cmd, $data) = @_;
     spew("$tmp/in", $data);
-    system("$cmd < $tmp/in > $tmp/out 2>/dev/null") == 0 or return undef;
+    system("$cmd < $tmp/in > $tmp/out 2>/dev/null") == 0 or return;
     return slurp("$tmp/out");
 }
 

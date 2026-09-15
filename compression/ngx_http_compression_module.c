@@ -2249,7 +2249,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
              * and asserting "refused" where the field merely omits
              * gzip would stamp a wrong verdict (the wildcard corner —
              * core gzip has never honored "*", and the day it does,
-             * this module must not have pre-empted it). The one
+             * this module must not have preempted it). The one
              * remaining asymmetry is fail-closed: an allowance visible
              * only on a later line defers here and cores declines to
              * identity — never a wrong compression.

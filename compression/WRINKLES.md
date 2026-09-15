@@ -562,7 +562,7 @@ showed libzstd + libbrotlienc as NEEDED, so the packaged module
 Requires both libraries even for a deployment that only serves
 precompressed sidecars — while the code's own property (static
 serving calls no library, reads format constants) said it shouldn't.
-The RFC's original framing ("statics link no compression lib at
+The RFC's original framing ("static modules link no compression lib at
 all"), core nginx's gzip/gzip_static/gunzip precedent, the parent
 pair's packaging, and the goal of REPLACING modules that ship split
 all pointed the same way.
