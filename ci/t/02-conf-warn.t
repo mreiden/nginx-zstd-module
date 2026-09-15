@@ -1,6 +1,7 @@
 use Test::Nginx::Socket;
 use File::Basename;
 use File::Spec;
+use File::Temp qw(tempfile);
 use lib 'lib';
 
 my $dirname = dirname(__FILE__);
@@ -24,6 +25,43 @@ if (defined $ENV{'TEST_NGINX_BINARY'}) {
                && -f $module_path;
     }
 }
+
+# The estimator-only directive (zstd_max_cctx_memory) needs a module built
+# with -DZSTD_STATIC_LINKING_ONLY. ci/tools/ci-build.sh leaves that out of
+# its release flavours on purpose (the deployable .so must not depend on
+# libzstd's static-only entry points), so CI Deep's Build & Test matrix runs
+# this file against a binary that refuses the directive. `nginx -V` echoes
+# the configure arguments, so the build shape is detectable here: blocks
+# that need the estimator skip themselves on a release-shape build, and
+# their complement (the refusal with its message) runs only there.
+our $static_linking = 0;
+if (defined $ENV{'TEST_NGINX_BINARY'}) {
+    # Shell-free: the binary path is one argv word, however it is spelled,
+    # and its stderr (where -V prints) is joined onto the pipe in the child.
+    my $pid = open(my $vh, '-|');
+    die "fork for nginx -V: $!" if !defined $pid;
+    if (!$pid) {
+        open(STDERR, '>&', \*STDOUT) or exit 127;
+        exec {$ENV{'TEST_NGINX_BINARY'}} $ENV{'TEST_NGINX_BINARY'}, '-V';
+        exit 127;
+    }
+    my $v = do { local $/; <$vh> };
+    close $vh;
+    $static_linking = 1 if defined $v && $v =~ /-DZSTD_STATIC_LINKING_ONLY/;
+}
+
+# One byte over NGX_HTTP_ZSTD_MAX_DICT_SIZE (10 MB), generated rather than
+# committed, for the too-large refusal (TEST 25b). Exposed to config blocks
+# via $TEST_NGINX_ZSTD_HUGEDICT. File::Temp picks an unpredictable name
+# and opens it O_EXCL, so a pre-seeded symlink at a guessable path cannot
+# redirect the write on a shared runner, and the file goes at exit. The
+# loader refuses it at fstat() on size alone, so the file is extended with
+# a checked truncate rather than written: no 10 MiB scalar, no bytes read.
+my ($huge_fh, $huge_path) = tempfile("zstd-hugedict-XXXXXX",
+                                     TMPDIR => 1, UNLINK => 1);
+truncate($huge_fh, 10 * 1024 * 1024 + 1) or die "hugedict: truncate: $!";
+close $huge_fh or die "hugedict: close: $!";
+local $ENV{'TEST_NGINX_ZSTD_HUGEDICT'} = $huge_path;
 
 add_block_preprocessor(sub {
     my $block = shift;
@@ -682,6 +720,10 @@ a symlink at any component is refused, not followed
 # location configures no zstd_dcz_dict_file, which is the scoping that makes
 # the dcz clamp irrelevant here. Asserts a served response, not merely a
 # start, so a config that loads but breaks compression still fails.
+#
+# Needs the estimator, so only a -DZSTD_STATIC_LINKING_ONLY build runs
+# it; TEST 23b is the same config on the release-shape build.
+--- skip_eval: 3: !$::static_linking
 --- config
     location /budget {
         zstd on;
@@ -700,6 +742,30 @@ Accept-Encoding: zstd
 Content-Encoding: zstd
 --- no_error_log
 [error]
+
+
+
+=== TEST 23b: a release-shape build refuses zstd_max_cctx_memory by name at config load
+# The other half of TEST 23: without the memory-estimation API the
+# directive cannot be honoured, and the build says so at "nginx -t"
+# rather than loading with a silently unenforced budget. Pins the message
+# an operator sees (00-filter.t TEST 45 pins only the must_die).
+--- skip_eval: 2: $::static_linking
+--- config
+    location /budget {
+        zstd on;
+        zstd_min_length 1;
+        zstd_comp_level 1;
+        zstd_max_cctx_memory 2m;
+        zstd_types text/plain;
+        default_type text/plain;
+        return 200 "hello world padding padding padding padding padding\n";
+    }
+--- must_die
+--- error_log
+"zstd_max_cctx_memory" requires the module to be built with -DZSTD_STATIC_LINKING_ONLY
+--- no_error_log
+[alert]
 
 
 
@@ -747,3 +813,225 @@ GET /ok
 --- error_code: 200
 --- no_error_log eval
 [qr/zstd_static_dict_bypass on. but ngx_http_zstd_filter_module/, qr/\[emerg\]/]
+
+
+
+=== TEST 25b: a zstd_dict_file above the 10 MB limit is refused at config load
+# The size is compared as off_t before the size_t narrowing, so the refusal
+# is the loader's own message, not a later read or allocation failure. One
+# byte over the limit; the complement (a file under it loads) is every
+# other zstd_dict_file block in this suite.
+--- http_config
+    zstd_dict_file_unsafe on;
+    zstd_dict_file $TEST_NGINX_ZSTD_HUGEDICT;
+--- config
+    location /d {
+        zstd on;
+        default_type text/plain;
+        return 200 "body";
+    }
+--- must_die
+--- error_log
+dictionary file too large: 10485761 bytes (limit: 10485760 bytes)
+--- no_error_log
+[alert]
+
+
+
+=== TEST 26: zstd_dict_strict_path refuses a path that names a directory
+# "/" is absolute, so the walk starts, vets the root, and then finds no
+# component left to open: there is no leaf. Refused as naming a
+# directory rather than opened and rejected later as not a regular
+# file, so the operator hears what is wrong with the PATH.
+--- http_config
+    zstd_dict_file_unsafe on;
+    zstd_dict_strict_path on;
+    zstd_dict_file /;
+--- config
+    location /d {
+        zstd on;
+        default_type text/plain;
+        return 200 "body";
+    }
+--- must_die
+--- error_log
+"/" names a directory, not a dictionary file; refused by "zstd_dict_strict_path on"
+--- no_error_log
+[alert]
+
+
+
+=== TEST 27: zstd_dict_strict_path refuses a trailing separator as naming a directory
+# open(2) on "/x/dict.zdict/" fails with ENOTDIR: the trailing separator
+# requires a directory. The walk used to open the last component as the
+# leaf anyway, accepting a regular file the kernel would have refused;
+# it now stops after vetting the directories before it and refuses the
+# path as naming a directory. The fixture's leaf IS a regular file, so
+# the old behaviour would have loaded it and served.
+--- http_config eval
+"    zstd_dict_file_unsafe on;
+    zstd_dict_strict_path on;
+    zstd_dict_file \$TEST_NGINX_SERVER_ROOT/html/zstd.dict/;"
+--- user_files
+>>> zstd.dict
+the quick brown fox jumps over the lazy dog
+--- post_setup_server_root eval
+'my $root = $ENV{TEST_NGINX_SERVER_ROOT} or die "TEST_NGINX_SERVER_ROOT unset";
+chmod(0755, $root, "$root/html") == 2
+    or die "chmod strict-path fixture: $!";'
+--- config
+    location /d {
+        zstd on;
+        default_type text/plain;
+        return 200 "body";
+    }
+--- must_die
+--- error_log eval
+qr{"[^"]+/html/zstd\.dict/" names a directory, not a dictionary file; refused by "zstd_dict_strict_path on"}
+--- no_error_log
+[alert]
+
+
+
+=== TEST 28: zstd_dict_strict_path refuses a world-writable intermediate directory
+# A33-F2: every directory the walk opens is vetted before it is trusted
+# as the base of the next openat(). A mode-0777 ancestor lets any local
+# user rename a file into place, so it is refused by name even though
+# the leaf itself is self-owned 0644.
+--- http_config eval
+"    zstd_dict_file_unsafe on;
+    zstd_dict_strict_path on;
+    zstd_dict_file \$TEST_NGINX_SERVER_ROOT/html/loose/zstd.dict;"
+--- post_setup_server_root eval
+'my $root = $ENV{TEST_NGINX_SERVER_ROOT} or die "TEST_NGINX_SERVER_ROOT unset";
+chmod(0755, $root, "$root/html") == 2
+    or die "chmod strict-path fixture: $!";
+my $dir = "$root/html/loose";
+mkdir $dir or die "mkdir $dir: $!";
+open my $fh, ">", "$dir/zstd.dict" or die "open zstd.dict: $!";
+print $fh "the quick brown fox jumps over the lazy dog";
+close $fh;
+chmod(0644, "$dir/zstd.dict") == 1 or die "chmod zstd.dict: $!";
+chmod(0777, $dir) == 1 or die "chmod loose: $!";'
+--- config
+    location /d {
+        zstd on;
+        default_type text/plain;
+        return 200 "body";
+    }
+--- must_die
+--- error_log
+directory component "loose" of
+writable by group or other
+--- no_error_log
+[alert]
+
+
+
+=== TEST 29: zstd_dict_strict_path grants no sticky-bit exemption to a world-writable intermediate directory
+# A sticky world-writable ancestor (the /tmp layout) still lets an
+# unprivileged user CREATE the next component; it only stops them
+# renaming someone else's entry away, which is not the attack. Refused
+# exactly like the plain 0777 case, and the diagnostic says so.
+--- http_config eval
+"    zstd_dict_file_unsafe on;
+    zstd_dict_strict_path on;
+    zstd_dict_file \$TEST_NGINX_SERVER_ROOT/html/sticky/zstd.dict;"
+--- post_setup_server_root eval
+'my $root = $ENV{TEST_NGINX_SERVER_ROOT} or die "TEST_NGINX_SERVER_ROOT unset";
+chmod(0755, $root, "$root/html") == 2
+    or die "chmod strict-path fixture: $!";
+my $dir = "$root/html/sticky";
+mkdir $dir or die "mkdir $dir: $!";
+open my $fh, ">", "$dir/zstd.dict" or die "open zstd.dict: $!";
+print $fh "the quick brown fox jumps over the lazy dog";
+close $fh;
+chmod(0644, "$dir/zstd.dict") == 1 or die "chmod zstd.dict: $!";
+chmod(01777, $dir) == 1 or die "chmod sticky: $!";'
+--- config
+    location /d {
+        zstd on;
+        default_type text/plain;
+        return 200 "body";
+    }
+--- must_die
+--- error_log
+directory component "sticky" of
+no sticky-bit exemption
+--- no_error_log
+[alert]
+
+
+
+=== TEST 30: zstd_dict_strict_path refuses a group-writable intermediate directory
+# The group bit alone is enough: the rule is S_IWGRP | S_IWOTH, the
+# same one the leaf check applies, not world-writable only.
+--- http_config eval
+"    zstd_dict_file_unsafe on;
+    zstd_dict_strict_path on;
+    zstd_dict_file \$TEST_NGINX_SERVER_ROOT/html/shared/zstd.dict;"
+--- post_setup_server_root eval
+'my $root = $ENV{TEST_NGINX_SERVER_ROOT} or die "TEST_NGINX_SERVER_ROOT unset";
+chmod(0755, $root, "$root/html") == 2
+    or die "chmod strict-path fixture: $!";
+my $dir = "$root/html/shared";
+mkdir $dir or die "mkdir $dir: $!";
+open my $fh, ">", "$dir/zstd.dict" or die "open zstd.dict: $!";
+print $fh "the quick brown fox jumps over the lazy dog";
+close $fh;
+chmod(0644, "$dir/zstd.dict") == 1 or die "chmod zstd.dict: $!";
+chmod(0775, $dir) == 1 or die "chmod shared: $!";'
+--- config
+    location /d {
+        zstd on;
+        default_type text/plain;
+        return 200 "body";
+    }
+--- must_die
+--- error_log
+directory component "shared" of
+writable by group or other
+--- no_error_log
+[alert]
+
+
+
+=== TEST 31: zstd_dict_strict_path loads a real nested path and serves
+# The complement every refusal above needs: two self-owned 0755
+# directories below html and a 0644 leaf walk clean, the dictionary
+# loads, and the location serves. Without this block a walk that
+# refused everything would pass TESTs 21, 22 and 26-30.
+--- http_config eval
+"    zstd_dict_file_unsafe on;
+    zstd_dict_strict_path on;
+    zstd_dict_file \$TEST_NGINX_SERVER_ROOT/html/releases/7/zstd.dict;"
+--- post_setup_server_root eval
+'my $root = $ENV{TEST_NGINX_SERVER_ROOT} or die "TEST_NGINX_SERVER_ROOT unset";
+chmod(0755, $root, "$root/html") == 2
+    or die "chmod strict-path fixture: $!";
+for my $dir ("$root/html/releases", "$root/html/releases/7") {
+    mkdir $dir or die "mkdir $dir: $!";
+    chmod(0755, $dir) == 1 or die "chmod $dir: $!";
+}
+open my $fh, ">", "$root/html/releases/7/zstd.dict" or die "open zstd.dict: $!";
+print $fh "the quick brown fox jumps over the lazy dog";
+close $fh;
+chmod(0644, "$root/html/releases/7/zstd.dict") == 1 or die "chmod zstd.dict: $!";'
+--- config
+    location /d {
+        zstd on;
+        zstd_min_length 1;
+        zstd_types text/plain;
+        default_type text/plain;
+        return 200 "the quick brown fox jumps over the lazy dog, again and again";
+    }
+--- request
+GET /d
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[emerg]
+[error]
+[alert]

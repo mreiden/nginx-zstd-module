@@ -159,6 +159,29 @@ do not need it to run the module well.
 
 # Installation
 
+## Arch Linux
+
+The [`packaging/arch`](packaging/arch) directory contains an AUR-compatible
+`PKGBUILD` and a multi-stage Arch Linux `Dockerfile` with digest-pinned base
+images. Build and smoke test the package without changing the host system:
+
+```bash
+cd packaging/arch
+./build.sh
+sudo pacman -U dist/nginx-mod-zstd-*.pkg.tar.zst
+```
+
+The package is compiled against Arch's matching `nginx-src` package, installs
+both dynamic modules, and enables them through
+`/etc/nginx/modules.d/20-zstd.conf`. The container also compiles and smoke-tests
+the current checkout separately, so pull requests test their own module source
+while the exported package continues to use the pinned release archive.
+
+The container intentionally updates packages from Arch's live repositories.
+The exact nginx dependency protects the dynamic-module ABI by failing closed
+after an Arch nginx update. When that happens, update `_nginxver`, bump
+`pkgrel`, regenerate `.SRCINFO`, and refresh the container image digests.
+
 Build nginx with the module using `--add-dynamic-module`:
 
 ```bash
@@ -268,7 +291,7 @@ continuously exercised.
 
 ## ngx_http_zstd_filter_module
 
-This filter module compresses responses on the fly using zstd. It runs after the upstream or file handler generates the response, and before nginx sends it to the client. Compression is applied only when the client signals support via `Accept-Encoding: zstd`. 2xx responses are eligible for compression — except the bodyless `204 No Content` and `205 Reset Content` — as well as `403` and `404` (which often carry compressible error bodies). All other non-2xx statuses are passed through uncompressed.
+This filter module compresses responses on the fly using zstd. It runs after the upstream or file handler generates the response, and before nginx sends it to the client. Compression is applied only when the client signals support via `Accept-Encoding: zstd`. The eligible status set is: every 2xx except the bodyless `204 No Content` and `205 Reset Content` and except `206 Partial Content` (a range response's `Content-Range` is computed against the selected representation, and a new content coding would invalidate it, so 206 passes through as core `gzip` does), plus `403`, `404` and `410` (which often carry compressible error bodies; core `gzip` compresses 403 and 404 today, and nginx/nginx#1466, approved for 1.31.6, adds 410). Every other status is passed through uncompressed.
 
 > **`Vary: Accept-Encoding` is emitted automatically — you do not need `gzip_vary on`.** Whenever a response's encoding depends on `Accept-Encoding`, both this module and `zstd_static on` emit the `Vary: Accept-Encoding` header themselves, so proxies and CDNs keep the compressed and uncompressed variants apart without any directive on your part. Emission is duplicate-safe: with `gzip_vary on` nginx emits the field and the module stays quiet, with `gzip_vary off` the module emits it — exactly one `Vary: Accept-Encoding` line either way.
 >
@@ -1086,7 +1109,7 @@ Only use this directive when you control both the client and server and can guar
 
 Both dictionary loaders ([`zstd_dict_file`](#zstd_dict_file) and [`zstd_dcz_dict_file`](#zstd_dcz_dict_file)) always reject a FIFO, socket, directory, device node, or empty file — a config-load error either way, `on` or `off`. This directive controls an *additional*, opt-in trust policy on top of that: with it `on`, both loaders also refuse a **symlink at any component of the path** (not only the final one), a target — or an ancestor **directory** — **writable by group or other**, and a target or ancestor directory **not owned by the loading principal or by root**. It additionally requires the path to be **absolute** and free of `.`/`..` components.
 
-> **Why it matters.** A root master reloads its configuration (`nginx -s reload` or a supervisor-driven SIGHUP) and re-reads every dictionary from disk at that moment. If the path is a symlink a less-privileged local writer can repoint, the file itself is group/world-writable, or an **ancestor directory** is group/world-writable or foreign-owned, that writer chooses or mutates the bytes the master snapshots into every worker on the next reload — without ever needing privilege to touch the running nginx process. `on` closes all three. The path is resolved **one component at a time** with `openat(O_NOFOLLOW|O_DIRECTORY)`, so an intermediate symlink (`/srv/current/dict.bin` with `current` a symlink) is refused rather than silently traversed — a whole-path `O_NOFOLLOW` guards only the final component and would follow `current` without complaint. Every directory fd the walk opens along the way — the root `/` included — is `fstat()`-checked against the same rule as the leaf **before** it is trusted as the base for the next component: owned by neither root nor the loading principal, or writable by group or other, and the whole path is refused, naming the offending component. There is **no sticky-bit exemption** for this ancestor check — a sticky world-writable directory (a `/tmp`-style layout) still lets an unprivileged user create a new entry in it, which is the steering this check exists to refuse, sticky bit or not; deploy dictionaries under a directory tree that is itself owned and writable only by the deploying principal, not merely a temp directory with a sane leaf file. The leaf is then opened relative to the verified parent descriptor, and before a single byte is read its own mode is checked against `S_IWGRP|S_IWOTH` **and** its owner against the effective uid of the config-parsing master (root-owned files are also accepted, root not being less privileged than the loader). Owner-writability alone is not enough at either level: a dictionary — or an ancestor directory — owned by an unprivileged account at an entirely ordinary mode (`0644` for a file, `0755` for a directory) lets that owner rewrite or replace the bytes a later privileged reload snapshots, which is precisely the writer this directive exists to exclude. Every check runs against the **already-open file descriptor** — never by re-opening the path — so a rename or symlink swap after the check cannot smuggle in a different file (no TOCTOU window).
+> **Why it matters.** A root master reloads its configuration (`nginx -s reload` or a supervisor-driven SIGHUP) and re-reads every dictionary from disk at that moment. If the path is a symlink a less-privileged local writer can repoint, the file itself is group/world-writable, or an **ancestor directory** is group/world-writable or foreign-owned, that writer chooses or mutates the bytes the master snapshots into every worker on the next reload — without ever needing privilege to touch the running nginx process. `on` closes all three. The path is resolved **one component at a time** with `openat(O_NOFOLLOW|O_DIRECTORY)`, so an intermediate symlink (`/srv/current/dict.bin` with `current` a symlink) is refused rather than silently traversed — a whole-path `O_NOFOLLOW` guards only the final component and would follow `current` without complaint. Every directory fd the walk opens along the way — the root `/` included — is `fstat()`-checked against the same rule as the leaf **before** it is trusted as the base for the next component: owned by neither root nor the loading principal, or writable by group or other, and the whole path is refused, naming the offending component. There is **no sticky-bit exemption** for this ancestor check — a sticky world-writable directory (a `/tmp`-style layout) still lets an unprivileged user create a new entry in it, which is the steering this check exists to refuse, sticky bit or not; deploy dictionaries under a directory tree that is itself owned and writable only by the deploying principal, not merely a temp directory with a sane leaf file. The path must name a file: a trailing `/` (`zstd_dict_file /srv/dicts/zstd.dict/;`) is refused as naming a directory, matching `open(2)`'s `ENOTDIR`, so a configuration that relied on one stops loading under `on` — and since a rejected reload keeps the previous worker generation serving, check `nginx -t` rather than assuming the reload took. The leaf is then opened relative to the verified parent descriptor, and before a single byte is read its own mode is checked against `S_IWGRP|S_IWOTH` **and** its owner against the effective uid of the config-parsing master (root-owned files are also accepted, root not being less privileged than the loader). Owner-writability alone is not enough at either level: a dictionary — or an ancestor directory — owned by an unprivileged account at an entirely ordinary mode (`0644` for a file, `0755` for a directory) lets that owner rewrite or replace the bytes a later privileged reload snapshots, which is precisely the writer this directive exists to exclude. Every check runs against the **already-open file descriptor** — never by re-opening the path — so a rename or symlink swap after the check cannot smuggle in a different file (no TOCTOU window).
 
 > **Platform support.** The component walk needs POSIX.1-2008 `openat()`. Where it is unavailable (including Windows), `zstd_dict_strict_path on` **fails closed** with a config-load error rather than falling back to the weaker leaf-only guarantee — the directive never claims a protection the platform cannot deliver. `off` (the default) is unaffected everywhere.
 
@@ -1356,7 +1379,7 @@ skip is otherwise unobservable when a supplied hash matches the file.
 the bounded merge checks below; each member also keeps `workflow_dispatch:` so
 it can be run alone from the Actions tab. On merged `master`, CI selects only
 the testkit harness to preserve its promotion signal without duplicating the
-build, lint, scanner, or Windows jobs.
+build, lint, Arch package, scanner, or Windows jobs.
 
 Long jobs are deliberately not called from it. **CI Deep** runs them weekly in
 four explicit self-hosted dependency chains; **Bump** opens version-bump PRs
@@ -1366,9 +1389,10 @@ documented `ubuntu-latest` fallback instead.
 
 | Workflow | Cadence | What it does |
 |---|---|---|
-| **CI** ([`ci.yml`](.github/workflows/ci.yml)) | every PR + focused merged `master` signal + manual | Calls only Lint, Build&Test, Security Scanners, Harness Fault Arms, and the hosted Windows build. Four Linux jobs are initially runnable; dependency chains refill each lane as it becomes free. Only Harness Fault Arms runs on merged `master`. |
+| **CI** ([`ci.yml`](.github/workflows/ci.yml)) | every PR + focused merged `master` signal + manual | Calls Lint, Build&Test, Arch Package, Security Scanners, Harness Fault Arms, and the hosted Windows build. Four Linux jobs are initially runnable; dependency chains refill each lane as it becomes free. Only Harness Fault Arms runs on merged `master`. |
 | **Lint** ([`lint.yml`](.github/workflows/lint.yml)) | PR via CI + manual | Runs local deterministic checks, including runner trust, port bands, cadence, provenance, and the enforced four-lane topology. |
 | **Build&Test** ([`build-test.yml`](.github/workflows/build-test.yml)) | PR via CI + manual | Builds nginx mainline with strict warnings, runs the full functional and runtime regression suites, tests libzstd 1.4.x fallbacks, linkage variants, and arm64. Its sanitizer lane runs the filter and static Test::Nginx suites plus the runtime regressions under ASAN/UBSAN, requiring complete TAP/clean exits and rejecting complete sanitizer reports that contain module frames. Its dependency graph forms four self-hosted lane chains. |
+| **Arch Package** ([`arch-package.yml`](.github/workflows/arch-package.yml)) | PR via CI + manual | Builds `nginx-mod-zstd` in a fresh Arch container, checks the released package with namcap, and smoke-tests both the package and current checkout with dynamic and precompressed Zstandard responses. Uploads the released package as a short-lived CI artifact. |
 | **Security Scanners** ([`security-scanners.yml`](.github/workflows/security-scanners.yml)) | PR via CI, weekly deep + manual | Runs flawfinder, clang-tidy, and semgrep over the module sources. |
 | **Harness Fault Arms** ([`harness-fault-arms.yml`](.github/workflows/harness-fault-arms.yml)) | PR and merged `master` via CI + manual, not required | Builds with the shared [`nginx-module-testkit`](https://github.com/myguard-labs/nginx-module-testkit) and runs all six fault, allocation, codec-count, and parameter-count scenarios through one non-vacuous scenario runner. |
 | **Windows build** ([`windows-build.yml`](.github/workflows/windows-build.yml)) | PR via CI + manual | Builds and smoke-checks MSVC x64 static and MinGW-w64 x64 dynamic modules. |

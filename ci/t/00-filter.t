@@ -732,6 +732,53 @@ Content-Type: text/plain
 [error]
 
 
+=== TEST 29a: zstd filter compresses 410 responses above min_length
+# 410 Gone joins 403/404 as an error status with a compressible body,
+# matching what nginx/nginx#1466 (approved for 1.31.6) proposes for core
+# gzip.
+--- config
+    location /filter {
+        zstd on;
+        zstd_min_length 1;
+        zstd_types text/plain;
+        default_type text/plain;
+        return 410 "gone body\n";
+    }
+--- request
+GET /filter
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 410
+--- response_headers
+!Content-Length
+Transfer-Encoding: chunked
+Content-Encoding: zstd
+Content-Type: text/plain
+--- no_error_log
+[error]
+
+
+=== TEST 29b: a 409 response stays uncompressed (the 4xx exceptions are a list, not a range)
+--- config
+    location /filter {
+        zstd on;
+        zstd_min_length 1;
+        zstd_types text/plain;
+        default_type text/plain;
+        return 409 "conflict body\n";
+    }
+--- request
+GET /filter
+--- more_headers
+Accept-Encoding: zstd
+--- error_code: 409
+--- response_headers
+!Content-Encoding
+Content-Type: text/plain
+--- no_error_log
+[error]
+
+
 
 === TEST 30: no infinite loop / CPU spin on a zero-length proxied body
 # Regression for the recurring "100% CPU infinite loop" class:
@@ -3273,6 +3320,49 @@ GET /filter
 Accept-Encoding: zstd
 --- response_headers
 Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 112b: $zstd_ratio and $zstd_bytes_* carry their final values at the log phase
+# TESTs 32 and 39 reference the variables via `set`, which evaluates them
+# during rewrite -- before the filter has run -- so they only ever exercise
+# the not_found guard. The formatted values exist for one consumer, the
+# access log, which evaluates at the log phase after the response
+# completed. Two requests on one instance: the first compresses a body
+# under a log_format naming all three variables, the second serves the
+# log file back. The file is cleared when the server root is set up and
+# then accumulates one line per repetition of the block (repeat_each is
+# 3), so the whole body is anchored: every line must be a well-formed
+# record and there are at most three -- a later repetition cannot hide
+# behind an earlier line.
+--- post_setup_server_root eval
+'unlink "$ENV{TEST_NGINX_SERVER_ROOT}/logs/zstdvars.log";'
+--- http_config
+    log_format zstdvars 'ratio=$zstd_ratio in=$zstd_bytes_in out=$zstd_bytes_out';
+--- config
+    location /filter {
+        zstd on;
+        zstd_min_length 1;
+        zstd_types text/plain;
+        default_type text/plain;
+        access_log $TEST_NGINX_SERVER_ROOT/logs/zstdvars.log zstdvars;
+        return 200 "log-phase variables: this body is long enough to compress and to compress again and again\n";
+    }
+    location = /vars.log {
+        alias $TEST_NGINX_SERVER_ROOT/logs/zstdvars.log;
+        default_type text/plain;
+        access_log off;
+    }
+--- request eval
+["GET /filter", "GET /vars.log"]
+--- more_headers eval
+["Accept-Encoding: zstd", ""]
+--- response_headers eval
+["Content-Encoding: zstd", "!Content-Encoding"]
+--- response_body_like eval
+[qr/./s, qr/\A(?:ratio=\d+\.\d{3} in=[1-9]\d+ out=[1-9]\d+\n){1,3}\z/]
 --- no_error_log
 [error]
 

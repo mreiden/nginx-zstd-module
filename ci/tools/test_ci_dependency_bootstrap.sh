@@ -11,48 +11,126 @@ set -euo pipefail
 root=${CI_DEPENDENCY_ROOT:-$(git rev-parse --show-toplevel)}
 cd "$root"
 
+# The apt packages a step's `run` installs, and the checks built on it:
+# require_apt_package accepts the package installed by ANY step of the
+# file; require_bootstrap_package demands it from EVERY step named
+# "Install bootstrap dependencies"; require_resolver_jobs walks each JOB
+# that runs the nginx resolver and demands that the same job has a
+# bootstrap step before it installing curl and python3 -- a file-wide
+# check would stay green with one job's bootstrap deleted as long as any
+# other job still carried one.
+APT_STEP_PY='
+import pathlib, shlex, sys, yaml
+
+path, wanted, mode = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+BOOTSTRAP = "Install bootstrap dependencies"
+RESOLVER = "ci/tools/nginx-releases.sh"
+NEEDED = ("curl", "python3")
+
+
+def installed(run):
+    found = set()
+    logical = run.replace("\\\n", " ")
+    for line in logical.splitlines():
+        try:
+            lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+            lexer.whitespace_split = True
+            lexer.commenters = "#"
+            words = list(lexer)
+        except ValueError:
+            continue
+        start = 0
+        for end in [
+            *[i for i, word in enumerate(words) if word in {";", "&&", "||", "|"}],
+            len(words),
+        ]:
+            command = words[start:end]
+            start = end + 1
+            apt = 1 if command[:1] == ["sudo"] else 0
+            if len(command) > apt and command[apt] == "apt-get" \
+                    and "install" in command[apt + 1:]:
+                install = command.index("install", apt + 1)
+                found |= {w for w in command[install + 1:] if not w.startswith("-")}
+    return found
+
+
+doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+if mode == "jobs":
+    bad = 0
+    resolving = 0
+    for name, job in (doc.get("jobs") or {}).items():
+        steps = job.get("steps", []) if isinstance(job, dict) else []
+        steps = [s for s in steps if isinstance(s, dict)]
+        resolver = [i for i, s in enumerate(steps)
+                    if isinstance(s.get("run"), str) and RESOLVER in s["run"]]
+        if not resolver:
+            continue
+        resolving += 1
+        boots = [i for i, s in enumerate(steps)
+                 if s.get("name") == BOOTSTRAP and i < resolver[0]]
+        if not boots:
+            print(f"FAIL: {path}: job {name!r} runs the nginx resolver (step "
+                  f"{resolver[0]}) with no {BOOTSTRAP!r} step before it in "
+                  "that job", file=sys.stderr)
+            bad += 1
+            continue
+        packages = installed(steps[boots[-1]].get("run") or "")
+        for pkg in NEEDED:
+            if pkg not in packages:
+                print(f"FAIL: {path}: job {name!r}: the {BOOTSTRAP!r} step "
+                      f"before the resolver does not install apt package "
+                      f"{pkg}", file=sys.stderr)
+                bad += 1
+    if resolving == 0:
+        print(f"FAIL: {path}: no job runs {RESOLVER}", file=sys.stderr)
+        bad += 1
+    raise SystemExit(1 if bad else 0)
+
+bootstrap_steps = 0
+for job in (doc.get("jobs") or {}).values():
+    for step in job.get("steps", []) if isinstance(job, dict) else []:
+        if not isinstance(step, dict) or not isinstance(step.get("run"), str):
+            continue
+        packages = installed(step["run"])
+        if mode == "any":
+            if wanted in packages:
+                raise SystemExit(0)
+        elif step.get("name") == BOOTSTRAP:
+            bootstrap_steps += 1
+            if wanted not in packages:
+                print(f"FAIL: {path}: the {BOOTSTRAP!r} step itself must install "
+                      f"apt package {wanted} (a later step installing it does not "
+                      "count -- the resolver runs right after the bootstrap)",
+                      file=sys.stderr)
+                raise SystemExit(1)
+if mode == "bootstrap" and bootstrap_steps:
+    raise SystemExit(0)
+if mode == "bootstrap":
+    print(f"FAIL: {path} has no {BOOTSTRAP!r} step to check", file=sys.stderr)
+else:
+    print(f"FAIL: {path} must install apt package {wanted}", file=sys.stderr)
+raise SystemExit(1)
+'
+
 require_apt_package() {
   local file=$1 package=$2
   local base=${CI_DEPENDENCY_ROOT:-$root}
-  python3 - "$base/$file" "$package" <<'PY'
-import pathlib, shlex, sys, yaml
-
-path, wanted = pathlib.Path(sys.argv[1]), sys.argv[2]
-doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-for job in (doc.get("jobs") or {}).values():
-    for step in job.get("steps", []) if isinstance(job, dict) else []:
-        run = step.get("run") if isinstance(step, dict) else None
-        if not isinstance(run, str):
-            continue
-        logical = run.replace("\\\n", " ")
-        for line in logical.splitlines():
-            try:
-                lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
-                lexer.whitespace_split = True
-                lexer.commenters = "#"
-                words = list(lexer)
-            except ValueError:
-                continue
-            start = 0
-            for end in [
-                *[i for i, word in enumerate(words) if word in {";", "&&", "||", "|"}],
-                len(words),
-            ]:
-                command = words[start:end]
-                start = end + 1
-                apt = 1 if command[:1] == ["sudo"] else 0
-                if len(command) > apt and command[apt] == "apt-get" \
-                        and "install" in command[apt + 1:]:
-                    install = command.index("install", apt + 1)
-                    packages = {
-                        w for w in command[install + 1:] if not w.startswith("-")
-                    }
-                    if wanted in packages:
-                        raise SystemExit(0)
-print(f"FAIL: {path} must install apt package {wanted}", file=sys.stderr)
-raise SystemExit(1)
-PY
+  python3 -c "$APT_STEP_PY" "$base/$file" "$package" any
 }
+
+require_bootstrap_package() {
+  local file=$1 package=$2
+  local base=${CI_DEPENDENCY_ROOT:-$root}
+  python3 -c "$APT_STEP_PY" "$base/$file" "$package" bootstrap
+}
+
+require_resolver_jobs() {
+  local file=$1
+  local base=${CI_DEPENDENCY_ROOT:-$root}
+  python3 -c "$APT_STEP_PY" "$base/$file" - jobs
+}
+
 
 require() {
   local file=$1 needle=$2
@@ -67,7 +145,7 @@ require_before() {
   first_line=$(grep -n -m1 -F -- "$first" "$file" | cut -d: -f1 || true)
   second_line=$(grep -n -m1 -F -- "$second" "$file" | cut -d: -f1 || true)
   if [ -z "$first_line" ] || [ -z "$second_line" ] || [ "$first_line" -ge "$second_line" ]; then
-    echo "FAIL: $file must install curl before resolving nginx" >&2
+    echo "FAIL: $file must install curl and python3 before resolving nginx" >&2
     exit 1
   fi
 }
@@ -91,14 +169,19 @@ for file in \
   require "$file" 'name: Install bootstrap dependencies'
 done
 
+# The resolver reads the GitHub releases feed with curl and parses it with
+# python3. Every JOB that runs it must carry its own "Install bootstrap
+# dependencies" step ahead of the resolver step, installing both; a later
+# job-specific install, or another job's bootstrap, must not satisfy that.
+# Checked per job rather than per file: ci-deep.yml resolves in two jobs,
+# and a file-wide ordering check stayed green with one of them stripped.
 for file in \
   .github/workflows/asan.yml \
   .github/workflows/build-test.yml \
   .github/workflows/ci-deep.yml \
   .github/workflows/codeql.yml \
   .github/workflows/valgrind.yml; do
-  require_before "$file" 'name: Install bootstrap dependencies' \
-    'curl -fsSL https://nginx.org/en/download.html'
+  require_resolver_jobs "$file"
 done
 
 # Detached nginx signatures are verified by these fallback workflows.  Do not
@@ -164,5 +247,29 @@ if CI_DEPENDENCY_ROOT="$mutant" require_apt_package \
   exit 1
 fi
 echo 'OK: dependency comment mutant rejected'
+
+# Negative control: strip ONE resolver job's bootstrap step (ci-deep.yml's
+# helgrind job) while the memcheck job keeps its own. A file-wide check
+# accepted this; the per-job check must not.
+cp .github/workflows/ci-deep.yml "$mutant/.github/workflows/ci-deep.yml"
+python3 - "$mutant/.github/workflows/ci-deep.yml" <<'PY'
+import pathlib, sys, yaml
+path = pathlib.Path(sys.argv[1])
+doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+job = doc["jobs"]["helgrind"]
+before = len(job["steps"])
+job["steps"] = [s for s in job["steps"]
+                if not (isinstance(s, dict)
+                        and s.get("name") == "Install bootstrap dependencies")]
+if len(job["steps"]) != before - 1:
+    raise SystemExit("mutant did not remove exactly one bootstrap step")
+path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+PY
+if CI_DEPENDENCY_ROOT="$mutant" require_resolver_jobs \
+    .github/workflows/ci-deep.yml >/dev/null 2>&1; then
+  echo 'FAIL: a resolver job with its bootstrap step removed was accepted' >&2
+  exit 1
+fi
+echo 'OK: single-job bootstrap removal mutant rejected'
 
 echo 'OK: fork fallback dependencies are explicitly bootstrapped'
