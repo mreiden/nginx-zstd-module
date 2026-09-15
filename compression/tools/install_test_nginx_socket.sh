@@ -19,7 +19,7 @@ lock="$(dirname "$0")/test-nginx-socket.cpan.lock"
 spec="Test::Nginx::Socket@${version}"
 
 # The INSTALL must consume the artifact the checks above validated, not
-# re-resolve the spec (CodeRabbit round 5, and the parent #249 script's
+# re-resolve the spec (the parent #249 script's
 # original shape): a second resolution is a second trip to the index,
 # and an index change between check and install would execute an
 # unreviewed dependency graph. authors/id paths are immutable on CPAN.

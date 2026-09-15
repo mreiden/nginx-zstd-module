@@ -8,7 +8,7 @@ use CompressionRoundtrip qw(spew slurp cli_decode assert_decoders);
 
 assert_decoders('zstd', 'brotli');
 
-# Phase-3 tuning directives: compression_level <coding> <n> and
+# Tuning directives: compression_level <coding> <n> and
 # compression_window <coding> <size>, keyed by coding against
 # backend-declared bounds. The deterministic witness is the header
 # filter's debug line ("compression: create <coding> level <n>
@@ -292,7 +292,7 @@ qr/compression: create zstd level 3 window_bits 0/
 
 
 === TEST 16: brotli defaults -- quality 6, lg_win 19 (parent parity)
-# pins the declared default: the phase-0 shim said 5, ngx_brotli's
+# pins the declared default: an earlier shim said 5, ngx_brotli's
 # brotli_comp_level default is 6 -- the vtable declaration corrects
 # the drift and this block keeps it corrected
 --- log_level: debug

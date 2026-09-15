@@ -27,7 +27,7 @@ alert-avoidance branch), witnessed by "content-less flush shipped as
 special buf" — once per zstd response. Brotli is exercised through
 the same scenario but its first flush emits stream-header bits, so
 its completion carries content and cannot land in the special-buf
-branch (the phase-0 "done is per-op, per-backend" asymmetry, live).
+branch (the interface's "done is per-op, per-backend" asymmetry, live).
 
 Oracles per coding: byte-exact decode of both scenarios' bodies, and
 at debug log level the witness lines above with per-scenario floors.
@@ -400,7 +400,7 @@ http {{
             # its stream-header bits, so the brotli completion carries
             # content and rides a data buf (measured: exactly
             # PROXY_REPEAT witnesses, all zstd — a live example of the
-            # phase-0 "done is defined per-op, per-backend" lesson).
+            # interface's "done is defined per-op, per-backend" rule).
             # Floor = the zstd responses; a lower bound, not an exact
             # pin (nginx may emit further data-less specials
             # mid-relay). Drain-witness counts depend on scheduling;

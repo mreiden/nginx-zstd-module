@@ -86,7 +86,7 @@ for s in "${SCENARIOS[@]}"; do
     if [ "$EXPECT_SKIP" -eq 1 ]; then
         # rc must ALSO be 0: a harness can emit "1..0 # SKIP" and then
         # die -- an expected-skip verdict on a failed run would bank a
-        # green for a broken engine (CodeRabbit, round 5).
+        # green for a broken engine.
         if [ "$skipped_all" -eq 1 ] && [ "$rc" -eq 0 ]; then
             echo "ok (expected SKIP) $s"
         else

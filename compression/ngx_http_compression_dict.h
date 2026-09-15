@@ -1,5 +1,5 @@
 /*
- * nginx-compression — the shared dictionary store (phase 1, RFC #109).
+ * nginx-compression — the shared dictionary store (RFC #109).
  *
  * THE DATA MODEL THE RFC CALLS LOAD-BEARING, made concrete: the only
  * persistent state per dictionary is {path, raw bytes, sha256}. Every
@@ -9,7 +9,7 @@
  * ONE store entry feeds every coding: one copy per file instead of one
  * per module, and at most one hash pass per file per cycle.
  *
- * Store rules (review round 1 of the RFC, verbatim where possible):
+ * Store rules (the RFC's, verbatim where possible):
  *
  *  - The STORE is cycle-global and deduplicates BY PATH: the same file
  *    named at http{} and again in a location loads once. Everything
@@ -43,14 +43,14 @@
  *    RFC 9842 negotiation keys on the hash, so duplicates would be
  *    ambiguous (parent behavior, kept).
  *
- * PHASE 1a SCOPE: the store loads, validates, dedups, and exposes the
- * per-location lists; nothing reads them yet. Dictionary codings stay
- * unelectable until phase 1b wires Available-Dictionary negotiation
- * and the wire-prologue emitters (the election gates on
- * wire_prologue != NULL). Because nothing non-negotiated can ever be
- * served from this store, there is no equivalent of the parent's
- * zstd_dict_file_unsafe acknowledgement — that gate guards a
- * non-RFC-9842 mode this module simply does not have.
+ * SCOPE: the store loads, validates, dedups, and exposes the
+ * per-location lists. Everything that reads them — Available-Dictionary
+ * negotiation and the wire-prologue emitters (the election gates on
+ * wire_prologue != NULL) — lives in the filter module. Because nothing
+ * non-negotiated can ever be served from this store, there is no
+ * equivalent of the parent's zstd_dict_file_unsafe acknowledgement —
+ * that gate guards a non-RFC-9842 mode this module simply does not
+ * have.
  */
 
 #ifndef NGX_HTTP_COMPRESSION_DICT_H

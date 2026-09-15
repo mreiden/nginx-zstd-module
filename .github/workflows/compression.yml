@@ -1,6 +1,6 @@
-# CI for the unified compression module (compression/). Phase-3
-# wiring: the module was deliberately outside root CI through the
-# prototype phases; these jobs cover what the WSL loop covered —
+# CI for the unified compression module (compression/). Separate from
+# the root build-test.yml on purpose; these jobs cover what the WSL
+# loop covered —
 # the eight Test::Nginx suites, both proxy-backed tools, the gzip-less
 # no-compat build (the --with-compat masking lesson), the reduced
 # backend shapes through the REAL auto/detect opt-outs, the genuine
@@ -43,8 +43,8 @@ concurrency:
 env:
   # Pinned, unlike the parent's build-test.yml (whose resolve job scrapes
   # nginx.org for the current mainline at run time): a version bump here
-  # should be a deliberate, blameable commit while phase0 is a prototype.
-  # Adopt the parent's resolve+verify machinery at productization.
+  # should be a deliberate, blameable commit until this workflow adopts
+  # the parent's resolve+verify machinery.
   NGINX_VERSION: "1.31.5"
 
 jobs:
@@ -141,7 +141,7 @@ jobs:
       - name: Input-chain cursor unit oracle (ownership, ordering, alloc failure)
         # The parent's test_input_chain_cursor_unit shape: the extracted
         # production helpers against a pool shim -- the retained-before-
-        # cursor drain order is not wire-testable (round 5 blocker).
+        # cursor drain order is not wire-testable.
         run: bash compression/tools/test_input_chain_cursor_unit.sh
 
       - name: Ratio scaling unit oracle (overflow-safe $compression_ratio)

@@ -1,6 +1,6 @@
 use Test::Nginx::Socket;
 
-# Phase-3 bypass predicates: compression_bypass (any predicate variable
+# Bypass predicates: compression_bypass (any predicate variable
 # resolving non-empty and not "0" serves identity, stock
 # ngx_http_test_predicates semantics) and compression_bypass_vary (the
 # operator-named extra Vary field, emitted on BOTH the bypassed and the
@@ -117,7 +117,7 @@ $::body
 
 === TEST 5: compression_bypass_vary rides BOTH paths
 # bypassed request: Vary names the driving header AND Accept-Encoding
-# (round 5: the bypassed identity is still a variant of a negotiated
+# (the bypassed identity is still a variant of a negotiated
 # URI -- without the AE dimension a cache can store it as the URI's
 # baseline and key later compressed variants inconsistently), no
 # Content-Encoding. The harness folds same-name lines with ", ".
@@ -563,7 +563,7 @@ no-transform fixture body: repeated compressible text
 
 
 === TEST 16: no-transform vetoes gzip even when OUR types gate defers
-# Round 5 (eilandert): the local eligibility gates are DEFERRALS to
+# The local eligibility gates are DEFERRALS to
 # core gzip, so the whole-stack vetoes must run before them --
 # compression_types application/json beside gzip_types text/plain used
 # to answer a text/plain no-transform response with

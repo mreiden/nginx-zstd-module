@@ -1,7 +1,7 @@
 package CompressionRoundtrip;
 
 # The one decode harness both roundtrip-asserting suites share
-# (CodeRabbit round 5: 04-roundtrip and 05-tuning carried identical
+# (04-roundtrip and 05-tuning used to carry identical
 # spew/slurp/cli_decode copies, and neither checked that the reference
 # decoders exist -- a missing CLI turned every decode failure into a
 # confusing hash mismatch blamed on the C code).

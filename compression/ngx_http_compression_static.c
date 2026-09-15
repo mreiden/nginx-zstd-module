@@ -1,5 +1,5 @@
 /*
- * nginx-compression — phase 2: unified static sidecar serving.
+ * nginx-compression — the static module: unified sidecar serving.
  *
  * One content-phase handler probes for precompressed sidecars
  * (file.zst / file.br / file.gz) in compression_static_order and
@@ -42,8 +42,8 @@
 /*
  * ITS OWN MODULE since the split (the packaging call, gzip_static /
  * parent-pair precedent): static serving must ship as a
- * dependency-free .so — this TU calls no compression library, so a
- * static-only deployment (CDN edge, internal artifact host) loads a
+ * dependency-free .so — this module calls no compression library, so
+ * a static-only deployment (CDN edge, internal artifact host) loads a
  * module whose ldd shows nothing but libc. The filter module is not
  * required to be present, loaded, or even built.
  */
@@ -290,10 +290,11 @@ static ngx_int_t ngx_http_compression_static_check_zstd(
 /*
  * The static coding table: order token, sidecar extension (no dot),
  * Content-Encoding value == token, and an optional serve-time
- * validator. PHASE2 note: productization derives this from the
- * backend registry (a sidecar_ext field) so a new coding lands in
- * static serving automatically; the prototype keeps it literal
- * because gzip has no backend to hang an ext on either way.
+ * validator. Kept literal rather than derived from the backend
+ * registry (a sidecar_ext field would let a new coding land in
+ * static serving automatically) because gzip has no backend to hang
+ * an ext on either way, and because this module must not depend on
+ * the filter module's registry.
  */
 typedef struct {
     ngx_str_t    coding;
@@ -1087,7 +1088,7 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
     }
 
     /*
-     * PHASE3 (found in the production soak): a request that both
+     * Found in the production soak: a request that both
      * HOLDS a dictionary (Available-Dictionary) and explicitly
      * accepts a dictionary coding can be served dramatically smaller
      * by the FILTER module's dcz/dcb delta path than by any
@@ -1170,8 +1171,8 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
     vary_emitted = 0;
 
     /*
-     * Negotiated-mode Vary moved INTO the probe loop (parent #202,
-     * eilandert's port ruling on round 4): the header is emitted on
+     * Negotiated-mode Vary lives INSIDE the probe loop (parent #202's
+     * port condition): the header is emitted on
      * the first sidecar that proves USABLE — after is_dir/is_file and
      * the frame probe — not before any existence check. A URI whose
      * every sidecar is missing, a directory, truncated or

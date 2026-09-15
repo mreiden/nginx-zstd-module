@@ -1,7 +1,7 @@
 use Test::Nginx::Socket;
 
-# Phase-0 election matrix as a regression suite: the shell matrix from
-# the PR validation, graduated. Needs a binary built with
+# The election matrix as a regression suite: the shell matrix from
+# the original validation, graduated. Needs a binary built with
 # --add-module=<repo>/compression AND the core gzip module (the defer
 # cases exercise the real handoff; the gzip-less build shape has its
 # own compile-time coverage in CI-to-be).
@@ -579,7 +579,7 @@ Accept-Encoding: zstd
 
 
 === TEST 21a: application/wasm compresses by DEFAULT (parent-parity types)
-# the phase-0 html-only default was a silent regression against the
+# an earlier html-only default was a silent regression against the
 # parent's rich default list (caught via issue #123's fork read);
 # wasm is the canary — text-like content under a non-text media type
 --- config
@@ -879,7 +879,7 @@ Content-Encoding: gzip
 
 
 === TEST 26a: HEAD advertises the same Content-Encoding its GET would
-# parent-audit find: the phase-0 header_only skip made HEAD and GET
+# parent-audit find: an earlier header_only skip made HEAD and GET
 # disagree about the representation; core gzip advertises on HEAD
 --- config
     location /t {

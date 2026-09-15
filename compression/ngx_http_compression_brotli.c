@@ -1,5 +1,5 @@
 /*
- * brotli backend for nginx-compression (phase-0 prototype).
+ * brotli backend for nginx-compression.
  * The second implementation — the one that stress-tested the vtable.
  * Every divergence from zstd's shape is noted at the hook that absorbs
  * it; the interface survived without brotli-specific slots.
@@ -140,7 +140,7 @@ ngx_http_compression_brotli_attach_dictionary(void *bctx, ngx_str_t *raw)
      * Unlike zstd's zero-copy refPrefix, brotli builds a PREPARED form
      * whose contents depend on the quality set at create() — the
      * interface's create→attach ordering invariant exists for this
-     * line. Per-request preparation is the phase-0/1 model (the shared
+     * line. Preparation is per-request (the shared
      * store holds raw bytes only); a prepared-dictionary cache keyed
      * on (dict, quality) is a later optimization the interface leaves
      * room for without changing this hook's signature.
@@ -279,8 +279,8 @@ static ngx_http_compression_backend_t  ngx_http_compression_brotli_backend = {
     ngx_string("dcb"),
     BROTLI_MIN_QUALITY,
     BROTLI_MAX_QUALITY,
-    6,      /* ngx_brotli's brotli_comp_level merge default — the
-             * phase-0 shim said 5, a drift from the parent this
+    6,      /* ngx_brotli's brotli_comp_level merge default — an
+             * earlier shim said 5, a drift from the parent this
              * declaration corrects */
     BROTLI_MIN_WINDOW_BITS,
     BROTLI_MAX_WINDOW_BITS,

@@ -3,7 +3,7 @@ use Digest::SHA qw(sha256 sha256_hex);
 use MIME::Base64 qw(encode_base64);
 use File::Temp qw(tempdir);
 
-# Phase-1b negotiation and wire format. Everything derives from the
+# Dictionary negotiation and wire format. Everything derives from the
 # dictionary constant below: its hash, the Available-Dictionary value,
 # and the prologue regexes — nothing on the wire is hardcoded.
 #
@@ -317,7 +317,7 @@ $::dcz_re
 
 
 === TEST 9: identity clients still vary — ONE combined line
-# review round 2: a delegated AE line plus a literal AD line meant two
+# a delegated AE line plus a literal AD line used to mean two
 # Vary lines on the wire, and first-line-keyed caches would drop the
 # dictionary axis. Dict locations now push the single combined line
 # and skip delegation entirely (gzip_vary on here must NOT produce a

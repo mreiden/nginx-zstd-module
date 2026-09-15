@@ -1,21 +1,23 @@
-# nginx-compression — phase-0 prototype
+# nginx-compression — the unified compression module family
 
-Throwaway backend-interface prototype for the unified compression
-module (RFC: [myguard-labs/nginx-zstd-module#109]). One filter module,
+The unified compression module family
+(RFC: [myguard-labs/nginx-zstd-module#109]). One filter module,
 N backends behind one vtable (`ngx_http_compression.h`), election by
 `compression_order`, gzip by defer/veto — never implemented.
 
-Lives under `compression/` on the RFC's living review branch;
-deliberately NOT wired into this repo's CI or its root `config` — the
-zstd modules build exactly as before. Later phases land on the same
-branch (phase 1 begins with the ngx_brotli history graft + the shared
-dictionary store).
+Lives under `compression/` on the RFC's living review branch with its
+own CI (`.github/workflows/compression.yml`); deliberately NOT wired
+into this repo's root `config` — the zstd modules build exactly as
+before. The branch also carries the full ngx_brotli hardened-fork
+history under `brotli/` (subtree merge; the fork point is the merge's
+second parent).
 
-**The deliverable is the interface and [WRINKLES.md](WRINKLES.md)**,
-not this code. Directives implemented: `compression on|off`,
-`compression_order <codings...>` (tokens: `zstd`, `br`, `gzip`;
-unknown or duplicate = config error; the list is the enable set),
-`compression_min_length`, `compression_types`.
+Every place the two libraries refused to be shaped the same way is
+recorded in [WRINKLES.md](WRINKLES.md). The core directives:
+`compression on|off`, `compression_order <codings...>` (tokens:
+`zstd`, `br`, `gzip`; unknown or duplicate = config error; the list is
+the enable set), `compression_min_length`, `compression_types`; the
+rest are introduced by feature below.
 
 The addon builds TWO modules (the gzip/gzip_static split, kept
 because this pair replaces modules that ship split and because the
@@ -63,7 +65,7 @@ and reject the `gzip` order token at config load. With gzip present,
 Vary is delegated via `r->gzip_vary` — which the core emits only under
 `gzip_vary on`, so the module warns at config load when that is off.
 
-**Phase 1a** adds the shared dictionary store (see
+**The shared dictionary store** (see
 `ngx_http_compression_dict.h` for the full rules):
 `compression_dict_file <path> [sha256hex]` at http/server/location
 (lists replace wholesale on inheritance; the bytes live once in a
@@ -80,9 +82,7 @@ deployments whose pipeline derives each literal from the exact file
 it ships. It must precede every literal-carrying `compression_dict_file`
 (a later declaration is a config-load error), lines without a literal
 are hashed under either policy, and the "supplied never satisfies
-unsupplied" audit stays live under trust as the safety net. The branch also carries the full
-ngx_brotli hardened-fork history under `brotli/` (subtree merge; the
-fork point is the merge's second parent).
+unsupplied" audit stays live under trust as the safety net.
 
 The `optional` keyword on `compression_dict_file <path> [sha256]
 [optional]` demotes deploy-race load failures to warnings instead of
@@ -121,7 +121,7 @@ because a proxy in front terminates TLS, this directive asserts —
 as an operator statement, never inferred from client-settable
 headers — that the hop the client spoke was secure.
 
-**Phase 2** adds unified static sidecar serving: `compression_static
+**Unified static sidecar serving**: `compression_static
 off|on|always` and `compression_static_order` (tokens `zstd`/`br`/
 `gzip`; the list is the enable set AND the probe order; default
 `br zstd gzip` — static prefers br because its CPU was spent at build
@@ -134,7 +134,8 @@ magic + declared-window probe rides along intact (an oversized-window
 `always` serves the first existing sidecar with no Vary, and a static
 miss falls through to the dynamic filter with no latches touched.
 
-**Phase 1b** makes the dictionary codings real: RFC 9842
+**Dictionary negotiation**, which makes the dictionary codings
+servable: RFC 9842
 Available-Dictionary negotiation against the store (RFC 8941 byte
 sequence, strict shape), per-backend wire-prologue emitters (dcz's
 40-byte skippable frame with a checksummed stream; dcb's 36 raw
@@ -144,8 +145,8 @@ degrade to the base coding on any negotiation miss, and a hoisted
 `Vary: Available-Dictionary` on every eligible response wherever
 dictionaries are configured — identity fallbacks included.
 
-**Phase 3** (productization) begins with the per-coding tuning
-directives, keyed by coding so a new backend needs no new commands:
+**Per-coding tuning**, keyed by coding so a new backend needs no new
+commands:
 `compression_level <coding> <n>` (zstd `-131072..22`, `0` = library
 default, default `3`; br quality `0..11`, default `6`) and
 `compression_window <coding> <size>` (a power-of-two size stored as
@@ -153,13 +154,13 @@ its log2: zstd `1k..128m` acting as a per-request memory ceiling,
 unset by default; br `1k..16m`, default `512k`). Bounds and defaults
 are declared by the backend in the vtable and validated at config
 load. The `gzip` token is rejected with a pointer at
-`gzip_comp_level` (defer means the core module's own tuning applies),
+`gzip_comp_level` (defer means core gzip's own tuning applies),
 and `dcz`/`dcb` are rejected with a pointer at their base coding — a
 dictionary variant shares the base coding's parameters (brotli bakes
 quality into the prepared dictionary; there is nothing separate to
 tune).
 
-Phase 3 also brings output-buffer recycling (the core gzip filter's
+**Output-buffer recycling** (the core gzip filter's
 busy/free pattern): shipped buffers are reclaimed once downstream
 drains them, and `compression_buffers <num> [size]` caps how many a
 request may hold in flight (default `32`, size defaulting to the
@@ -206,7 +207,7 @@ The `$compression_ratio`, `$compression_bytes_in` and
 `$compression_bytes_out` variables (parent `$zstd_*` parity) are
 log-phase counters for the compressed response.
 
-Bypass predicates round out the phase-3 filter directives:
+**Bypass predicates**:
 `compression_bypass $var ...` serves identity when any predicate
 variable resolves non-empty and not `"0"` (the parents' zstd_bypass /
 brotli_bypass semantics), and `compression_bypass_vary <header>`

@@ -4,7 +4,7 @@ use Digest::SHA qw(sha256_hex);
 use MIME::Base64 qw(encode_base64);
 use File::Temp qw(tempdir);
 
-# Phase-3 output-buffer recycling. The deterministic witnesses are the
+# Output-buffer recycling. The deterministic witnesses are the
 # get_buf debug lines: "buffer cap N reached, awaiting drain" proves
 # the cap paused production, "reused output buf" proves a reclaimed
 # buffer came back through the free list -- and with a cap far below
@@ -20,7 +20,7 @@ our $big = '';
 {
     open my $ur, '<', '/dev/urandom' or die $!;
     my $raw;
-    # check the byte count (CodeRabbit round 5): a short read shrinks
+    # check the byte count: a short read shrinks
     # $big, both sides hash the same shortened fixture, and the
     # MUST-pause assertions in TESTs 1/2/11/12 become the only witness
     my $got = read($ur, $raw, 150_000);
@@ -271,7 +271,7 @@ output-chain memory PER RESPONSE
 [emerg]
 
 === TEST 11: a tight SIZE ships sub-postpone writes -- zstd completes intact
-# The buffered-bit/recycled pair (review round 3): without recycled=1
+# The buffered-bit/recycled pair: without recycled=1
 # on fresh bufs, every 64-byte ship sat under postpone_output's hold,
 # the busy chain never drained, and this exact config truncated the
 # zstd response to the first caps' worth of bytes under a 200 -- the

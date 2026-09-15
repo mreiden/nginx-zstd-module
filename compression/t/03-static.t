@@ -1,7 +1,7 @@
 use Test::Nginx::Socket;
 use File::Temp qw(tempdir);
 
-# Phase-2 static sidecar serving. Fixtures are REAL compressed files
+# Static sidecar serving. Fixtures are REAL compressed files
 # built in this prelude via the reference CLIs (zstd, brotli, gzip must
 # be on PATH — the same tools the wire matrix uses), so every serve
 # assertion compares against the exact bytes on disk.
@@ -1117,7 +1117,7 @@ $::src
 
 
 === TEST 39: broken .zst + usable .br + non-accepting client -> Vary, identity
-# The condition eilandert attached to the port: the probe runs
+# The condition attached to the parent #202 port: the probe runs
 # INDEPENDENTLY of the client's weights. This client accepts nothing,
 # but the walk still probes past the broken .zst, finds the usable
 # .br, and emits Vary before declining — without that, this identity

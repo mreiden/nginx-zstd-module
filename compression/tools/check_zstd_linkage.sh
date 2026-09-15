@@ -3,7 +3,7 @@
 # pair, taken to this module's shape): the define never rides CFLAGS, so
 # the ONE accepted ZSTDLIB_STATIC_API import is ZSTD_getCParams — the
 # level->cparams table the browser window cap needs, self-defined in its
-# own TU (ngx_http_compression_zstd.c) with the ABI caveat stated there.
+# own source file (ngx_http_compression_zstd.c) with the ABI caveat stated there.
 # Everything else must stay stable public API: the estimator family the
 # parent forbids must never appear as a dynamic import.
 #

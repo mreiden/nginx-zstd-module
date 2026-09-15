@@ -3,7 +3,7 @@ use Digest::SHA qw(sha256_hex);
 use File::Temp qw(tempdir);
 use File::Basename qw(dirname);
 
-# Phase-1a store rules as a regression suite: every config-load rule
+# The store rules as a regression suite: every config-load rule
 # from the shell matrix, plus the $compression_dicts_hashed witness
 # and the inheritance semantics only Test::Nginx can express cleanly.
 # The dictionary contents are Perl constants so their hashes are
@@ -25,7 +25,7 @@ our $dict_a  = "const shared = 'store fixture material, dictionary A';\n" x 40;
 # group/world-writable; a host where it is not (a shared /home, a
 # drvfs mount) skips these tests rather than failing them for a reason
 # that is not what they test.
-# Guarded, not die-on-failure (CodeRabbit round 5): only the walk tests
+# Guarded, not die-on-failure: only the walk tests
 # consume this fixture, and a host that cannot symlink (a Windows-side
 # checkout without SeCreateSymbolicLink, a restricted tmp) must skip
 # them via skip_eval instead of killing the whole file at file scope.
@@ -473,7 +473,7 @@ directive is not allowed here
 [alert]
 
 === TEST 23: strict_path declared AFTER a dict_file is a config error
-# Order-dependent fail-open (review round 3): the flag is read at
+# Order-dependent fail-open: the flag is read at
 # parse time, so a load above the "on" line ran without O_NOFOLLOW or
 # the writable-target check. Directives are conventionally
 # order-independent -- rejecting the ordering outright beats silently

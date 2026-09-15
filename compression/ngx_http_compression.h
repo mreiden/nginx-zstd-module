@@ -1,19 +1,20 @@
 /*
- * nginx-compression — phase-0 prototype (see RFC: nginx-zstd-module #109).
+ * nginx-compression — the unified compression module family
+ * (RFC: nginx-zstd-module #109).
  *
- * THE BACKEND INTERFACE. This header is the deliverable of phase 0: a
- * seam that two real encoders (zstd, brotli) sit behind today, that a
- * future coding can implement without touching the election, and that
- * reserves the phase-1 dictionary hooks. Every place the two libraries
- * refused to be shaped the same way is documented at the member that
- * absorbs the difference — those notes are the "wrinkles found", also
- * collected in WRINKLES.md.
+ * THE BACKEND INTERFACE. Two backends (zstd, brotli) sit behind it
+ * today; a new coding implements it in one translation unit and gets
+ * the filter module's election, negotiation and buffer handling
+ * without touching them. Every place the two libraries refused to be
+ * shaped the same way is documented at the member that absorbs the
+ * difference — those notes are the "wrinkles found", also collected
+ * in WRINKLES.md.
  *
  * Deliberately NOT here: gzip. Per the RFC's "defer or veto, never
  * implement", gzip is an election TOKEN, not a backend — the election
  * either stands aside for the core gzip filter (defer: decline without
  * touching the r->gzip_tested latch) or shuts it off (veto: latch).
- * The interface proves itself partly by gzip never needing a slot in it.
+ * The interface proves itself partly by gzip never needing a slot.
  */
 
 #ifndef NGX_HTTP_COMPRESSION_H
@@ -25,10 +26,9 @@
 #include <nginx.h>
 
 /*
- * Floor: 1.23.0 (May 2022) — the list-linked header change
+ * Requires nginx >= 1.23.0 (May 2022): the list-linked header change
  * (ngx_table_elt_t.next) this module relies on when pushing
- * Content-Encoding and Vary. Review round 1 caught the config
- * script claiming 1.9.11.
+ * Content-Encoding and Vary.
  */
 #if (nginx_version < 1023000)
 #error "nginx-compression requires nginx >= 1.23.0 (ngx_table_elt_t.next)"
@@ -84,7 +84,8 @@ typedef enum {
  * Backend availability. The config script (or -D on the compiler
  * line) sets these to 0 when a library is absent; unset means
  * present, so the current always-both build glue keeps working
- * unchanged. Each backend TU compiles to nothing under its 0 — the
+ * unchanged. Each backend translation unit compiles to nothing under
+ * its 0 — the
  * registry stays DENSE (no holes), which is what lets everything
  * downstream index by registry position.
  *
@@ -122,7 +123,7 @@ typedef enum {
 
 
 /*
- * PHASE3: resolved per-request tuning, passed to create(). The values
+ * Resolved per-request tuning, passed to create(). The values
  * are always concrete by the time a backend sees them — conf merge
  * fills unset slots from the backend's declared defaults — so a
  * backend never re-implements defaulting. window_bits is log2 of the
@@ -148,30 +149,31 @@ struct ngx_http_compression_backend_s {
 
     /*
      * RFC 9842 dictionary variant of the coding ("dcz", "dcb"), or
-     * empty when the backend has none. Phase-1 seam: negotiation
-     * (Available-Dictionary) happens in the core module against the
+     * empty when the backend has none. Negotiation
+     * (Available-Dictionary) happens in the filter module against the
      * shared store; the backend only ever sees raw bytes.
      *
      * BOTH dictionary codings carry a wire prologue the compression
-     * library does not emit (review round 1 corrected the earlier
-     * "dcz is a plain zstd frame" text): dcz prepends a 40-byte zstd
-     * SKIPPABLE frame (magic 0x184D2A5E, size 0x20, then the
-     * dictionary's SHA-256) which a zstd decoder skips natively;
-     * dcb prepends 36 raw bytes (0xFF 'D' 'C' 'B' + SHA-256) the
-     * brotli decoder does NOT consume. Same shape — magic plus hash —
-     * different framing and different consumer obligations, which is
-     * why wire_prologue is a per-backend hook rather than chassis
-     * code. (Phase-1 alternative on the table: since both prologues
-     * are derivable from {magic, hash}, the chassis could emit them
-     * from two descriptor fields and the hook disappears.)
+     * library does not emit, which the backend supplies through the
+     * wire_prologue hook below:
+     *
+     *   dcz: a 40-byte zstd SKIPPABLE frame (magic 0x184D2A5E, size
+     *        0x20, then the dictionary's SHA-256) which a zstd decoder
+     *        skips natively;
+     *   dcb: 36 raw bytes (0xFF 'D' 'C' 'B' + SHA-256) the brotli
+     *        decoder does NOT consume.
+     *
+     * Same shape — magic plus hash — but different framing and
+     * different consumer obligations, which is why the prologue is a
+     * per-backend hook rather than filter-module code.
      */
     ngx_str_t    dict_coding;
 
     /*
-     * PHASE3: declared tuning contract. Each backend owns its level
+     * Declared tuning contract. Each backend owns its level
      * SCALE (zstd -131072..22 where 0 = library default, brotli
-     * quality 0..11) — the scales share no axis, which is why phase 0
-     * rejected one unified level VALUE. The keyed directives
+     * quality 0..11) — the scales share no axis, which is why there
+     * is no single unified level VALUE. The keyed directives
      * (`compression_level <coding> <n>`, `compression_window <coding>
      * <size>`) keep per-coding values behind one name and validate
      * against these bounds at config load, so a new backend gets its
@@ -193,11 +195,11 @@ struct ngx_http_compression_backend_s {
      * process. zstd's ZSTD_CCtx_refPrefix must precede the first
      * compress call and its parameters must already be final; brotli's
      * BrotliEncoderPrepareDictionary bakes in the QUALITY, so the
-     * level cannot change after attach either. The core module
+     * level cannot change after attach either. The filter module
      * enforces the order; backends may assume it.
      *
      * create() allocates the backend ctx from r->pool and registers
-     * its own pool cleanup for the library handle — the core module
+     * its own pool cleanup for the library handle — the filter module
      * never sees a raw encoder pointer and there is no destroy() slot
      * to forget to call on error paths.
      */
@@ -217,8 +219,8 @@ struct ngx_http_compression_backend_s {
     ngx_int_t  (*hint_input_size)(void *bctx, off_t bytes);
 
     /*
-     * Phase-1 seam, wired but not yet driven by a store: attach one
-     * RAW (unstructured) dictionary. `raw` must outlive the request —
+     * Attach one RAW (unstructured) dictionary. `raw` must outlive
+     * the request —
      * zstd references the bytes in place (refPrefix, zero copy);
      * brotli builds a prepared form and could drop them, but the
      * contract is written for the cheapest backend to keep the store's
@@ -228,24 +230,20 @@ struct ngx_http_compression_backend_s {
 
     /*
      * Wire prologue BEFORE the first encoder byte, from the elected
-     * dictionary's SHA-256. Both dict codings need one — see
-     * dict_coding above — and neither library emits it (zstd's
-     * refPrefix is transparent; brotli's header is outside the
-     * stream). Returns the number of bytes written into `out`
-     * (bounded by out_len), or NGX_ERROR.
+     * dictionary's SHA-256 (see dict_coding above for both shapes).
+     * Emission stays per-backend: dcz's prologue is a VALID ZSTD
+     * SKIPPABLE FRAME whose layout is zstd format knowledge, dcb's is
+     * raw out-of-band bytes the decoder never sees; a filter-module
+     * emitter would need per-backend format descriptors, which is
+     * this hook wearing a struct costume.
      *
-     * SETTLED in phase 1b (the chassis-vs-backend question from
-     * round 1): emission stays per-backend. dcz's prologue is a
-     * VALID ZSTD SKIPPABLE FRAME — its shape (magic 0x184D2A5E,
-     * little-endian size word, then the hash) is zstd format
-     * knowledge; dcb's is raw out-of-band bytes the decoder never
-     * sees. A chassis emitter would need per-backend format
-     * descriptors, which is this hook wearing a struct costume.
+     * The prologue is mandatory on the wire, so NULL means the
+     * dictionary coding is NOT SERVABLE: the election gates dict
+     * codings on `wire_prologue != NULL`, never on `dict_coding.len`
+     * alone.
      *
-     * NULL still means the dictionary coding is NOT SERVABLE (review
-     * round 2): the prologue is mandatory on the wire, so the
-     * election gates dict codings on `wire_prologue != NULL`, never
-     * on `dict_coding.len` alone.
+     * Returns the number of bytes written into `out` (bounded by
+     * out_len), or NGX_ERROR.
      */
     ssize_t    (*wire_prologue)(void *bctx, const u_char *dict_sha256,
                                 u_char *out, size_t out_len);
@@ -274,9 +272,10 @@ struct ngx_http_compression_backend_s {
 /*
  * Registry: compiled-in backends, NULL-terminated. The extensibility
  * contract from the RFC in its smallest form — a new coding is one
- * translation unit exporting one of these plus a registry entry (and
- * a bump of NGX_HTTP_COMPRESSION_NBACKENDS, which also sizes the
- * conf's tuning slots).
+ * translation unit exporting one of these, a registry entry, an
+ * NGX_HTTP_COMPRESSION_HAVE_* availability macro, and that macro's
+ * term in NGX_HTTP_COMPRESSION_NBACKENDS (which also sizes the conf's
+ * tuning slots).
  */
 extern ngx_http_compression_backend_t
     *ngx_http_compression_backends[NGX_HTTP_COMPRESSION_NBACKENDS + 1];
@@ -284,11 +283,11 @@ extern ngx_http_compression_backend_t
 #if (NGX_HTTP_COMPRESSION_HAVE_ZSTD)
 /*
  * Runtime libzstd feature-floor check (parent #284), called from the
- * filter's init_module hook. Lives in the zstd backend TU so the
- * chassis stays codec-clean: warns on build-vs-runtime version skew,
+ * filter's init_module hook. Lives in the zstd backend so the filter
+ * module stays library-clean: warns on build-vs-runtime version skew,
  * returns NGX_ERROR only when a configured negative level needs an API
- * floor the loaded library predates. The policy itself is the parent's
- * ../src/ngx_http_zstd_version.h verbatim (the unification dividend).
+ * floor the loaded library predates. The policy is the parent's
+ * ../src/ngx_http_zstd_version.h verbatim.
  */
 ngx_int_t ngx_http_compression_zstd_verify_runtime(ngx_cycle_t *cycle,
     ngx_flag_t any_negative_level);
@@ -298,8 +297,8 @@ ngx_int_t ngx_http_compression_zstd_verify_runtime(ngx_cycle_t *cycle,
 /*
  * One election-order entry. backend == NULL is the gzip token: on the
  * FILTER side gzip is never implemented (defer/veto); on the STATIC
- * side gzip is fully first-class — serving a premade .gz is file
- * serving and needs no zlib (how the unified static subsumes
+ * side gzip is fully first-class — serving a precompressed .gz is file
+ * serving and needs no zlib library (how the unified static subsumes
  * gzip_static for free, gzip-less builds included).
  */
 typedef struct {
@@ -308,11 +307,10 @@ typedef struct {
 
 
 /*
- * The FILTER module's location configuration. Since the module split
- * (the packaging call: the static module must be a dependency-free
- * .so, and the pair replaces existing split-format modules) the
- * static handler is its own ngx_module_t with its own private conf in
- * static.c — this struct is the filter's alone again.
+ * The FILTER module's location configuration. The static module is
+ * its own ngx_module_t with its own private conf in
+ * ngx_http_compression_static.c (the static .so must stay
+ * dependency-free, and the pair replaces modules that ship split).
  */
 typedef struct {
     ngx_flag_t     enable;
@@ -329,7 +327,7 @@ typedef struct {
     ngx_array_t   *order;          /* of ngx_http_compression_token_t */
 
     /*
-     * PHASE3: per-coding tuning, indexed by registry position. Merged
+     * Per-coding tuning, indexed by registry position. Merged
      * against the backend's declared defaults, so by election time
      * every slot is concrete (see ngx_http_compression_tuning_t).
      */
@@ -337,20 +335,20 @@ typedef struct {
     ngx_int_t      window_bits[NGX_HTTP_COMPRESSION_CONF_SLOTS];
 
     /*
-     * PHASE1a: this level's active dictionaries — pointers into the
-     * cycle-global store (see ngx_http_compression_dict.h). NULL =
-     * inherit.
+     * This level's active dictionaries — pointers into the
+     * cycle-global store (see ngx_http_compression_dict.h).
+     * NULL = inherit.
      */
     ngx_array_t   *dicts;          /* of ngx_http_compression_dict_t * */
 
     /*
      * RFC 9842 §8 secure-context escape hatch (parent #158), applied to
-     * every dictionary coding (dcz and dcb): a dictionary-compressed
+     * every dictionary coding: a dictionary-compressed
      * response is only offered on a secure context, because over
      * cleartext it hands a network attacker a length oracle over content
      * the dictionary already describes. The context is secure when this
      * nginx terminates TLS (r->connection->ssl != NULL); off by default.
-     * compression_dict_assume_secure_transport on asserts that a
+     * `compression_dict_assume_secure_transport on` asserts that a
      * TLS-terminating proxy in front made the hop the client actually
      * spoke secure — an operator acknowledgement, NEVER inferred from
      * X-Forwarded-Proto or any sibling, which a client can set on a
@@ -359,20 +357,23 @@ typedef struct {
     ngx_flag_t     dict_assume_secure;
 
     /*
-     * PHASE3: per-request bypass predicates (parent zstd_bypass /
-     * fork brotli_bypass semantics — any predicate variable resolving
-     * non-empty and not "0" serves identity), plus the operator-named
-     * extra Vary field for header/cookie-driven predicates. One
-     * unified-module delta from the parents: bypass VETOES the gzip
-     * token too (latches core gzip off) — in this module gzip is part
-     * of the stack, and a bypass that silently fell through to core
-     * gzip would defeat the operator's intent.
+     * Per-request bypass predicates (compression_bypass; the parents'
+     * zstd_bypass / brotli_bypass semantics): any predicate variable
+     * resolving non-empty and not "0" serves identity. bypass_vary is
+     * the operator-named extra Vary field for header/cookie-driven
+     * predicates, emitted on BOTH the bypassed identity response and
+     * the compressed one; responses that leave the header filter
+     * earlier (module off, subrequests, already-encoded, no-transform)
+     * never carry it. One unified-module delta from the parents: a
+     * bypass VETOES the gzip token too (latches core gzip off) — here
+     * gzip is part of the stack, and a bypass that silently fell
+     * through to core gzip would defeat the operator's intent.
      */
     ngx_array_t   *bypass;         /* of ngx_http_complex_value_t */
     ngx_str_t      bypass_vary;
 
     /*
-     * PHASE3: output-buffer pool geometry. num caps how many output
+     * Output-buffer pool geometry. num caps how many output
      * bufs a request may hold in flight (the recycling backstop
      * against a slow client + fast upstream); size 0 means "the
      * backend's recommended step size" — an explicit size overrides

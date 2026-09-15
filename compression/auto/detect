@@ -7,7 +7,7 @@
 # cygpath normalization for explicit paths), with ONE deliberate
 # difference: a library that is not found is NOT fatal. The backend
 # roster is a build-time variable (NGX_HTTP_COMPRESSION_HAVE_*): the
-# missing backend's TU compiles to nothing, its coding tokens fail at
+# missing backend compiles to nothing, its coding tokens fail at
 # config load with "built without X support", and static sidecar
 # serving keeps working for EVERY coding — it reads format constants,
 # not library APIs. Even the zero-library build is legal (it still
@@ -123,7 +123,7 @@ END
 
     # NO -DZSTD_STATIC_LINKING_ONLY on CFLAGS (the parent's #237, taken
     # one step further here): committing it unconditionally both leaked
-    # it into every nginx TU's compile and mislabeled the dynamic-retry
+    # it into every nginx source file's compile and mislabeled the dynamic-retry
     # build as a static one. This module needs the define in exactly one
     # translation unit — ngx_http_compression_zstd.c self-defines it for
     # its single, documented static-API import (ZSTD_getCParams; see the

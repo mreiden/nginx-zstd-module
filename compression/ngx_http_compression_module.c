@@ -1,9 +1,9 @@
 /*
- * nginx-compression — phase-0 prototype core (RFC: nginx-zstd-module
+ * nginx-compression — the filter module (RFC: nginx-zstd-module
  * #109). One filter module, N backends, election by compression_order,
- * gzip by defer/veto. Throwaway by charter: the deliverable is the
- * backend interface and the seams, not production polish — the known
- * shortcuts are marked "PHASE0:" and collected in WRINKLES.md.
+ * gzip by defer/veto. Every place the libraries refused to be shaped
+ * the same way is noted where it is absorbed and collected in
+ * WRINKLES.md.
  */
 
 #include <ngx_config.h>
@@ -37,8 +37,8 @@ ngx_http_compression_backend_t
     *ngx_http_compression_backends[NGX_HTTP_COMPRESSION_NBACKENDS + 1];
 
 
-/* conf struct + token type moved to ngx_http_compression.h in phase 2:
- * the static handler TU shares them */
+/* the conf struct and the token type live in ngx_http_compression.h:
+ * the static module shares them */
 
 
 typedef struct {
@@ -59,7 +59,7 @@ typedef struct {
     size_t                           out_size;
 
     /*
-     * PHASE3: output-buffer recycling (the gzip filter's busy/free
+     * Output-buffer recycling (the gzip filter's busy/free
      * pattern). Shipped bufs sit on `busy` until downstream drains
      * them; ngx_chain_update_chains reclaims drained ones onto
      * `free`, and get_buf prefers a reclaimed buf over a fresh
@@ -75,7 +75,7 @@ typedef struct {
     ngx_uint_t                       bufs_num;
 
     /*
-     * PHASE3 parity: $compression_ratio / _bytes_in / _bytes_out feed
+     * Parent parity: $compression_ratio / _bytes_in / _bytes_out feed
      * from these, and max_length enforces the parents' running input
      * cap — the declared-length gate in the header filter only sees
      * the ADVERTISED length; a chunked or lying upstream can stream
@@ -101,7 +101,7 @@ typedef struct {
     off_t                            pledged_size;
 
     /*
-     * PHASE1b: the elected dictionary variant's wire prologue,
+     * The elected dictionary variant's wire prologue,
      * prepared at election time and emitted ahead of the first
      * encoder byte (40 bytes dcz, 36 dcb; 0 = base coding).
      */
@@ -347,7 +347,7 @@ ngx_module_t  ngx_http_compression_filter_module = {
 /*
  * Runtime feature-floor gate (parent #284). Only the zstd backend has
  * version-gated API territory (negative levels, libzstd >= 1.4.0);
- * the check lives in its TU and runs only when that backend is
+ * the check lives in that backend and runs only when it is
  * compiled in. A cycle with no http block has no main conf and
  * nothing configured — that is a pass, not an error.
  */
@@ -378,7 +378,7 @@ static ngx_http_output_body_filter_pt    ngx_http_next_body_filter;
 
 /*
  * Default compression_types, mirrored from the parent zstd filter
- * (parent parity for migrators — the phase-0 html-only default was a
+ * (parent parity for migrators — an earlier html-only default was a
  * silent regression against it, caught reading GetPageSpeed's fork
  * via issue #123; the wasm/wgsl entries ride along, text-like formats
  * under non-text media types). The DIRECTIVE parser's post value
@@ -421,7 +421,7 @@ static ngx_str_t  ngx_http_compression_gzip_token = ngx_string("gzip");
 
 
 /*
- * PHASE1b: RFC 9842 negotiation. The client names the dictionary it
+ * RFC 9842 negotiation. The client names the dictionary it
  * holds via Available-Dictionary — an RFC 8941 Byte Sequence, i.e.
  * `:<base64 of the raw SHA-256>:` — and it matches (or doesn't)
  * against this location's list of store entries. First match wins;
@@ -719,9 +719,9 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
 }
 
 
-/* the gzip-less Accept-Encoding walk moved into
- * ngx_http_compression_ae_header() above (phase 2: the static handler
- * needs it too) */
+/* the gzip-less Accept-Encoding walk lives in
+ * ngx_http_compression_ae_header() above: the static module needs it
+ * too */
 
 
 static ngx_int_t
@@ -733,7 +733,8 @@ ngx_http_compression_add_backends(ngx_conf_t *cf)
 
     /*
      * Filled here rather than by static initializer only because the
-     * backends live in separate TUs exporting pointers. Fill is DENSE
+     * backends live in separate translation units exporting pointers.
+     * Fill is DENSE
      * under the HAVE guards — a library-less build compacts the
      * registry instead of leaving a hole, so registry position stays
      * a valid conf-slot index everywhere.
@@ -905,9 +906,9 @@ ngx_http_compression_init_main_conf(ngx_conf_t *cf, void *conf)
 
 
 /*
- * PHASE3 tuning directives. Phase 0 rejected one unified level VALUE
+ * Tuning directives. There is no single unified level VALUE
  * (zstd 3 and brotli 6 are both "the sane default" yet share no axis
- * — wrinkle #8); what survives is one unified level NAME, keyed by
+ * — wrinkle #8); what there is instead is one unified level NAME, keyed by
  * coding: `compression_level zstd 9` / `compression_level br 11`.
  * The backend declares its scale's bounds and default in the vtable,
  * so a new coding gets both directives for free with its registry
@@ -1727,7 +1728,7 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     }
 
     /*
-     * PHASE3: tuning slots resolve to the backend's declared defaults
+     * Tuning slots resolve to the backend's declared defaults
      * here, so election-time values are always concrete and backends
      * never re-implement defaulting. Merge runs after preconfiguration
      * filled the registry.
@@ -1940,8 +1941,8 @@ ngx_http_compression_order(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
  * The negotiated-URI Vary: ONE combined line for dictionary locations,
  * the by-construction Accept-Encoding line (#163) otherwise. Factored
  * so the bypass branch and the election path cannot drift — the
- * bypassed identity response is still a variant of a NEGOTIATED URI
- * (CodeRabbit, round 5): a cache that stores it as the URI's first
+ * bypassed identity response is still a variant of a NEGOTIATED URI:
+ * a cache that stores it as the URI's first
  * response without an Accept-Encoding dimension can then satisfy
  * non-bypassed requests with it, or worse, key later compressed
  * variants inconsistently. Same sloppy-cache paranoia as #163's
@@ -1991,8 +1992,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     conf = ngx_http_get_module_loc_conf(r, ngx_http_compression_filter_module);
 
     /*
-     * GATE ORDER (round 5, eilandert's finding — the tier boundaries
-     * are load-bearing):
+     * GATE ORDER (the tier boundaries are load-bearing):
      *
      * SCOPE first — off, subrequest, already-encoded. The module makes
      * no whole-stack claim on these; core gzip legitimately owns them.
@@ -2041,7 +2041,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     }
 
     /*
-     * PHASE3 bypass (parent zstd_bypass semantics). The operator-named
+     * Bypass (parent zstd_bypass semantics). The operator-named
      * extra Vary field rides BOTH paths — the bypassed identity
      * response and the compressed one — so a shared cache keys on the
      * request header that drove the predicate (the module cannot infer
@@ -2087,8 +2087,8 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
          * The bypassed identity response is still a variant of a
          * NEGOTIATED URI: without the Accept-Encoding dimension a
          * cache can store it as the URI's baseline and key later
-         * (non-bypassed, compressed) variants inconsistently
-         * (CodeRabbit, round 5). NOT mirrored in the no-transform
+         * (non-bypassed, compressed) variants inconsistently.
+         * NOT mirrored in the no-transform
          * branch above: that skip is response-header-driven, so the
          * URI serves identity for every client as long as the origin
          * keeps sending no-transform — there is no negotiation to
@@ -2170,8 +2170,8 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
      *
      * Locations WITH dictionaries push ONE combined line,
      * "Vary: Accept-Encoding, Available-Dictionary, Sec-Fetch-Site",
-     * instead of a delegated AE line plus separate literal lines
-     * (review round 2): two Vary lines are legal per RFC 9110, but a
+     * instead of a delegated AE line plus separate literal lines:
+     * two Vary lines are legal per RFC 9110, but a
      * fair number of intermediary caches key on the FIRST line only —
      * precisely the hazard this header exists to prevent. Delegation is
      * skipped ON PURPOSE there so the core emitter cannot add a second
@@ -2265,10 +2265,10 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         }
 
         /*
-         * PHASE1b: at each base token, the dictionary variant runs
+         * At each base token, the dictionary variant runs
          * first. Electable iff the location matched the client's
          * Available-Dictionary AND the backend is dict-ready
-         * (wire_prologue != NULL — the round-2 readiness gate) AND
+         * (wire_prologue != NULL — the readiness gate) AND
          * the client names the dict coding EXPLICITLY: a "*" wildcard
          * must never elect dcz/dcb, since only a client that actually
          * holds the dictionary can decode them (allow_wildcard=0).
@@ -2333,7 +2333,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     ctx->bufs_num = (ngx_uint_t) conf->bufs.num;
     ctx->max_length = conf->max_length;
 
-    /* PHASE3: resolve this coding's tuning slot (concrete post-merge;
+    /* resolve this coding's tuning slot (concrete post-merge;
      * the dict variant shares the base coding's values) */
     for (i = 0; ngx_http_compression_backends[i] != NULL; i++) {
         if (ngx_http_compression_backends[i] == elected) {
@@ -2401,8 +2401,8 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         ctx->prologue_len = (size_t) plen;
 
         /*
-         * The output buffer must hold the prologue (review round 2's
-         * blocking find): brotli's out_size is CONTENT-DERIVED —
+         * The output buffer must hold the prologue: brotli's
+         * out_size is CONTENT-DERIVED —
          * BrotliEncoderMaxCompressedSize(1..29) is smaller than the
          * 36-byte dcb prologue — so a tiny known-length body sized a
          * buffer the prologue memcpy overran (heap write, worker
@@ -2422,8 +2422,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
      * without this, sendfile-backed responses arrive as file bufs and
      * the (deliberate) in-memory-only cut used to fire AFTER the
      * compressed headers had gone out, truncating the response
-     * instead of failing cleanly (review round 1). Same line core
-     * gzip uses.
+     * instead of failing cleanly. Same line core gzip uses.
      */
     r->main_filter_need_in_memory = 1;
 
@@ -2492,7 +2491,7 @@ ngx_http_compression_create_temp_buf(ngx_pool_t *pool, size_t size)
 
 
 /*
- * PHASE3: produce the working output buf — a reclaimed one when the
+ * Produce the working output buf — a reclaimed one when the
  * free list has any, a fresh allocation while under the
  * compression_buffers cap, or NGX_DECLINED with ctx->nomem latched
  * when neither is possible (production pauses until downstream
@@ -2629,8 +2628,8 @@ ngx_http_compression_next_in_buf(ngx_http_compression_ctx_t *ctx,
 
 
 /*
- * Link consumed. A retained link is pool-owned: free it (review round
- * 1 — these used to accumulate for the request's lifetime). A cursor
+ * Link consumed. A retained link is pool-owned: free it (these used
+ * to accumulate for the request's lifetime). A cursor
  * link is CALLER-owned: never free it — ngx_free_chain() overwrites
  * cl->next, which would corrupt the upstream filter's chain while its
  * callback is active — just advance past it (parent #260).
@@ -2735,7 +2734,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
     if (ctx->nomem) {
         /*
-         * PHASE3 recycling: the previous invocation hit the buffer
+         * Recycling: the previous invocation hit the buffer
          * cap. Push the busy chain downstream first — a NULL pass
          * lets the write filter drain what it holds — then reclaim
          * whatever drained. Production resumes below with the freed
@@ -2764,13 +2763,13 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
 
     /*
-     * PHASE1b: the dict coding's wire prologue rides ahead of the
+     * The dict coding's wire prologue rides ahead of the
      * first encoder byte, in the same output buffer the first step
      * fills. The buffer is guaranteed to hold it by the clamp at
      * election time — NOT by any assumption about backend out_size:
      * zstd's recommendation is fixed and large, but brotli's is
-     * content-derived and can be as small as 7 bytes (review round
-     * 2). Emitted on the first invocation that carries input — a
+     * content-derived and can be as small as 7 bytes.
+     * Emitted on the first invocation that carries input — a
      * zero-body response still gets it, since the last_buf special
      * buf arrives through the input cursor like any other link.
      */
@@ -2790,7 +2789,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
 
     /*
-     * PHASE3 recycling: the outer cycle is the parent filter's shape —
+     * Recycling: the outer cycle is the parent filter's shape —
      * produce until the buffer cap pauses us, ship, reclaim what
      * downstream drained, and RESUME IN THIS INVOCATION when the
      * reclaim freed anything. Returning early with unconsumed input
@@ -2810,7 +2809,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     {
 
         /*
-         * PHASE0: in-memory bufs only (wrinkle #9: chassis complexity,
+         * In-memory bufs only (wrinkle #9: filter-module complexity,
          * no backend hook needed). Belt only — the header filter sets
          * r->main_filter_need_in_memory, so the copy filter converts
          * file bufs before they reach here; if this fires, that
@@ -2818,8 +2817,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
          */
         if (b->in_file && !ngx_buf_in_memory(b)) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                          "compression: file buffers unsupported in the "
-                          "phase-0 prototype");
+                          "compression: file buffers unsupported");
             return NGX_ERROR;
         }
 
@@ -2833,7 +2831,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             /*
              * Special bufs (flags only) have pos == last == NULL, and
              * NULL pointer arithmetic is UB even when the difference
-             * would be zero (review round 1) — gate on
+             * would be zero — gate on
              * ngx_buf_in_memory before touching the cursors.
              */
             data = ngx_buf_in_memory(b) ? (size_t) (b->last - b->pos) : 0;
@@ -2940,7 +2938,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             ctx->bytes_out += io.out_produced;
 
             /*
-             * ORDER MATTERS (review round 1's double-FINISH): the
+             * ORDER MATTERS (the double-FINISH hazard): the
              * completion check must run BEFORE the full-buffer ship.
              * When a FINISH lands its last byte exactly at ob->end,
              * shipping first and looping used to call FINISH again on
@@ -3076,7 +3074,7 @@ ship:
     }
 
     /*
-     * Held-state publication (review round 2, rounds 3/4 refined):
+     * Held-state publication:
      * after a PROCESS-only invocation the response's bytes live in
      * ctx->ob AND inside the encoder — both libraries buffer
      * internally — while this filter returns without sending
@@ -3089,16 +3087,15 @@ ship:
      * discipline — set at the input append above, cleared only at a
      * completed flush or finish — NOT latched for the stream's
      * lifetime, which upstream's unbuffered path reads as permanent
-     * NGX_HTTP_LOWLEVEL_BUFFERED congestion. PHASE0: reuses the core
-     * gzip bit — defined in every build, and the elected path
-     * latches core gzip off so the owners can never overlap; a
-     * dedicated bit ships with productization.
+     * NGX_HTTP_LOWLEVEL_BUFFERED congestion. The bit REUSED is core
+     * gzip's — defined in every build, and the elected path
+     * latches core gzip off so the owners can never overlap.
      */
 
     if (out == NULL) {
         if (!had_input && !ctx->nomem) {
             /*
-             * Writer-driven pass (review round 2): nothing of ours to
+             * Writer-driven pass: nothing of ours to
              * emit, but the chain below may hold undelivered output —
              * forward the poke, then reclaim whatever it drained.
              */

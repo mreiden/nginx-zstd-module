@@ -9,17 +9,17 @@ use CompressionRoundtrip qw(spew slurp cli_decode assert_decoders);
 
 assert_decoders('zstd', 'brotli');
 
-# Decode roundtrips INSIDE the suite (review round 2, finding 3): every
+# Decode roundtrips INSIDE the suite: every
 # block's response body is fed back through the reference decoder named
 # by its `--- decode_with` section and compared byte-exact against the
 # original plaintext. The big fixture is deliberately INCOMPRESSIBLE
 # (base64 of random bytes, ~200 KB) so brotli's 32 KB output chunks
 # ship several buffers per response — the multi-buffer FINISH path the
-# round-1 double-FINISH fix lives on. The one-byte blocks pin round
-# 2's blocking find: brotli's content-derived out_size (7 bytes for a
+# double-FINISH fix lives on. The one-byte blocks pin the prologue
+# clamp: brotli's content-derived out_size (7 bytes for a
 # 1-byte body) is smaller than the 36-byte dcb prologue, and the
-# chassis clamp is what makes them serve intact (pre-fix this was an
-# ASan heap-buffer-overflow and a silently corrupt response).
+# filter module's clamp is what makes them serve intact (pre-fix this
+# was an ASan heap-buffer-overflow and a silently corrupt response).
 
 my $tmp = tempdir(CLEANUP => 1);
 
@@ -50,7 +50,7 @@ our %decoders = (
     # natively; the dictionary rides -D
     dcz  => sub { cli_decode("zstd -dq -D $tmp/dict -c", $_[0]) },
     # dcb's 36 raw bytes are NOT consumed by the decoder. ASSERT the
-    # prologue before stripping it (CodeRabbit round 5): the regression
+    # prologue before stripping it: the regression
     # these blocks defend against is a corrupt prologue with a valid
     # stream behind it -- skip-36-and-decode is blind to exactly that.
     dcb  => sub {
@@ -70,7 +70,7 @@ add_response_body_check(sub {
     my $srckey = $block->expect_src // "big";
     chomp $srckey;
     # an unknown key must die HERE, not hash undef into a failure that
-    # blames the C code (CodeRabbit round 5)
+    # blames the C code
     die $block->name . ": unknown expect_src key '$srckey'"
         unless exists $srcs{$srckey};
 
@@ -212,7 +212,7 @@ Content-Encoding: dcb
 # brotli sizes the out buffer from the content length — 7 bytes for a
 # 1-byte body — and the 36-byte prologue used to be memcpy'd straight
 # past it (heap write; worker survived; response silently corrupt).
-# The chassis clamp makes this the smallest possible healthy dcb
+# The filter module's clamp makes this the smallest possible healthy dcb
 # response, decoded here to prove prologue AND stream both intact.
 --- user_files eval
 [ [ "rt.dict" => $::dict ] ]
@@ -241,7 +241,7 @@ Content-Encoding: dcb
 
 === TEST 6: ONE-BYTE dcz body serves intact
 # zstd's out_size is fixed and large, so this side never overflowed —
-# pinned anyway: the clamp's guarantee is chassis-wide, not
+# pinned anyway: the clamp's guarantee is the filter module's, not
 # backend-specific
 --- user_files eval
 [ [ "rt.dict" => $::dict ] ]

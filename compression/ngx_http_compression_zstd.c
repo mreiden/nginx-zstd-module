@@ -1,5 +1,5 @@
 /*
- * zstd backend for nginx-compression (phase-0 prototype).
+ * zstd backend for nginx-compression.
  * The reference implementation the vtable was shaped against; see
  * ngx_http_compression.h for the contract each hook satisfies.
  */
@@ -21,7 +21,8 @@
  * so a future libzstd.so is nominally free to remove or reshape them.
  * In practice ZSTD_getCParams is exported by every distribution
  * libzstd and has been shape-stable since 1.4. The define lives HERE,
- * in the only TU that needs it, not on CFLAGS (see auto/detect) —
+ * in the only translation unit that needs it, not on CFLAGS (see
+ * auto/detect) —
  * every other libzstd call in this file is stable public API, and if
  * a stable replacement for the cparams table ever lands, this import
  * and this comment both go.
@@ -120,7 +121,7 @@ ngx_http_compression_zstd_create(ngx_http_request_t *r,
      * declare the content size), and an explicit compression_window
      * still wins verbatim for operators serving non-browser clients.
      *
-     * PHASE3 note: the parent's dcz path additionally sizes the
+     * Not yet mirrored: the parent's dcz path additionally sizes the
      * window UP to dictionary + expected content so the far end of a
      * large dictionary keeps matching — that computation joins
      * attach_dictionary when the prepared-dictionary work lands; an
@@ -164,8 +165,8 @@ ngx_http_compression_zstd_hint_input_size(void *bctx, off_t bytes)
     ngx_http_compression_zstd_ctx_t  *z = bctx;
 
     /*
-     * Negative sizes never reach the wire as a pledge (CodeRabbit,
-     * round 5): the unsigned cast would turn them into a huge value —
+     * Negative sizes never reach the wire as a pledge:
+     * the unsigned cast would turn them into a huge value —
      * exactly -1 happens to alias ZSTD_CONTENTSIZE_UNKNOWN, but any
      * other negative becomes a real pledge the stream cannot honour,
      * and ZSTD_compressStream2 then fails at ZSTD_e_end ("Src size is
@@ -197,8 +198,8 @@ ngx_http_compression_zstd_attach_dictionary(void *bctx, ngx_str_t *raw)
      * output — the checksum converts that into a visible decode
      * error for ~4 bytes per response. Set here rather than at
      * create() so plain-zstd responses keep the parent module's
-     * bare-frame behavior — and set BEFORE refPrefix (CodeRabbit,
-     * round 5): prefix attachment snapshots the active parameters, so
+     * bare-frame behavior — and set BEFORE refPrefix:
+     * prefix attachment snapshots the active parameters, so
      * every parameter write belongs ahead of it rather than leaning on
      * current libzstd tolerance.
      */
@@ -231,8 +232,8 @@ ngx_http_compression_zstd_wire_prologue(void *bctx,
      * RFC 9842 §2.2: dcz opens with a 40-byte zstd SKIPPABLE frame —
      * magic 0x184D2A5E and the 32-byte content size, both little-
      * endian, then the dictionary's SHA-256. A zstd decoder skips it
-     * natively (which is why the phase-0 contract text got away with
-     * calling dcz "a plain frame" for as long as it did); libzstd
+     * natively (which is why an early draft of the contract got away
+     * with calling dcz "a plain frame" for as long as it did); libzstd
      * will not emit it.
      */
     if (out_len < 40) {
