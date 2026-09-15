@@ -1300,7 +1300,7 @@ ngx_http_compression_window_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
 
     if (bits > b->window_bits_max) {
         u_char     list[192], *p;
-        ngx_int_t  i;
+        ngx_int_t  w;
         ngx_str_t  vals;
 
         /*
@@ -1308,19 +1308,21 @@ ngx_http_compression_window_cmd(ngx_conf_t *cf, ngx_command_t *cmd,
          * config's own notation (google's brotli_window error does
          * the same) — strictly more actionable than raw byte counts
          * for a message a human reads exactly once at config load.
+         * `w` walks the window-bits range; `i` above stays the backend
+         * index (MSVC -W4 C4456 flagged the shadow).
          */
         p = list;
 
-        for (i = b->window_bits_min; i <= b->window_bits_max; i++) {
-            if (i > b->window_bits_min) {
+        for (w = b->window_bits_min; w <= b->window_bits_max; w++) {
+            if (w > b->window_bits_min) {
                 p = ngx_cpymem(p, ", ", 2);
             }
-            if (i >= 20) {
+            if (w >= 20) {
                 p = ngx_snprintf(p, list + sizeof(list) - p, "%uim",
-                                 (ngx_uint_t) 1 << (i - 20));
+                                 (ngx_uint_t) 1 << (w - 20));
             } else {
                 p = ngx_snprintf(p, list + sizeof(list) - p, "%uik",
-                                 (ngx_uint_t) 1 << (i - 10));
+                                 (ngx_uint_t) 1 << (w - 10));
             }
         }
 
