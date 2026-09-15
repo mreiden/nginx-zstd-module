@@ -695,8 +695,8 @@ ngx_http_compression_dict_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         entry->path = path;
 
         /*
-         * off_t bound BEFORE the size_t narrowing (round-4 review,
-         * R3-9; the parent rejects first for the same reason): on
+         * off_t bound BEFORE the size_t narrowing (the parent
+         * rejects first for the same reason): on
          * ILP32 a 4 GiB file cast to size_t loads as its low 32 bits,
          * hashes clean, and serves. The cap itself is the parent's
          * 10 MB — comfortably above the 8 MB useful-window warning

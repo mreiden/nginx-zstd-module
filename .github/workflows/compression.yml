@@ -17,14 +17,13 @@ permissions:
   contents: read
 
 on:
-  # push is scoped to the LIVING BRANCH, not removed (round-4 follow-up
-  # with data): the base repo creates no workflow runs for an outside
-  # collaborator's pull_request synchronizes on #117 — its last
-  # compression run there predates this branch's entire catch-up — so
-  # the fork-side push run is the only CI these pushes actually get.
-  # The branch filter keeps the round-3 concern satisfied: a push to
-  # master (base repo included) fires nothing, so there is no
-  # double-run anywhere.
+  # push is scoped to the LIVING BRANCH, not removed: the base repo
+  # creates no workflow runs for an outside collaborator's pull_request
+  # synchronizes on #117 — its last compression run there predates this
+  # branch's entire catch-up — so the fork-side push run is the only CI
+  # these pushes actually get. The branch filter keeps the double-run
+  # concern satisfied: a push to master (base repo included) fires
+  # nothing, so there is no double-run anywhere.
   push:
     branches:
       - phase0
@@ -547,7 +546,7 @@ jobs:
             --version "${NGINX_VERSION}" --expect-skip
 
   # ── ASan+UBSan over the chain-state paths ────────────────────────────
-  # Round-4 review: compression/ never ran under a sanitizer on any job
+  # compression/ otherwise never runs under a sanitizer on any job
   # (the root asan.yml builds the repo root as its addon). The three
   # proxy tools are the drivers because they exercise exactly the
   # buffer/chain lifecycle — mid-stream flushes, forced backpressure

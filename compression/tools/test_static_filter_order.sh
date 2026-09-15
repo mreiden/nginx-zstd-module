@@ -46,8 +46,8 @@ expect_anchor ngx_http_zstd_filter_module
 expect_order
 
 # 2. Brotli and gzip, no standalone zstd: the parent's selector applies and
-#    prefers brotli, so this filter runs before brotli (the case the review
-#    on #117 flagged: anchoring at gzip here hands brotli the first shot).
+#    prefers brotli, so this filter runs before brotli (the case #117
+#    flagged: anchoring at gzip here hands brotli the first shot).
 HTTP_FILTER_MODULES='ngx_http_gzip_filter_module ngx_http_brotli_filter_module ngx_http_range_header_filter_module'
 expect_anchor ngx_http_brotli_filter_module
 expect_order

@@ -704,7 +704,7 @@ cached malformed verdict
 
 
 === TEST 23: the window check runs UNDER DIRECTIO (aligned probe witness)
-# the property the parent's #101 review pinned: oversized windows are a
+# the property the parent's #101 pinned: oversized windows are a
 # systematic build-pipeline product, so O_DIRECT must not skip the
 # check. The debug line witnesses the aligned-probe path actually ran.
 --- log_level: debug

@@ -15,7 +15,7 @@ boundary, move the boundary onto the content:
    B in {C, C/2 (two exact fills: a full-buffer ship AT the boundary
    mid-op, then done-at-boundary), C-1, C+1, C-2, C+2}.
 4. B == C and B == C/2 MUST log the module's witness line
-   ("finish landed exactly at buffer end") — the round-1
+   ("finish landed exactly at buffer end") — the
    double-FINISH corner provably executed — and every case must
    decode byte-exact (zstd's pre-fix symptom was a silently appended
    empty frame; brotli's was a hard error mid-response).

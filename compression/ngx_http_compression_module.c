@@ -2366,7 +2366,7 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
         {
             /*
              * A refused hint is a lost optimization, not a lost
-             * response (round-4 review; the parent logs and continues
+             * response (the parent logs and continues
              * the same way). Turning it into NGX_ERROR made the
              * header filter 500 a request the encoder would have
              * served fine unpledged.
@@ -2879,8 +2879,8 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
                 /*
                  * Re-assert the held bit on EVERY consuming op, not
-                 * only at the invocation's input append (round-4
-                 * review, on bc36f47): the completed-flush clear below
+                 * only at the invocation's input append: the
+                 * completed-flush clear below
                  * runs per op inside this loop, so a chain shaped
                  * [flush][data] — the postpone filter's product —
                  * cleared the bit at the flush link and then encoded
@@ -2951,7 +2951,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 ngx_buf_t  *ob;
 
                 /*
-                 * The round-1 double-FINISH corner's observable
+                 * The double-FINISH corner's observable
                  * witness: the op completed with its last byte parked
                  * exactly at ob->end. tools/test_exact_boundary.py
                  * FORCES this case (measure the deterministic
@@ -2991,7 +2991,7 @@ ngx_http_compression_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                      * shipments; the flags must not ride a zero-size
                      * temp buf (ngx_output_chain alerts on those) —
                      * use a special buf. The drained buf goes back to
-                     * ctx->ob unconditionally (round-4 review): on a
+                     * ctx->ob unconditionally: on a
                      * content-less FINISH it used to be abandoned —
                      * neither reusable nor counted out of
                      * ctx->allocated. Harmless with the request over,
