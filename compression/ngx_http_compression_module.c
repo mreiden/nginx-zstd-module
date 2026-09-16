@@ -101,11 +101,12 @@ typedef struct {
     off_t                            pledged_size;
 
     /*
-     * The elected dictionary variant's wire prologue,
-     * prepared at election time and emitted ahead of the first
-     * encoder byte (40 bytes dcz, 36 dcb; 0 = base coding).
+     * The elected dictionary variant's wire prologue, pointing at the
+     * bytes the store entry holds (assembled once at configuration
+     * load, cycle pool) and emitted ahead of the first encoder byte
+     * (40 bytes dcz, 36 dcb; 0 = base coding).
      */
-    u_char                           prologue[40];
+    const u_char                    *prologue;
     size_t                           prologue_len;
 
     unsigned                         done:1;
@@ -682,12 +683,16 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
         return NULL;
     }
 
-    /* strict RFC 8941 byte-sequence shape: OWS ":" base64 ":" OWS */
+    /*
+     * Strict RFC 8941 byte-sequence shape: ":" base64 ":". No
+     * whitespace trim of our own (the parent's decoder has none
+     * either): nginx's header parser already drops the SP on both
+     * sides of a value, and RFC 8941 §4.2 discards only SP -- an HTAB
+     * inside the value is part of it and makes the field malformed,
+     * which negotiates nothing and serves the base coding.
+     */
     p = ad->value.data;
     last = ad->value.data + ad->value.len;
-
-    while (p < last && (*p == ' ' || *p == '\t')) { p++; }
-    while (last > p && (last[-1] == ' ' || last[-1] == '\t')) { last--; }
 
     if (last - p < 2 || *p != ':' || last[-1] != ':') {
         return NULL;    /* malformed: negotiate nothing, serve base */
@@ -1976,7 +1981,6 @@ static ngx_int_t
 ngx_http_compression_header_filter(ngx_http_request_t *r)
 {
     ngx_int_t                        w;
-    ssize_t                          plen;
     ngx_uint_t                       i;
 #if (NGX_HTTP_GZIP)
     ngx_uint_t                       gzip_listed;
@@ -2392,13 +2396,20 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
             return NGX_ERROR;
         }
 
-        plen = elected->wire_prologue(ctx->bctx, elected_dict->sha256,
-                                      ctx->prologue,
-                                      sizeof(ctx->prologue));
-        if (plen == NGX_ERROR) {
+        /*
+         * Assembled once at configuration load for every dictionary
+         * and backend (ngx_http_compression_dict_prologues()), so the
+         * election copies a pointer rather than running the hook. A
+         * zero length here is unreachable: the election gated this
+         * backend on wire_prologue != NULL, and postconfiguration
+         * refused the configuration if that hook failed.
+         */
+        if (elected_dict->prologue_len[i] == 0) {
             return NGX_ERROR;
         }
-        ctx->prologue_len = (size_t) plen;
+
+        ctx->prologue = elected_dict->prologue[i];
+        ctx->prologue_len = elected_dict->prologue_len[i];
 
         /*
          * The output buffer must hold the prologue: brotli's
@@ -3151,6 +3162,56 @@ ship:
 }
 
 
+/*
+ * Assemble every dictionary's wire prologue once, per backend, now that
+ * each entry's hash is final (an "optional" re-key happens at directive
+ * parse time, before postconfiguration). The hook stays the backend's
+ * and the store learns nothing about the bytes it holds; the election
+ * then points at them instead of running the hook on every request.
+ * A hook that fails here fails the configuration: the alternative is a
+ * dictionary coding the election would offer and could not serve.
+ */
+static ngx_int_t
+ngx_http_compression_dict_prologues(ngx_conf_t *cf,
+    ngx_http_compression_main_conf_t *cmcf)
+{
+    ssize_t                          n;
+    ngx_uint_t                       i, j;
+    ngx_http_compression_dict_t    **dicts;
+    ngx_http_compression_backend_t  *b;
+
+    dicts = cmcf->store.elts;
+
+    for (i = 0; i < cmcf->store.nelts; i++) {
+
+        for (j = 0; ngx_http_compression_backends[j] != NULL; j++) {
+            b = ngx_http_compression_backends[j];
+
+            if (b->dict_coding.len == 0 || b->wire_prologue == NULL) {
+                dicts[i]->prologue_len[j] = 0;
+                continue;
+            }
+
+            n = b->wire_prologue(NULL, dicts[i]->sha256,
+                                 dicts[i]->prologue[j],
+                                 NGX_HTTP_COMPRESSION_PROLOGUE_MAX);
+            if (n <= 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "compression: the %V backend produced "
+                                   "no %V wire prologue for dictionary "
+                                   "\"%V\"", &b->coding, &b->dict_coding,
+                                   &dicts[i]->path);
+                return NGX_ERROR;
+            }
+
+            dicts[i]->prologue_len[j] = (size_t) n;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_compression_init(ngx_conf_t *cf)
 {
@@ -3170,6 +3231,10 @@ ngx_http_compression_init(ngx_conf_t *cf)
                                         ngx_http_compression_filter_module);
     if (cmcf == NULL || !cmcf->any_enabled) {
         return NGX_OK;
+    }
+
+    if (ngx_http_compression_dict_prologues(cf, cmcf) != NGX_OK) {
+        return NGX_ERROR;
     }
 
     ngx_http_next_header_filter = ngx_http_top_header_filter;

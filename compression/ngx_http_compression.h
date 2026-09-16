@@ -121,6 +121,9 @@ typedef enum {
 #define NGX_HTTP_COMPRESSION_CONF_SLOTS  1
 #endif
 
+/* the longest wire prologue any backend emits (dcz: 40 bytes, dcb: 36) */
+#define NGX_HTTP_COMPRESSION_PROLOGUE_MAX  40
+
 
 /*
  * Resolved per-request tuning, passed to create(). The values
@@ -241,6 +244,12 @@ struct ngx_http_compression_backend_s {
      * dictionary coding is NOT SERVABLE: the election gates dict
      * codings on `wire_prologue != NULL`, never on `dict_coding.len`
      * alone.
+     *
+     * A pure function of the hash: the filter module calls it ONCE per
+     * dictionary and backend at configuration load, with bctx NULL,
+     * and stores the bytes on the dictionary entry; the election then
+     * copies them instead of calling the hook per request. Emits at
+     * most NGX_HTTP_COMPRESSION_PROLOGUE_MAX bytes.
      *
      * Returns the number of bytes written into `out` (bounded by
      * out_len), or NGX_ERROR.

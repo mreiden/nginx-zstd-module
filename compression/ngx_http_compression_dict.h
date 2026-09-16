@@ -60,6 +60,8 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#include "ngx_http_compression.h"
+
 
 #define NGX_HTTP_COMPRESSION_SHA256_LEN      32
 #define NGX_HTTP_COMPRESSION_SHA256_HEX_LEN  64
@@ -70,6 +72,20 @@ typedef struct {
     ngx_str_t    bytes;        /* raw contents, cycle config pool */
     u_char       sha256[NGX_HTTP_COMPRESSION_SHA256_LEN];
     ngx_str_t    sha256_hex;   /* lowercase; negotiation + compare key */
+
+    /*
+     * Each backend's wire prologue for this dictionary, indexed by
+     * registry position and assembled once by the backend's
+     * wire_prologue hook when the filter module's postconfiguration
+     * runs (every hash is final by then). The bytes are the backend's
+     * -- the store holds them without knowing their shape -- and the
+     * election copies a pointer instead of calling the hook per
+     * request. A zero length is a backend without a dictionary coding.
+     */
+    u_char       prologue[NGX_HTTP_COMPRESSION_CONF_SLOTS]
+                         [NGX_HTTP_COMPRESSION_PROLOGUE_MAX];
+    size_t       prologue_len[NGX_HTTP_COMPRESSION_CONF_SLOTS];
+
     unsigned     supplied:1;   /* hash arrived via config, verbatim */
     unsigned     verified:1;   /* a computed pass confirmed the hash */
     unsigned     optional:1;   /* any line for this path said

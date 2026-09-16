@@ -264,6 +264,90 @@ Content-Encoding: zstd
 
 
 
+=== TEST 6b: a trailing space after the byte sequence still negotiates
+# nginx's header parser drops the SP on both sides of a value before the
+# module sees it, so the decoder needs no trim of its own (and has none,
+# like the parent's). Control for 6c/6d: the space case must keep
+# electing dcz after the trim was removed.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "negotiation fixture body, long enough to compress meaningfully\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64: }
+--- response_headers
+Content-Encoding: dcz
+--- no_error_log
+[error]
+
+
+
+=== TEST 6c: a trailing HTAB after the byte sequence is malformed
+# RFC 8941 §4.2 discards only SP around a field value; nginx keeps an
+# HTAB inside the value, so the sequence no longer ends in ":" and the
+# request negotiates nothing. Before, a trim of our own accepted it --
+# a divergence from the parent's decoder for a header no conforming
+# client sends.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "negotiation fixture body, long enough to compress meaningfully\n";
+    }
+--- request
+GET /t
+--- more_headers eval
+qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\t}
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
+=== TEST 6d: a leading HTAB before the byte sequence is malformed
+# The mirror of 6c: nginx skips the SP after the colon of the field
+# name but starts the value at an HTAB, so the sequence no longer
+# begins with ":". Sent as a raw request: the harness's more_headers
+# parser strips the whitespace after a field name's colon itself, so
+# the tab would never reach nginx that way.
+--- user_files eval
+[ [ "app.dict" => $::dict ] ]
+--- http_config
+    compression_dict_file html/app.dict;
+--- config
+    location /t {
+        compression on;
+        compression_min_length 1;
+        default_type text/html;
+        gzip_vary on;
+        return 200 "negotiation fixture body, long enough to compress meaningfully\n";
+    }
+--- raw_request eval
+"GET /t HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept-Encoding: zstd, dcz\r\nAvailable-Dictionary: \t:$::b64:\r\n\r\n"
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log
+[error]
+
+
+
 === TEST 7: "*" must never elect a dictionary coding
 # only a client that actually holds the dictionary can decode dcz/dcb;
 # a blanket wildcard is not that statement
