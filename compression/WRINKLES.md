@@ -816,6 +816,29 @@ claims of coverage.
   disappears (the store dedupes by path; one line IS the dedupe).
   Lands with the post-merge batch alongside build-windows.sh.
 
+- **Prepared brotli dictionary cache** (deferred 2026-09-16 by
+  decision, with the numbers): the brotli backend runs
+  `BrotliEncoderPrepareDictionary()` on every dcb response, and
+  `tools/dict_attach_cost_bench.sh` (i7-13700K, libbrotli 1.2.0) puts
+  that at 0.7 ms per request for a 64 KB dictionary, 4.5 ms for 1 MB
+  and ~150 ms for 8 MB — the same at quality 1 and quality 11, so no
+  advisory level can name it (that is why brotli declares
+  `dict_advisory_level` 0 while zstd declares 9). A prepared form is
+  immutable and attachable to any number of encoders, so preparing
+  once per dictionary would remove the cost. Measured through the
+  API's own allocation hooks, the prepared form is small and does not
+  copy the bytes: 265 KB of tables for any dictionary up to 1 MB and
+  1.05 MB for an 8 MB one, identical across qualities (three
+  allocations; whether the contents differ by quality needs a look at
+  libbrotli before the cache key drops quality). The trade the
+  decision turned on: preparing at configuration load costs the same
+  per-dictionary time at startup — hundreds of 700 KB dictionaries
+  add about a second, hundreds of 8 MB ones tens of seconds — while
+  preparing lazily on first use moves that to the first request per
+  dictionary per worker. Worth it for a site with one dictionary and
+  one app; not obviously worth it for a site with hundreds. Revisit
+  when a dcb deployment measures the per-request cost as a problem.
+
 ## Phase-0 shortcuts (not findings — deliberate scope cuts)
 
 status set is 200-only (real module inherits the zstd filter's set);
