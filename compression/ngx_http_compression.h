@@ -193,6 +193,19 @@ struct ngx_http_compression_backend_s {
     ngx_int_t    window_bits_default;   /* 0 = library default */
 
     /*
+     * Level at or above which attaching a dictionary costs enough per
+     * request to be named at configuration load (0 = never). Both
+     * backends rebuild their match tables from the raw bytes on every
+     * dictionary response, at a cost set by dictionary size and level
+     * and independent of the body; below this level that cost is flat
+     * in dictionary size, from it upward it climbs steeply. The
+     * backend declares the level with the measurement behind it
+     * (tools/dict_attach_cost_bench.sh), and the merge warns when a
+     * location configures dictionaries at or above it.
+     */
+    ngx_int_t    dict_advisory_level;
+
+    /*
      * Per-request lifecycle. INVARIANT (wrinkle #2, both libraries
      * force it): create → hint_input_size → attach_dictionary →
      * process. zstd's ZSTD_CCtx_refPrefix must precede the first

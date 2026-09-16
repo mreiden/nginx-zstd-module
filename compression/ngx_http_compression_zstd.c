@@ -315,6 +315,11 @@ static ngx_http_compression_backend_t  ngx_http_compression_zstd_backend = {
              * explicit opt-in — a serving ceiling has no business
              * beyond it */
     0,      /* unset: the level's own window default */
+    9,      /* dict advisory: the first level whose strategy builds the
+             * expensive match tables under refPrefix (parent #336,
+             * libzstd 1.5.7, 1 KB body: a 1 MB dictionary costs 0.75 ms
+             * at level 3 against 4.5 ms at level 9, an 8 MB one 0.75 ms
+             * against 35 ms; levels 1-8 are flat in dictionary size) */
     ngx_http_compression_zstd_create,
     ngx_http_compression_zstd_hint_input_size,
     ngx_http_compression_zstd_attach_dictionary,

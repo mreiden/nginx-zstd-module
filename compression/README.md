@@ -158,7 +158,20 @@ load. The `gzip` token is rejected with a pointer at
 and `dcz`/`dcb` are rejected with a pointer at their base coding — a
 dictionary variant shares the base coding's parameters (brotli bakes
 quality into the prepared dictionary; there is nothing separate to
-tune).
+tune). A location that configures `compression_dict_file` lines at a
+level the backend declares expensive for per-request dictionary attach
+(zstd: level 9 and above, the parent's #336 advisory — each dcz
+response rebuilds the dictionary's match tables through
+`ZSTD_CCtx_refPrefix()` at a cost set by dictionary size and level, not
+by the body) gets a config-load warning naming the count and the
+largest dictionary. Advisory only; nothing about serving changes. The
+measurement behind each backend's level is reproducible with
+`tools/dict_attach_cost_bench.sh`. Brotli declares no such level: its
+per-request `BrotliEncoderPrepareDictionary()` costs the same at every
+quality and scales with the dictionary alone (about 4.5 ms per request
+for a 1 MB dictionary, at quality 1 and at quality 11 alike), so there
+is no level an operator could lower — the lever for dcb is a prepared
+dictionary cache, which the backend does not have yet.
 
 **Output-buffer recycling** (the core gzip filter's
 busy/free pattern): shipped buffers are reclaimed once downstream

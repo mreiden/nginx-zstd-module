@@ -537,3 +537,160 @@ qr/compression: create zstd level -1 window_bits 0/
 --- must_die
 --- error_log
 is duplicate
+
+
+
+=== TEST 25: dictionaries at a high zstd level warn at config load
+# Parent #336's advisory, zstd arm. A dcz response re-attaches its
+# dictionary through ZSTD_CCtx_refPrefix() on every request, at a cost
+# set by dictionary size and level and independent of the body; level 9
+# is the first whose strategy builds those tables, so the zstd backend
+# declares 9 as its advisory level. Config-load only: the request below
+# still serves.
+--- user_files eval
+[ [ "t/body.txt" => $::src ], [ "app.dict" => $::src ] ]
+--- config
+    location /t/ {
+        compression on;
+        compression_level zstd 9;
+        compression_dict_file html/app.dict;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /t/body.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- error_log
+1 dictionary is configured at "compression_level zstd" 9
+re-attaches its dictionary on every request
+--- no_error_log
+[emerg]
+[error]
+[alert]
+
+
+
+=== TEST 26: dictionaries at the default zstd level stay silent
+# Negative control for TEST 25, and the one that matters: the common
+# profile configures dictionaries at the default level and must not be
+# warned at. Identical to TEST 25 except for the level, so a warning
+# here is the gate firing on dictionary presence alone.
+--- user_files eval
+[ [ "t/body.txt" => $::src ], [ "app.dict" => $::src ] ]
+--- config
+    location /t/ {
+        compression on;
+        compression_level zstd 3;
+        compression_dict_file html/app.dict;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /t/body.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log eval
+[qr/re-attaches its dictionary/, qr/\[emerg\]/, qr/\[error\]/, qr/\[alert\]/]
+
+
+
+=== TEST 27: the advisory renders the dictionary count and the LARGEST size
+# Pins the formatted region: the count, the plural branch, and which
+# dictionary the size comes from. Two fixtures of different sizes,
+# declared smallest-last so "keep the first" and "keep the last" both
+# read wrong -- the message must name the body-sized dictionary.
+--- user_files eval
+[ [ "t/body.txt" => $::src ], [ "app.dict" => $::src ],
+  [ "small.dict" => "small dictionary fixture\n" x 4 ] ]
+--- config
+    location /t/ {
+        compression on;
+        compression_level zstd 9;
+        compression_dict_file html/app.dict;
+        compression_dict_file html/small.dict;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /t/body.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- error_log eval
+[ '2 dictionaries are configured at "compression_level zstd" 9',
+  "largest configured dictionary here is " . length($::src) . " bytes" ]
+--- no_error_log
+[emerg]
+[error]
+[alert]
+
+
+
+=== TEST 28: a high zstd level WITHOUT dictionaries stays silent
+# The other half of the gate: level 9 alone is not the finding, since
+# without a configured dictionary there is nothing to attach.
+--- user_files eval
+[ [ "t/body.txt" => $::src ] ]
+--- config
+    location /t/ {
+        compression on;
+        compression_level zstd 9;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /t/body.txt
+--- more_headers
+Accept-Encoding: zstd
+--- response_headers
+Content-Encoding: zstd
+--- no_error_log eval
+[qr/re-attaches its dictionary/, qr/\[emerg\]/, qr/\[error\]/, qr/\[alert\]/]
+
+
+
+=== TEST 29: dictionaries at a high zstd level with zstd NOT in the order stay silent
+# The unified-module gate: the advisory keys on the backends this
+# location can actually elect. With compression_order br, no dcz
+# response can exist here, so the zstd level is not this location's
+# cost -- and brotli declares no advisory level yet.
+--- user_files eval
+[ [ "t/body.txt" => $::src ], [ "app.dict" => $::src ] ]
+--- config
+    location /t/ {
+        compression on;
+        compression_order br;
+        compression_level zstd 9;
+        compression_dict_file html/app.dict;
+        compression_min_length 1;
+        compression_types text/plain;
+        default_type text/plain;
+        gzip_vary on;
+        root html;
+    }
+--- request
+GET /t/body.txt
+--- more_headers
+Accept-Encoding: br
+--- response_headers
+Content-Encoding: br
+--- no_error_log eval
+[qr/re-attaches its dictionary/, qr/\[emerg\]/, qr/\[error\]/, qr/\[alert\]/]

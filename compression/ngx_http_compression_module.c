@@ -1843,6 +1843,86 @@ ngx_http_compression_merge_conf(ngx_conf_t *cf, void *parent, void *child)
      * there is nothing to warn about.
      */
 
+    /*
+     * Dictionaries at an expensive compressor profile (parent #336).
+     *
+     * A dictionary response re-attaches its dictionary on EVERY
+     * request — zstd through ZSTD_CCtx_refPrefix(), brotli through
+     * BrotliEncoderPrepareDictionary() — rebuilding the backend's match
+     * tables at a cost set by dictionary size and level and independent
+     * of the response body, so a small body pays it in full. Each
+     * backend declares the level from which that cost stops being flat
+     * in dictionary size (dict_advisory_level, with its measurement),
+     * and a location that configures dictionaries at or above it for a
+     * backend in its order is named here, at configuration load.
+     *
+     * A hardening advisory, not a default-config DoS: the level and the
+     * dictionary set are both the operator's, and a client only selects
+     * among already-configured dictionaries. The gate is the profile,
+     * not the dictionary size — the sizes are one box's numbers on one
+     * body size, and a threshold on bytes would be a tuning constant
+     * with no defensible value; level is what the operator can act on.
+     * The message names the count and the largest dictionary so the
+     * operator can weigh it.
+     */
+    if (conf->enable && conf->dicts != NULL && conf->dicts->nelts > 0) {
+        size_t                           largest;
+        ngx_uint_t                       j;
+        ngx_http_compression_dict_t    **dicts;
+        ngx_http_compression_backend_t  *b;
+
+        dicts = conf->dicts->elts;
+        largest = 0;
+
+        for (i = 0; i < conf->dicts->nelts; i++) {
+            if (dicts[i]->bytes.len > largest) {
+                largest = dicts[i]->bytes.len;
+            }
+        }
+
+        t = conf->order->elts;
+
+        for (j = 0; j < conf->order->nelts; j++) {
+            b = t[j].backend;
+
+            if (b == NULL || b->dict_coding.len == 0
+                || b->wire_prologue == NULL || b->dict_advisory_level == 0)
+            {
+                continue;   /* gzip token, or no servable dict coding */
+            }
+
+            for (i = 0; ngx_http_compression_backends[i] != NULL
+                        && ngx_http_compression_backends[i] != b; i++)
+            {
+                /* void */
+            }
+
+            if (ngx_http_compression_backends[i] == NULL
+                || conf->levels[i] < b->dict_advisory_level)
+            {
+                continue;
+            }
+
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "%ui dictionar%s configured at "
+                               "\"compression_level %V\" %i; each %V "
+                               "response re-attaches its dictionary on "
+                               "every request, rebuilding the %V backend's "
+                               "match tables at a cost set by dictionary "
+                               "size and level and independent of the "
+                               "response body (largest configured "
+                               "dictionary here is %uz bytes). Lower "
+                               "\"compression_level %V\" below %i for "
+                               "dictionary locations, or use smaller "
+                               "dictionaries, if this cost is not intended",
+                               conf->dicts->nelts,
+                               conf->dicts->nelts == 1 ? "y is" : "ies are",
+                               &b->coding, conf->levels[i],
+                               &b->dict_coding, &b->coding, largest,
+                               &b->coding, b->dict_advisory_level);
+        }
+    }
+
     return NGX_CONF_OK;
 }
 

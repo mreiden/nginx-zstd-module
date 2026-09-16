@@ -284,6 +284,15 @@ static ngx_http_compression_backend_t  ngx_http_compression_brotli_backend = {
     BROTLI_MIN_WINDOW_BITS,
     BROTLI_MAX_WINDOW_BITS,
     19,     /* 512k, ngx_brotli's brotli_window default */
+    0,      /* dict advisory: none, because the cost is not level-shaped.
+             * BrotliEncoderPrepareDictionary() costs the same at every
+             * quality and scales with the dictionary alone (measured,
+             * libbrotli 1.2.0, 1 KB body, tools/dict_attach_cost_bench.sh:
+             * 0.7 ms for 64 KB, 4.5 ms for 1 MB, ~150 ms for 8 MB, at
+             * quality 1 and at quality 11 alike) -- so no level can be
+             * named as the one to lower. The lever here is a prepared
+             * dictionary cache keyed on (dictionary, quality), not an
+             * advisory; see attach_dictionary() above. */
     ngx_http_compression_brotli_create,
     ngx_http_compression_brotli_hint_input_size,
     ngx_http_compression_brotli_attach_dictionary,
