@@ -293,11 +293,12 @@ Content-Encoding: dcz
 
 
 === TEST 6c: a trailing HTAB after the byte sequence is malformed
-# RFC 8941 §4.2 discards only SP around a field value; nginx keeps an
-# HTAB inside the value, so the sequence no longer ends in ":" and the
-# request negotiates nothing. Before, a trim of our own accepted it --
-# a divergence from the parent's decoder for a header no conforming
-# client sends.
+# RFC 9110 counts an HTAB as optional whitespace around a field value,
+# but nginx's parser strips only SP and hands the tab over inside the
+# value; RFC 8941 then discards only SP too, so the sequence no longer
+# ends in ":" and the request negotiates nothing. Before, a trim of
+# our own accepted it -- a divergence from the parent's decoder for a
+# header no conforming client sends (HTTP/2 and HTTP/3 forbid it).
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config
@@ -325,8 +326,9 @@ Content-Encoding: zstd
 # The mirror of 6c: nginx skips the SP after the colon of the field
 # name but starts the value at an HTAB, so the sequence no longer
 # begins with ":". Sent as a raw request: the harness's more_headers
-# parser strips the whitespace after a field name's colon itself, so
-# the tab would never reach nginx that way.
+# parser strips all whitespace after a field name's colon (the RFC 9110
+# reading, wider than nginx's), so the tab would never reach nginx
+# that way.
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config

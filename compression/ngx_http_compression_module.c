@@ -686,10 +686,13 @@ ngx_http_compression_match_dict(ngx_http_request_t *r,
     /*
      * Strict RFC 8941 byte-sequence shape: ":" base64 ":". No
      * whitespace trim of our own (the parent's decoder has none
-     * either): nginx's header parser already drops the SP on both
-     * sides of a value, and RFC 8941 §4.2 discards only SP -- an HTAB
-     * inside the value is part of it and makes the field malformed,
-     * which negotiates nothing and serves the base coding.
+     * either). RFC 9110 §5.5 makes both SP and HTAB optional
+     * whitespace around a field value; nginx's header parser strips
+     * only the SP, so an HTAB reaches this code inside the value,
+     * where RFC 8941 §4.2 (which discards only SP) makes the field
+     * malformed: nothing is negotiated and the base coding is served.
+     * Same reading as the parent and as core gzip's Accept-Encoding
+     * parse, and HTTP/2 and HTTP/3 reject such a value outright.
      */
     p = ad->value.data;
     last = ad->value.data + ad->value.len;
