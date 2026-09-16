@@ -267,8 +267,10 @@ Content-Encoding: zstd
 === TEST 6b: a trailing space after the byte sequence still negotiates
 # nginx's header parser drops the SP on both sides of a value before the
 # module sees it, so the decoder needs no trim of its own (and has none,
-# like the parent's). Control for 6c/6d: the space case must keep
-# electing dcz after the trim was removed.
+# like the parent's). The HTAB twin is deliberately not pinned: nginx
+# keeps a tab inside the value today (the decoder then calls the field
+# malformed) but nginx/nginx#1554 strips it like the SP, so the outcome
+# flips with the nginx version.
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config
@@ -287,64 +289,6 @@ GET /t
 qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64: }
 --- response_headers
 Content-Encoding: dcz
---- no_error_log
-[error]
-
-
-
-=== TEST 6c: a trailing HTAB after the byte sequence is malformed
-# RFC 9110 counts an HTAB as optional whitespace around a field value,
-# but nginx's parser strips only SP and hands the tab over inside the
-# value; RFC 8941 then discards only SP too, so the sequence no longer
-# ends in ":" and the request negotiates nothing. Before, a trim of
-# our own accepted it -- a divergence from the parent's decoder for a
-# header no conforming client sends (HTTP/2 and HTTP/3 forbid it).
---- user_files eval
-[ [ "app.dict" => $::dict ] ]
---- http_config
-    compression_dict_file html/app.dict;
---- config
-    location /t {
-        compression on;
-        compression_min_length 1;
-        default_type text/html;
-        gzip_vary on;
-        return 200 "negotiation fixture body, long enough to compress meaningfully\n";
-    }
---- request
-GET /t
---- more_headers eval
-qq{Accept-Encoding: zstd, dcz\nAvailable-Dictionary: :$::b64:\t}
---- response_headers
-Content-Encoding: zstd
---- no_error_log
-[error]
-
-
-
-=== TEST 6d: a leading HTAB before the byte sequence is malformed
-# The mirror of 6c: nginx skips the SP after the colon of the field
-# name but starts the value at an HTAB, so the sequence no longer
-# begins with ":". Sent as a raw request: the harness's more_headers
-# parser strips all whitespace after a field name's colon (the RFC 9110
-# reading, wider than nginx's), so the tab would never reach nginx
-# that way.
---- user_files eval
-[ [ "app.dict" => $::dict ] ]
---- http_config
-    compression_dict_file html/app.dict;
---- config
-    location /t {
-        compression on;
-        compression_min_length 1;
-        default_type text/html;
-        gzip_vary on;
-        return 200 "negotiation fixture body, long enough to compress meaningfully\n";
-    }
---- raw_request eval
-"GET /t HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept-Encoding: zstd, dcz\r\nAvailable-Dictionary: \t:$::b64:\r\n\r\n"
---- response_headers
-Content-Encoding: zstd
 --- no_error_log
 [error]
 
