@@ -491,9 +491,10 @@ Content-Encoding: zstd
 
 
 
-=== TEST 20b2: a 410 body is eligible (core gzip parity as of nginx 1.31.6)
-# nginx/nginx#1466 added 410 Gone to gzip's 403/404 carve-outs: a
-# removed resource's error page is as compressible as a 404's
+=== TEST 20b2: a 410 body is eligible (the set proposed for core gzip upstream)
+# nginx/nginx#1466 proposes adding 410 Gone to gzip's 403/404
+# carve-outs: a removed resource's error page is as compressible as a
+# 404's
 --- config
     location /t {
         compression on;

@@ -178,9 +178,9 @@ static ngx_conf_enum_t  ngx_http_compression_http_version_enum[] = {
 
 /*
  * 410 Gone is compressed like 403/404: an error status whose body is
- * as compressible as a 404's, and the set core gzip compresses as of
- * nginx 1.31.6 (nginx/nginx#1466, which also added this macro). Defined
- * here for the nginx versions before it.
+ * as compressible as a 404's. nginx/nginx#1466 proposes the same for
+ * core gzip and adds this macro with it; defined here for every nginx
+ * that does not have it.
  */
 #ifndef NGX_HTTP_GONE
 #define NGX_HTTP_GONE  410
