@@ -1026,8 +1026,8 @@ $::src
 
 
 === TEST 42: a 410 Gone response is compressed like 403/404
-# The status set is core gzip's, which gained 410 in nginx 1.31.6
-# (nginx/nginx#1466): a removed resource's error page is as
+# The status set is core gzip's plus 410, which nginx/nginx#1466
+# proposes for gzip too: a removed resource's error page is as
 # compressible as a 404's.
 --- config
     location /t {
