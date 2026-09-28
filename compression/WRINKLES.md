@@ -839,10 +839,25 @@ claims of coverage.
   one app; not obviously worth it for a site with hundreds. Revisit
   when a dcb deployment measures the per-request cost as a problem.
 
-## Phase-0 shortcuts (not findings — deliberate scope cuts)
+## Phase-0 shortcuts (historical — every one has since been closed)
 
-status set is 200-only (real module inherits the zstd filter's set);
-no busy/free output-buf recycling; no bypass predicates, dictionaries,
-static-file serving, or per-coding tuning directives; build glue links
-system libs unconditionally (the hardened auto/* patterns come from
-nginx-zstd-module when this stops being throwaway).
+The first cut of the module took these scope cuts on purpose. None of
+them describes the module as it stands; each line says what the cut
+was and where it was closed.
+
+- **Status set was 200-only.** Now the parent filter's set: any 2xx
+  except 204, 205 and 206, plus 403, 404 and 410 (the error statuses
+  with compressible bodies). t/00-election.t pins 403, 404 and 410 as
+  eligible and 206, 302 and 500 as not; 204 and 205 have no block.
+- **No busy/free output-buffer recycling.** Closed by wrinkle 24;
+  `compression_buffers` caps the pool.
+- **No bypass predicates.** Closed by wrinkle 25
+  (`compression_bypass`, `compression_bypass_vary`).
+- **No dictionaries.** Closed by the shared store (wrinkle 14) and
+  RFC 9842 negotiation.
+- **No static-file serving.** Closed by the static module (wrinkles
+  21, 28 and 29).
+- **No per-coding tuning directives.** Closed by wrinkle 22
+  (`compression_level`, `compression_window`).
+- **Build glue linked system libraries unconditionally.** Closed by
+  `auto/detect` and the build-time backend roster (wrinkle 23).

@@ -2194,7 +2194,8 @@ ngx_http_compression_header_filter(ngx_http_request_t *r)
     /*
      * status not eligible: < 200, bodyless 204/205, 206 Partial Content,
      * or any > 299 except 403/404/410 (which carry compressible error
-     * bodies; the set core gzip compresses as of nginx 1.31.6).
+     * bodies; core gzip's set plus 410, which nginx/nginx#1466 proposes
+     * for gzip too).
      *
      * 206 is excluded (matching nginx's gzip filter): an upstream 206 has
      * a Content-Range computed against its selected representation.
