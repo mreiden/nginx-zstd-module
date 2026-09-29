@@ -21,14 +21,18 @@ typedef struct {
   ngx_uint_t enable;
 } configuration_t;
 
-/* Main (http-level) configuration. Cycle-owned on purpose: a rejected
-   reload takes this state down with its pool. */
+/* Cycle-owned. any_enabled is the conservative "could this cycle serve a
+   .br sidecar" latch for init() (zstd siblings' #182): set at directive
+   PARSE time by set_enable_slot() whenever "brotli_static" is parsed as
+   "on" or "always" anywhere in the config, so the always-declining
+   content-phase handler is appended only when some location could use
+   it. "brotli_static" takes no NGX_HTTP_LIF_CONF, so there is no "if"
+   conf to reason about; parse time is still the safe side (a false
+   positive costs the handler's early return, a false negative would
+   silently stop sidecars being served). Independent of the filter
+   module's own bit. */
 typedef struct {
-  /* Locations where the gzip_vary-off warning was withheld because a
-     compression_vary module is loaded (see merge_conf); reported as
-     one summary warning from postconfiguration instead of per
-     location. Mirrors the filter module's counter. */
-  ngx_uint_t vary_warn_suppressed;
+  ngx_flag_t any_enabled;
 } main_configuration_t;
 
 static ngx_conf_enum_t kBrotliStaticEnum[] = {
@@ -45,6 +49,8 @@ static ngx_int_t handler(ngx_http_request_t* req);
 static void* create_main_conf(ngx_conf_t* root_cfg);
 static void* create_conf(ngx_conf_t* root_cfg);
 static char* merge_conf(ngx_conf_t* root_cfg, void* parent, void* child);
+static char* set_enable_slot(ngx_conf_t* root_cfg, ngx_command_t* cmd,
+                             void* conf);
 static ngx_int_t init(ngx_conf_t* root_cfg);
 
 /* << Forward declarations*/
@@ -55,7 +61,7 @@ static ngx_command_t kCommands[] = {
     {ngx_string("brotli_static"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
          NGX_CONF_TAKE1,
-     ngx_conf_set_enum_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     set_enable_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(configuration_t, enable), &kBrotliStaticEnum},
     ngx_null_command};
 
@@ -64,7 +70,7 @@ static ngx_http_module_t kModuleContext = {
     init, /* postconfiguration */
 
     create_main_conf, /* create main configuration */
-    NULL, /* init main configuration */
+    NULL,             /* init main configuration */
 
     NULL, /* create server configuration */
     NULL, /* merge server configuration */
@@ -131,14 +137,18 @@ static ngx_int_t handler(ngx_http_request_t* req) {
   cfg = ngx_http_get_module_loc_conf(req, ngx_http_brotli_static_module);
   if (cfg->enable == NGX_HTTP_BROTLI_STATIC_OFF) return NGX_DECLINED;
 
-  if (cfg->enable == NGX_HTTP_BROTLI_STATIC_ALWAYS) {
-    /* Ignore request properties (e.g. Accept-Encoding). */
-  } else {
-    /* NGX_HTTP_BROTLI_STATIC_ON */
-    req->gzip_vary = 1;
-    rc = check_eligility(req);
-    if (rc != NGX_OK) return NGX_DECLINED;
-  }
+  /* NGX_HTTP_BROTLI_STATIC_ON's Vary and acceptance check both moved
+     BELOW the file checks (zstd siblings' #202, their round-4 ruling):
+     Vary is earned by a USABLE .br — here existence + regular file,
+     since this module deliberately does no content validation — not by
+     the attempt. A URI with no usable .br is not a negotiated variant,
+     and stamping Vary on its identity response fragmented shared
+     caches for nothing. The flip side, the ruling's condition: the
+     probe runs before the acceptance check, so a NON-accepting client
+     still learns the URI varies when a usable .br exists — without
+     that, its identity response would enter shared caches
+     unpartitioned. "always" is unchanged: it ignores Accept-Encoding
+     and never varies. */
 
   /* Get path and append the suffix. */
   last = ngx_http_map_uri_to_path(req, &path, &root, kSuffixLen);
@@ -211,11 +221,25 @@ static ngx_int_t handler(ngx_http_request_t* req) {
   }
 #endif
 
-  /* The .br file exists and will be served: NOW suppress a later gzip
-     filter/handler (moved from check_eligility — latching before the
-     file was known to exist killed the gzip_static fallback). ALWAYS
-     mode never consulted Accept-Encoding, so it never latched. */
+  /* The .br is proven usable: the URI genuinely varies, so the header
+     goes out now (parent #163's by-construction emission at #202's
+     placement) — on the serve path AND on the non-accepting decline
+     below. */
   if (cfg->enable == NGX_HTTP_BROTLI_STATIC_ON) {
+    if (ngx_http_brotli_vary_accept_encoding(req) != NGX_OK) {
+      return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    /* Acceptance decides serve-vs-decline, never probe-vs-skip. The
+       gzip latch below must NOT fire on this decline: a brotli-refusing
+       gzip-accepting client still deserves the gzip_static fallback. */
+    rc = check_eligility(req);
+    if (rc != NGX_OK) return NGX_DECLINED;
+
+    /* The .br file exists and will be served: NOW suppress a later gzip
+       filter/handler (latching before the file was known to exist
+       killed the gzip_static fallback). ALWAYS mode never consulted
+       Accept-Encoding, so it never latched. */
     req->gzip_tested = 1;
     req->gzip_ok = 0;
   }
@@ -244,6 +268,23 @@ static ngx_int_t handler(ngx_http_request_t* req) {
   ngx_str_set(&content_encoding_entry->value, kEncoding);
   req->headers_out.content_encoding = content_encoding_entry;
 
+  /* gzip_static parity: byte ranges address the selected representation
+   * (RFC 9110 §14.2) — the .br bytes on disk — which a client can fetch,
+   * resume and concatenate coherently because the validator is strong and
+   * the bytes are stable. Ranges only work by opting in: the range filter
+   * bails unless allow_ranges is set. */
+  req->allow_ranges = 1;
+
+  /* HEAD fast path (parent nginx-zstd-module #179): the response headers
+     already carry everything a HEAD needs — Content-Encoding and the Vary
+     line are set above — so send them and skip the body ngx_buf_t +
+     ngx_file_t allocations below. Strict NGX_HTTP_HEAD, not
+     req->header_only, which also covers 304/204 whose existing
+     header_only return past the body setup stays correct. */
+  if (req->method == NGX_HTTP_HEAD) {
+    return ngx_http_send_header(req);
+  }
+
   /* Setup response body. */
   buf = ngx_pcalloc(req->pool, sizeof(ngx_buf_t));
   if (buf == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -254,6 +295,10 @@ static ngx_int_t handler(ngx_http_request_t* req) {
   buf->in_file = buf->file_last ? 1 : 0;
   buf->last_buf = (req == req->main) ? 1 : 0;
   buf->last_in_chain = 1;
+  /* An empty sidecar in a subrequest leaves in_file and last_buf both 0;
+   * sync marks the flagless zero-size buf deliberate so the output chain
+   * does not alert "zero size buf" (gzip_static parity). */
+  buf->sync = (buf->last_buf || buf->in_file) ? 0 : 1;
   buf->file->fd = file_info.fd;
   buf->file->name = path;
   buf->file->log = log;
@@ -271,11 +316,6 @@ static ngx_int_t handler(ngx_http_request_t* req) {
   return ngx_http_output_filter(req, &out);
 }
 
-static void* create_main_conf(ngx_conf_t* root_cfg) {
-  /* pcalloc zeroes vary_warn_suppressed — no reset hook needed. */
-  return ngx_pcalloc(root_cfg->pool, sizeof(main_configuration_t));
-}
-
 static void* create_conf(ngx_conf_t* root_cfg) {
   configuration_t* cfg;
   cfg = ngx_palloc(root_cfg->pool, sizeof(configuration_t));
@@ -290,37 +330,40 @@ static char* merge_conf(ngx_conf_t* root_cfg, void* parent, void* child) {
   ngx_conf_merge_uint_value(cfg->enable, prev->enable,
                             NGX_HTTP_BROTLI_STATIC_OFF);
 
-  /* "on" mode picks .br vs the plain file by Accept-Encoding, so the
-     response varies on it and a shared cache must key on it — nginx only
-     emits Vary: Accept-Encoding when the core gzip_vary is on. "always"
-     is deliberately exempt: it serves .br regardless of Accept-Encoding,
-     so the response genuinely does not vary. Same check as the zstd
-     sibling modules. When the compression_vary filter module is loaded
-     — it emits the header from r->gzip_vary without needing "gzip_vary
-     on" — the per-location warning is withheld and counted instead;
-     presence alone cannot prove it is enabled here (see
-     ngx_http_brotli_vary_handled_externally()), so postconfiguration
-     reports one summary warning. */
-  if (cfg->enable == NGX_HTTP_BROTLI_STATIC_ON) {
-    ngx_http_core_loc_conf_t* clcf =
-        ngx_http_conf_get_module_loc_conf(root_cfg, ngx_http_core_module);
-    if (clcf != NULL && !clcf->gzip_vary) {
-      if (ngx_http_brotli_vary_handled_externally(root_cfg)) {
-        main_configuration_t* main_cfg = ngx_http_conf_get_module_main_conf(
-            root_cfg, ngx_http_brotli_static_module);
-        if (main_cfg != NULL) {
-          main_cfg->vary_warn_suppressed++;
-        }
-      } else {
-        ngx_conf_log_error(NGX_LOG_WARN, root_cfg, 0,
-                           "brotli_static is enabled but \"gzip_vary\" is "
-                           "off; add \"gzip_vary on\" to emit "
-                           "\"Vary: Accept-Encoding\" so proxies and CDNs "
-                           "cache compressed and uncompressed responses "
-                           "separately");
-      }
-    }
+  /* No gzip_vary-off warning here anymore (parent #163): the "on"-mode
+     handler emits "Vary: Accept-Encoding" itself via
+     ngx_http_brotli_vary_accept_encoding(), so correctness no longer
+     depends on "gzip_vary on" and the warning would be misleading. */
+
+  return NGX_CONF_OK;
+}
+
+static void* create_main_conf(ngx_conf_t* root_cfg) {
+  /* pcalloc: any_enabled starts clear and only set_enable_slot() sets it */
+  return ngx_pcalloc(root_cfg->pool, sizeof(main_configuration_t));
+}
+
+/* "brotli_static off|on|always": the stock enum slot plus the parse-time
+   any_enabled latch (see main_configuration_t). ngx_conf_set_enum_slot()
+   accepts exactly the three enum entries, so by the time this runs the
+   argument is one of them; only the literal "off" leaves the bit clear. */
+static char* set_enable_slot(ngx_conf_t* root_cfg, ngx_command_t* cmd,
+                             void* conf) {
+  ngx_str_t* value;
+  char* rc;
+  main_configuration_t* main_cfg;
+
+  rc = ngx_conf_set_enum_slot(root_cfg, cmd, conf);
+  if (rc != NGX_CONF_OK) return rc;
+
+  value = root_cfg->args->elts;
+  if (value[1].len == 3 && ngx_strncmp(value[1].data, "off", 3) == 0) {
+    return NGX_CONF_OK;
   }
+
+  main_cfg = ngx_http_conf_get_module_main_conf(root_cfg,
+                                                ngx_http_brotli_static_module);
+  main_cfg->any_enabled = 1;
 
   return NGX_CONF_OK;
 }
@@ -330,24 +373,11 @@ static ngx_int_t init(ngx_conf_t* root_cfg) {
   ngx_http_handler_pt* handler_slot;
   main_configuration_t* main_cfg;
 
-  /* The per-location gzip_vary-off warnings withheld in merge_conf,
-     folded into one line — see the filter module's postconfiguration
-     for why this stays a warning rather than going silent
-     (compression_vary defaults to off, and another module's merged
-     conf cannot be read to check). */
+  /* Off everywhere: nothing could serve a sidecar, so do not append the
+     always-declining content-phase handler (zstd siblings' #182). */
   main_cfg = ngx_http_conf_get_module_main_conf(root_cfg,
                                                 ngx_http_brotli_static_module);
-  if (main_cfg != NULL && main_cfg->vary_warn_suppressed) {
-    ngx_conf_log_error(NGX_LOG_WARN, root_cfg, 0,
-                       "brotli_static is enabled with \"gzip_vary\" off in "
-                       "%ui location(s); the per-location warnings are "
-                       "suppressed because "
-                       "ngx_http_compression_vary_filter_module is loaded, "
-                       "but its \"compression_vary\" directive defaults to "
-                       "off; verify \"compression_vary on\" covers those "
-                       "locations so \"Vary: Accept-Encoding\" is emitted",
-                       main_cfg->vary_warn_suppressed);
-  }
+  if (main_cfg == NULL || !main_cfg->any_enabled) return NGX_OK;
 
   core_cfg = ngx_http_conf_get_module_main_conf(root_cfg, ngx_http_core_module);
   handler_slot =

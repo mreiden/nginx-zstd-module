@@ -1,3 +1,8 @@
+# Everything is LF unless a later rule says otherwise: git's text=auto
+# heuristic leaves genuine binaries alone, and later byte-exact rules
+# override. Retires the Windows-checkout CRLF-smudge class in one line.
+* text=auto eol=lf
+
 # Files that are executed or sourced by POSIX sh on Linux (including WSL
 # builds from a Windows checkout) must stay LF: nginx's ./configure
 # sources `config`/`filter/config`/`static/config` with sh, which treats
@@ -15,8 +20,18 @@ examples/*.conf text eol=lf
 t/suite/* -text
 fuzz/corpus/* -text
 fuzz/fuzz.dict -text
+# Any dictionary fixture is byte-significant -- libFuzzer token files
+# (text-format but byte-exact) and RFC 9842 raw dictionaries alike.
+# -text rather than binary keeps the libFuzzer ones diffable. .dat is
+# the neutral extension Compression Dictionary Transport guidance
+# recommends for web-served dictionaries; cover it for future examples.
+*.dict -text
+*.dat -text
 *.br binary
 
 # CI-only stub module for the vary-suppression witness; it claims a
 # real third-party module's name and must never ship in archives.
-/tools/ci-cvary-stub export-ignore
+
+# The CPAN dependency lock is byte-compared against cpanm output on a
+# Linux runner: a CRLF smudge turns every line into a mismatch.
+*.cpan.lock text eol=lf

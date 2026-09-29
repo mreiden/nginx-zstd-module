@@ -105,6 +105,21 @@ ref_accepts(const uint8_t *d, size_t n)
 
         while (i < n && (d[i] == ' ' || d[i] == '\t')) i++;
 
+        /*
+         * Junk after the name and OWS ("br x"): the element matches
+         * nothing. Mirror the production rule confidently — skip to the
+         * next top-level comma; bail to "unsure" on a DQUOTE so
+         * quote-skipping subtleties stay out of the confident path.
+         */
+        if (i < n && d[i] != ';' && d[i] != ',') {
+            is_br = 0;
+            is_star = 0;
+            while (i < n && d[i] != ',') {
+                if (d[i] == '"') return -1;
+                i++;
+            }
+        }
+
         q = 1000;   /* no weight → q=1 */
 
         /*
@@ -128,6 +143,25 @@ ref_accepts(const uint8_t *d, size_t n)
                     i++;
                 }
                 pe = i;
+
+                /*
+                 * Empty parameter name ("br;;q=1", trailing "br;"):
+                 * RFC 9110 has no empty-parameter production, so the
+                 * element is malformed and matches nothing (mirrors
+                 * the production rule; siblings' parent #142). Skip to
+                 * the next top-level comma; bail to "unsure" on a
+                 * DQUOTE to keep quote-skipping out of this path.
+                 */
+                if (pe == ps) {
+                    is_br = 0;
+                    is_star = 0;
+                    while (i < n && d[i] != ',') {
+                        if (d[i] == '"') return -1;
+                        i++;
+                    }
+                    break;
+                }
+
                 is_qp = (pe - ps == 1 && (d[ps] == 'q' || d[ps] == 'Q'));
 
                 while (i < n && (d[i] == ' ' || d[i] == '\t')) i++;

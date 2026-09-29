@@ -47,6 +47,13 @@
    IIUC, buffered == some data passed to filter has not been pushed further. */
 #define NGX_HTTP_BROTLI_BUFFERED NGX_HTTP_GZIP_BUFFERED
 
+/* 410 Gone is compressed like 403/404. nginx/nginx#1466 proposes the
+   same for core gzip and adds this macro with it; defined here for
+   every nginx that does not have it. */
+#ifndef NGX_HTTP_GONE
+#define NGX_HTTP_GONE 410
+#endif
+
 /* One RFC 9842 dictionary, loaded at config parse. `bytes` is the raw
    file content in cf->pool (worker-lifetime; old workers keep their
    forked copy across a reload until they drain), prepared per request
@@ -81,6 +88,17 @@ typedef struct {
   /* RFC 9842 dictionaries (ngx_http_brotli_dcb_dict_t). */
   ngx_array_t* dcb_dicts;
 
+  /* RFC 9842 secure-context gate. A dcb response is only offered on a
+     secure context: over cleartext, dictionary compression hands a
+     network attacker a length oracle over content the dictionary already
+     describes (RFC 9842 section 8). Secure means this nginx terminates
+     TLS (r->connection->ssl != NULL); off by default. When a
+     TLS-terminating proxy fronts nginx (ssl NULL here),
+     brotli_dcb_assume_secure_transport on asserts the hop the client
+     actually spoke was secure — an operator acknowledgement, never
+     inferred from X-Forwarded-Proto or any client-settable header. */
+  ngx_flag_t dcb_assume_secure;
+
   ngx_bufs_t deprecated_unused_bufs;
 
   /* Brotli encoder parameter: quality */
@@ -90,17 +108,6 @@ typedef struct {
   size_t lg_win;
 } ngx_http_brotli_conf_t;
 
-/* Main (http-level) configuration. Cycle-owned on purpose: a rejected
-   reload takes this state down with its pool (the same reasoning as
-   the zstd sibling's dcz counter). */
-typedef struct {
-  /* Locations where the gzip_vary-off warning was withheld because a
-     compression_vary module is loaded (see merge_conf); reported as
-     one summary warning from postconfiguration instead of per
-     location. */
-  ngx_uint_t vary_warn_suppressed;
-} ngx_http_brotli_main_conf_t;
-
 /* Instance context. */
 typedef struct {
   /* Brotli encoder instance. */
@@ -109,10 +116,12 @@ typedef struct {
   /* Payload length; -1, if unknown. */
   off_t content_length;
 
-  /* (uncompressed) bytes pushed to encoder. */
-  size_t bytes_in;
+  /* (uncompressed) bytes pushed to encoder. uint64_t, not size_t (zstd
+     siblings' #200 row m7): on ILP32 a size_t wraps at 4 GiB and silently
+     corrupts $brotli_ratio for larger streamed responses. */
+  uint64_t bytes_in;
   /* (compressed) bytes pulled from encoder. */
-  size_t bytes_out;
+  uint64_t bytes_out;
 
   /* Input buffer chain. */
   ngx_chain_t* in;
@@ -167,28 +176,113 @@ static void ngx_http_brotli_filter_free(void* opaque, void* address);
 
 static ngx_int_t ngx_http_brotli_check_request(ngx_http_request_t* r);
 
+static ngx_int_t ngx_http_brotli_cc_value_no_transform(ngx_table_elt_t* cc);
+static ngx_int_t ngx_http_brotli_no_transform(ngx_http_request_t* r);
+
 static ngx_int_t ngx_http_brotli_add_variables(ngx_conf_t* cf);
 static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
                                                 ngx_http_variable_value_t* v,
                                                 uintptr_t data);
+static ngx_int_t ngx_http_brotli_dcb_dicts_hashed_variable(
+    ngx_http_request_t* r, ngx_http_variable_value_t* v, uintptr_t data);
 
-static void* ngx_http_brotli_create_main_conf(ngx_conf_t* cf);
 static void* ngx_http_brotli_create_conf(ngx_conf_t* cf);
 static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
                                         void* child);
 static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf);
+static char* ngx_http_brotli_set_enable_slot(ngx_conf_t* cf,
+                                             ngx_command_t* cmd, void* conf);
 
 static char* ngx_http_brotli_parse_wbits(ngx_conf_t* cf, void* post,
                                          void* data);
 
 static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
                                            void* conf);
+static ssize_t ngx_http_brotli_read_dict_file(ngx_fd_t fd, u_char* buf,
+                                              size_t size);
+static void* ngx_http_brotli_create_main_conf(ngx_conf_t* cf);
+static char* ngx_http_brotli_init_main_conf(ngx_conf_t* cf, void* conf);
 static ngx_table_elt_t* ngx_http_brotli_find_request_header(
     ngx_http_request_t* r, const char* name, size_t len);
 static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
     ngx_http_request_t* r, ngx_http_brotli_conf_t* conf);
 static ngx_int_t ngx_http_brotli_emit_dcb_header(ngx_http_request_t* r,
                                                  ngx_http_brotli_ctx_t* ctx);
+
+/* Cycle-global dictionary trust policy (zstd siblings' #165 + #199).
+   MAIN_CONF only: the loaded dictionaries are cycle state, so the
+   policy is a property of the whole load, declared once in http{}. */
+typedef struct {
+  /* brotli_dcb_dict_strict_path: opt-in, off by default. When on, the
+     dictionary path is resolved one component at a time with
+     openat(O_NOFOLLOW|O_DIRECTORY) -- an intermediate symlink (the
+     classic current -> releases/7 layout) is refused, not followed --
+     and the file must be owned by the loading principal or root and
+     not be writable by group or other. */
+  ngx_flag_t dict_strict_path;
+
+  /* Set by ngx_http_brotli_dcb_dict_file() the first time it loads a
+     dictionary while dict_strict_path does not yet read as the
+     explicit "on" at that point in the parse. Directives are
+     conventionally order-independent, so silently treating such a
+     load as "strict passed" would fail OPEN; init_main_conf rejects
+     the ordering outright when the final value is "on", rather than
+     re-opening every dictionary post-parse (which would reintroduce
+     the TOCTOU window the fstat-after-open checks close). */
+  ngx_flag_t dict_loaded_before_strict_on;
+  ngx_str_t dict_loaded_before_strict_on_file;
+
+  /* brotli_dcb_dict_trust_hashes (zstd sibling #198 + #220): default
+     off VERIFIES a supplied hash literal against the bytes read -- a
+     mismatch fails the load, protecting a pipeline whose config
+     generation and file placement are decoupled. "on" restores the
+     trusted-verbatim path: the literal IS the negotiation key and the
+     load-time SHA-256 is skipped, which at hundreds of dictionaries is
+     essentially all of the config-load CPU (the sibling measured 737
+     lines: nginx -t 5.1s -> 0.9s, user CPU 4.3s -> 0.03s). Lines
+     without a literal are hashed under either policy -- which is also
+     the per-line escape hatch under trust. */
+  ngx_flag_t dcb_dict_trust_hashes;
+
+  /* Ordering record, same trap and remedy as the strict_path pair
+     above: a literal VERIFIED (hashed) because trust did not yet read
+     "on" at that point in the parse is correct but silently paid the
+     full pass the directive exists to skip; init_main_conf rejects
+     the ordering when the final value is "on". */
+  ngx_flag_t dcb_dict_verified_before_trust_on;
+  ngx_str_t dcb_dict_verified_before_trust_on_file;
+
+  /* Load-time SHA-256 computations over dcb dictionaries in THIS
+     configuration ($brotli_dcb_dicts_hashed). Cycle-owned; the
+     observable witness that trust_hashes actually skips the pass
+     (zero for trusted literals) rather than substituting the literal
+     after hashing anyway -- the evidence gap the old trusted-verbatim
+     test admitted it could not close. */
+  ngx_uint_t dcb_dicts_hashed;
+
+  /* One EVP digest context reused across every hash this config load
+     computes (the zstd sibling's #262): lazily created on the first
+     computed hash, freed with cf->pool when parsing ends. void* so no
+     OpenSSL types leak into this struct; NULL (creation failed, or no
+     libcrypto) makes every hash take the portable path -- the same
+     total-function contract as before. Only the dict_file handler
+     touches it, and only during parse. */
+  void* dcb_evp_md_ctx;
+  ngx_flag_t dcb_evp_md_ctx_attempted;
+
+  /* Conservative "could this cycle serve a brotli response" latch for
+     ngx_http_brotli_filter_init() (zstd siblings' #182). Set at directive
+     PARSE time by ngx_http_brotli_set_enable_slot() whenever "brotli" is
+     parsed as anything but an explicit "off" anywhere in the config --
+     main, srv, loc, or the NGX_HTTP_LIF_CONF conf synthesized for a
+     rewrite-phase "if" block, which the location-conf merge walk does
+     not provably visit. A false positive (hooks installed, every merged
+     location off) costs the two no-op calls this is about; a false
+     negative would silently drop compression for a live location, so
+     parse time is the safe side. Never read at request time; the
+     $brotli_* variables are registered regardless. */
+  ngx_flag_t any_enabled;
+} ngx_http_brotli_main_conf_t;
 
 /* Configuration literals. */
 
@@ -202,7 +296,7 @@ static ngx_command_t ngx_http_brotli_filter_commands[] = {
     {ngx_string("brotli"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
          NGX_HTTP_LIF_CONF | NGX_CONF_FLAG,
-     ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     ngx_http_brotli_set_enable_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_brotli_conf_t, enable), NULL},
 
     /* Deprecated, unused. */
@@ -261,6 +355,26 @@ static ngx_command_t ngx_http_brotli_filter_commands[] = {
          NGX_CONF_TAKE12,
      ngx_http_brotli_dcb_dict_file, NGX_HTTP_LOC_CONF_OFFSET, 0, NULL},
 
+    {ngx_string("brotli_dcb_assume_secure_transport"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF |
+         NGX_CONF_FLAG,
+     ngx_conf_set_flag_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_brotli_conf_t, dcb_assume_secure), NULL},
+
+    {ngx_string("brotli_dcb_dict_strict_path"),
+     NGX_HTTP_MAIN_CONF | NGX_CONF_FLAG, ngx_conf_set_flag_slot,
+     NGX_HTTP_MAIN_CONF_OFFSET,
+     offsetof(ngx_http_brotli_main_conf_t, dict_strict_path), NULL},
+
+    /* MAIN_CONF like strict_path, same reason: what a supplied hash
+       literal MEANS is a property of the whole load's trust model.
+       Must precede every brotli_dcb_dict_file carrying a literal
+       (enforced in init_main_conf). */
+    {ngx_string("brotli_dcb_dict_trust_hashes"),
+     NGX_HTTP_MAIN_CONF | NGX_CONF_FLAG, ngx_conf_set_flag_slot,
+     NGX_HTTP_MAIN_CONF_OFFSET,
+     offsetof(ngx_http_brotli_main_conf_t, dcb_dict_trust_hashes), NULL},
+
     ngx_null_command};
 
 /* Module context hooks. */
@@ -269,7 +383,7 @@ static ngx_http_module_t ngx_http_brotli_filter_module_ctx = {
     ngx_http_brotli_filter_init,   /* post-configuration */
 
     ngx_http_brotli_create_main_conf, /* create main configuration */
-    NULL, /* init main configuration */
+    ngx_http_brotli_init_main_conf,   /* init main configuration */
 
     NULL, /* create server configuration */
     NULL, /* merge server configuration */
@@ -307,6 +421,113 @@ static ngx_http_output_body_filter_pt ngx_http_next_body_filter;
    tokens out of quoted parameter values, ignored ";Q=0" refusals, and
    treated malformed weights as acceptance. */
 
+/* Does one Cache-Control value carry a no-transform DIRECTIVE (RFC 9111
+   §5.2.2.6)? Directives are comma-separated; everything from the first
+   ';' or '=' onward in a segment is parameter/argument text, so a quoted
+   parameter VALUE like extension="no-transform" does not match (parent
+   nginx-zstd-module #251's walker, with the '=' cut added). */
+static ngx_int_t ngx_http_brotli_cc_value_no_transform(ngx_table_elt_t* cc) {
+  u_char* p;
+  u_char* last;
+  u_char* start;
+  u_char* end;
+  u_char* cut;
+  u_char* seg_end;
+
+  p = cc->value.data;
+  last = p + cc->value.len;
+
+  while (p < last) {
+    start = p;
+    while (start < last && (*start == ' ' || *start == '\t')) {
+      start++;
+    }
+
+    /* Segment end = the next comma OUTSIDE any quoted string (zstd
+       sibling's #274): a quoted extension value may contain commas and
+       backslash-escaped characters, and splitting there fabricated a
+       matching segment out of the quoted text -- a false compression
+       opt-out. Computed once, used for the cut and the advance, so the
+       next segment can never start inside a quote. */
+    seg_end = start;
+    while (seg_end < last && *seg_end != ',') {
+      if (*seg_end == '\"') {
+        seg_end++;
+        while (seg_end < last && *seg_end != '\"') {
+          if (*seg_end == '\\' && seg_end + 1 < last) {
+            seg_end++;
+          }
+          seg_end++;
+        }
+        if (seg_end < last) {
+          seg_end++; /* the closing quote */
+        }
+        continue;
+      }
+      seg_end++;
+    }
+
+    cut = start;
+    while (cut < seg_end && *cut != ';' && *cut != '=') {
+      cut++;
+    }
+    end = cut;
+
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
+      end--;
+    }
+
+    if ((size_t)(end - start) == sizeof("no-transform") - 1 &&
+        ngx_strncasecmp(start, (u_char*)"no-transform",
+                        sizeof("no-transform") - 1) == 0) {
+      return 1;
+    }
+
+    p = (seg_end < last) ? seg_end + 1 : seg_end;
+  }
+
+  return 0;
+}
+
+/* RFC 9110 §7.7: no-transform forbids changing the content coding. The
+   walk covers the whole headers_out list rather than the
+   headers_out.cache_control chain because only some producers (the
+   upstream module) wire that chain — a Cache-Control pushed straight
+   onto the list by a module is invisible there. Repeated Cache-Control
+   lines are each checked (caches treat them as one combined list). */
+static ngx_int_t ngx_http_brotli_no_transform(ngx_http_request_t* r) {
+  ngx_uint_t i;
+  ngx_list_part_t* part;
+  ngx_table_elt_t* h;
+
+  part = &r->headers_out.headers.part;
+  h = part->elts;
+
+  for (i = 0; /* void */; i++) {
+    if (i >= part->nelts) {
+      if (part->next == NULL) {
+        break;
+      }
+      part = part->next;
+      h = part->elts;
+      i = 0;
+    }
+
+    if (h[i].hash == 0 || h[i].key.len != sizeof("Cache-Control") - 1 ||
+        h[i].value.len == 0) {
+      continue;
+    }
+
+    if (ngx_strncasecmp(h[i].key.data, (u_char*)"Cache-Control",
+                        sizeof("Cache-Control") - 1) == 0 &&
+        ngx_http_brotli_cc_value_no_transform(&h[i])) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
 /* Process headers and decide if request is eligible for brotli compression. */
 static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
   ngx_table_elt_t* h;
@@ -321,10 +542,13 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
     return ngx_http_next_header_filter(r);
   }
 
-  /* Only compress OK / forbidden / not found responses. */
+  /* Only compress OK / forbidden / not found / gone responses -- core
+     gzip's set plus 410, which nginx/nginx#1466 proposes for gzip
+     too. */
   if (r->headers_out.status != NGX_HTTP_OK &&
       r->headers_out.status != NGX_HTTP_FORBIDDEN &&
-      r->headers_out.status != NGX_HTTP_NOT_FOUND) {
+      r->headers_out.status != NGX_HTTP_NOT_FOUND &&
+      r->headers_out.status != NGX_HTTP_GONE) {
     return ngx_http_next_header_filter(r);
   }
 
@@ -356,6 +580,16 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
 
   /* Compress only certain MIME-typed responses. */
   if (ngx_http_test_content_type(r, &conf->types) == NULL) {
+    return ngx_http_next_header_filter(r);
+  }
+
+  /* RFC 9110 §7.7 (parent nginx-zstd-module #251): a response carrying
+     Cache-Control: no-transform must keep its content coding. Sits
+     before any Vary emission — the skip is keyed on a response header,
+     so the response does not vary on Accept-Encoding. Matching the
+     parent's standalone semantics, core gzip is left alone: this module
+     falls through, same as the bypass below. */
+  if (ngx_http_brotli_no_transform(r)) {
     return ngx_http_next_header_filter(r);
   }
 
@@ -392,19 +626,36 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
     return ngx_http_next_header_filter(r);
   }
 
-  r->gzip_vary = 1;
+  /* Vary emitted by this module rather than merely requested via
+     r->gzip_vary and left to the operator's "gzip_vary" directive —
+     whose default is OFF, under which nginx clears the flag and emits
+     nothing, so a negotiated response ships with no Vary and a shared
+     cache serves the compressed body to a client that cannot decode it
+     (parent nginx-zstd-module #163). Every path below negotiates on
+     Accept-Encoding (plain br, dcb, and the identity fallbacks), so the
+     line must be present. Placed below the bypass return, matching the
+     sibling unified module's ordering: the bypassed identity path carries
+     its cache-key dimension through the brotli_bypass_vary push above.
 
-  /* With dictionaries configured, WHICH encoding this location serves
-     depends on the request's Available-Dictionary header — the dcb
-     variant, the plain br variant a dictionary-less client receives, and
-     the identity fallback (a client sending "Accept-Encoding: dcb" only,
-     with a hash we do not hold, gets identity NOW but dcb once it
-     acquires a dictionary we do hold). A shared cache must key all of
-     them on that header. This push therefore sits ABOVE the acceptance
-     gate: every earlier return declines for reasons invariant in
-     Available-Dictionary; the paths below are not invariant. (This exact
-     ordering was a review finding on the sibling dcz implementation —
-     nginx-zstd-module PR #92 — baked in here from the start.) */
+     With dictionaries configured, the response ALSO varies on
+     Available-Dictionary and on Sec-Fetch-Site. Available-Dictionary
+     because the dcb variant, the plain-br variant a dictionary-less
+     client gets, and the identity fallback are all keyed on it.
+     Sec-Fetch-Site (parent #160) because dcb_negotiate() below refuses
+     the dictionary coding for any value other than absent / same-origin
+     / none (RFC 9842 §8.3 cross-origin partitioning), which makes that
+     header a response-selection input: without it in Vary a shared cache
+     filled by a same-origin request would serve the dcb body to a
+     cross-site request whose gate said no (or the reverse) — a hit on the
+     wrong variant across the partition.
+
+     Emit ONE combined "Vary: Accept-Encoding, Available-Dictionary,
+     Sec-Fetch-Site" rather than a delegated Accept-Encoding line plus
+     separate literal lines: two Vary lines are legal per RFC 9110, but a
+     fair number of intermediary caches key on the FIRST line only —
+     exactly the hazard this header exists to prevent. The combined-line
+     branch does NOT set r->gzip_vary, so the core emitter cannot add a
+     second Accept-Encoding line beside it. */
   if (conf->dcb_dicts != NULL && conf->dcb_dicts->nelts > 0) {
     ngx_table_elt_t* v;
 
@@ -418,7 +669,11 @@ static ngx_int_t ngx_http_brotli_header_filter(ngx_http_request_t* r) {
     v->next = NULL;
 #endif
     ngx_str_set(&v->key, "Vary");
-    ngx_str_set(&v->value, "Available-Dictionary");
+    ngx_str_set(&v->value,
+                "Accept-Encoding, Available-Dictionary, Sec-Fetch-Site");
+
+  } else if (ngx_http_brotli_vary_accept_encoding(r) != NGX_OK) {
+    return NGX_ERROR;
   }
 
   /* RFC 9842 dcb negotiation first: a client that advertises a
@@ -586,7 +841,13 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
       ctx->bytes_out += available_output;
       ctx->out_buf->last_buf = 0;
       ctx->out_buf->flush = 0;
-      if (ctx->end_of_input && BrotliEncoderIsFinished(ctx->encoder)) {
+      /* !HasMoreOutput alongside IsFinished (zstd siblings' round-4
+         twin): IsFinished alone rests on the undocumented invariant
+         that a finished encoder never holds output — marking last_buf
+         on this buf while output remained would truncate the stream.
+         The conjunct costs nothing. */
+      if (ctx->end_of_input && BrotliEncoderIsFinished(ctx->encoder) &&
+          !BrotliEncoderHasMoreOutput(ctx->encoder)) {
         ctx->out_buf->last_buf = 1;
         r->connection->buffered &= ~NGX_HTTP_BROTLI_BUFFERED;
       } else if (ctx->end_of_block) {
@@ -601,7 +862,8 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
       continue;
     }
 
-    if (BrotliEncoderIsFinished(ctx->encoder)) {
+    if (BrotliEncoderIsFinished(ctx->encoder) &&
+        !BrotliEncoderHasMoreOutput(ctx->encoder)) {
       ctx->success = 1;
       r->connection->buffered &= ~NGX_HTTP_BROTLI_BUFFERED;
       ngx_http_brotli_filter_close(ctx);
@@ -668,11 +930,23 @@ static ngx_int_t ngx_http_brotli_body_filter(ngx_http_request_t* r,
        runaway response. */
     if (conf->max_length != NGX_CONF_UNSET &&
         (off_t)ctx->bytes_in > (off_t)conf->max_length) {
-      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                    "brotli: input exceeded brotli_max_length (%z) on a "
-                    "response with no (honest) Content-Length; aborting to "
-                    "protect the worker",
-                    conf->max_length);
+      /* Name the shape truthfully (zstd siblings' #283): a declared length
+         the stream then overran is a misdeclaring upstream, not a chunked
+         one, and the operator's remedy differs. */
+      if (ctx->content_length >= 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "brotli: input exceeded brotli_max_length (%z) after "
+                      "%uL bytes on a response with declared "
+                      "Content-Length %O; aborting to protect the "
+                      "worker",
+                      conf->max_length, ctx->bytes_in, ctx->content_length);
+      } else {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "brotli: input exceeded brotli_max_length (%z) after "
+                      "%uL bytes on a response with no "
+                      "Content-Length; aborting to protect the worker",
+                      conf->max_length, ctx->bytes_in);
+      }
       ngx_http_brotli_filter_close(ctx);
       return NGX_ERROR;
     }
@@ -763,10 +1037,14 @@ static ngx_int_t ngx_http_brotli_filter_ensure_stream_initialized(
     ok = BrotliEncoderSetParameter(ctx->encoder, BROTLI_PARAM_SIZE_HINT,
                                    hint);
     if (!ok) {
-      ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                    "BrotliEncoderSetParameter(SIZE_HINT, %uD) failed",
+      /* Do what the comment above always promised (zstd siblings'
+         round-4 twin): a refused hint is a lost optimization, not a
+         lost response — the old return NGX_ERROR here failed a
+         request the encoder would have served fine unhinted. */
+      ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                    "BrotliEncoderSetParameter(SIZE_HINT, %uD) refused; "
+                    "continuing unhinted",
                     hint);
-      return NGX_ERROR;
     }
   }
 
@@ -927,7 +1205,6 @@ static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
   ngx_str_t decoded;
   ngx_uint_t i;
   ngx_table_elt_t* h;
-  ngx_table_elt_t* ae;
   ngx_http_brotli_dcb_dict_t* dicts;
 
   if (conf->dcb_dicts == NULL || conf->dcb_dicts->nelts == 0) {
@@ -938,8 +1215,38 @@ static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
     return NULL;
   }
 
-  ae = r->headers_in.accept_encoding;
-  if (ae == NULL) {
+  /* RFC 9842 section 8 secure-context gate, fail-closed and ahead of the
+     header parsing: no dcb response over a non-secure connection, because
+     a dictionary-compressed response over cleartext is a length oracle
+     over content the dictionary already describes. Secure means this
+     nginx terminates TLS. The guard mirrors ngx_connection_t's own
+     condition for the ssl member (#if (NGX_SSL || NGX_COMPAT)), not
+     NGX_SSL alone, so a --with-compat build (where the field exists and
+     is always NULL) reads it correctly. HTTP/2 and HTTP/3 both carry a
+     non-NULL connection->ssl. A TLS-terminating proxy makes ssl NULL
+     here; brotli_dcb_assume_secure_transport on opts back in — an
+     operator acknowledgement, never inferred from a client-settable
+     forwarded-scheme header. */
+  if (!conf->dcb_assume_secure) {
+    ngx_flag_t secure;
+
+#if (NGX_SSL || NGX_COMPAT)
+    secure = (r->connection->ssl != NULL);
+#else
+    secure = 0;
+#endif
+
+    if (!secure) {
+      ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                     "brotli dcb: skip, not a secure context (RFC 9842 "
+                     "section 8); set "
+                     "\"brotli_dcb_assume_secure_transport on\" if TLS "
+                     "terminates upstream");
+      return NULL;
+    }
+  }
+
+  if (r->headers_in.accept_encoding == NULL) {
     return NULL;
   }
 
@@ -979,8 +1286,11 @@ static ngx_http_brotli_dcb_dict_t* ngx_http_brotli_dcb_negotiate(
     return NULL;
   }
 
-  if (ngx_http_brotli_coding_weight(&ae->value, "dcb", sizeof("dcb") - 1,
-                                    0) <= 0) {
+  /* Whole-field lookup; wildcard-suppressed — only a client that
+     actually holds the dictionary can decode dcb, so a blanket "*"
+     must not turn it on. */
+  if (ngx_http_brotli_request_coding_weight(r, "dcb", sizeof("dcb") - 1,
+                                            0) <= 0) {
     return NULL;
   }
 
@@ -1036,6 +1346,8 @@ static ngx_int_t ngx_http_brotli_emit_dcb_header(ngx_http_request_t* r,
 }
 
 static ngx_int_t ngx_http_brotli_add_variables(ngx_conf_t* cf) {
+  static ngx_str_t dicts_hashed_name =
+      ngx_string("brotli_dcb_dicts_hashed");
   ngx_http_variable_t* var;
 
   var = ngx_http_add_variable(cf, &ngx_http_brotli_ratio, 0);
@@ -1045,7 +1357,104 @@ static ngx_int_t ngx_http_brotli_add_variables(ngx_conf_t* cf) {
 
   var->get_handler = ngx_http_brotli_ratio_variable;
 
+  var = ngx_http_add_variable(cf, &dicts_hashed_name, 0);
+  if (var == NULL) {
+    return NGX_ERROR;
+  }
+
+  var->get_handler = ngx_http_brotli_dcb_dicts_hashed_variable;
+
   return NGX_OK;
+}
+
+/* $brotli_dcb_dicts_hashed — load-time SHA-256 passes over dcb
+   dictionaries this configuration cycle. Constant after config parse.
+   Operators check that trust_hashes actually took effect (zero with
+   every line trusted); the suite uses it as the witness that trust
+   SKIPS the pass rather than substituting the literal after hashing
+   anyway. */
+static ngx_int_t ngx_http_brotli_dcb_dicts_hashed_variable(
+    ngx_http_request_t* r, ngx_http_variable_value_t* v, uintptr_t data) {
+  ngx_http_brotli_main_conf_t* bmcf;
+
+  (void)data;
+
+  bmcf = ngx_http_get_module_main_conf(r, ngx_http_brotli_filter_module);
+
+  v->data = ngx_pnalloc(r->pool, NGX_INT_T_LEN);
+  if (v->data == NULL) {
+    return NGX_ERROR;
+  }
+
+  v->len = ngx_sprintf(v->data, "%ui", bmcf->dcb_dicts_hashed) - v->data;
+  v->valid = 1;
+  v->no_cacheable = 0;
+  v->not_found = 0;
+
+  return NGX_OK;
+}
+
+/* Split bytes_in/bytes_out into an integer part and THREE exact fractional
+   digits without ever overflowing uint64_t (zstd siblings' #294). Either
+   counter can approach UINT64_MAX on a long-lived connection, and
+   bytes_out may exceed bytes_in whenever the encoder expands
+   incompressible input. `bytes_in * 100 / bytes_out` wraps in the
+   multiply; dividing first and scaling only the remainder still wraps
+   when bytes_out > bytes_in, because the remainder is then bytes_in
+   itself. Exact long division instead: per digit the remainder (always
+   < divisor) is multiplied by 10, and when that product would not fit,
+   whole divisors are peeled off remainder * 10 by addition so nothing
+   leaves uint64_t -- the result matches an exact 128-bit
+   bytes_in * 1000 / bytes_out for every input pair
+   (tools/test_ratio_scaling_unit.sh extracts this verbatim and checks
+   it against that oracle). The caller rounds the third digit away. */
+static void ngx_http_brotli_ratio_parts(uint64_t bytes_in, uint64_t bytes_out,
+                                        ngx_uint_t* ratio_int,
+                                        ngx_uint_t* ratio_frac) {
+  uint64_t remainder, frac;
+  int i;
+
+  *ratio_int = (ngx_uint_t)(bytes_in / bytes_out);
+
+  remainder = bytes_in % bytes_out;
+  frac = 0;
+
+  for (i = 0; i < 3; i++) {
+    if (remainder <= UINT64_MAX / 10) {
+      remainder *= 10;
+      frac = frac * 10 + remainder / bytes_out;
+      remainder %= bytes_out;
+      continue;
+    }
+
+    /* remainder * 10 would overflow. Since remainder < bytes_out, that only
+       happens for a very large divisor; then remainder * 10 is at most
+       10 * bytes_out, so the quotient digit is in [0, 10) and can be found
+       exactly without forming the product: peel off whole multiples of
+       bytes_out from remainder * 10 one at a time, each step staying inside
+       uint64_t. */
+    {
+      uint64_t acc = remainder;
+      uint64_t digit = 0;
+      int k;
+
+      /* acc accumulates remainder * 10 modulo bytes_out. */
+      for (k = 0; k < 9; k++) {
+        acc += remainder;
+
+        if (acc >= bytes_out || acc < remainder) {
+          /* wrapped past, or reached, one whole bytes_out */
+          acc -= bytes_out;
+          digit++;
+        }
+      }
+
+      frac = frac * 10 + digit;
+      remainder = acc;
+    }
+  }
+
+  *ratio_frac = (ngx_uint_t)frac;
 }
 
 static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
@@ -1067,31 +1476,29 @@ static ngx_int_t ngx_http_brotli_ratio_variable(ngx_http_request_t* r,
     return NGX_OK;
   }
 
-  v->data = ngx_pnalloc(r->pool, NGX_INT32_LEN + 3);
+  v->data = ngx_pnalloc(r->pool, NGX_INT64_LEN + 3);
   if (v->data == NULL) {
     return NGX_ERROR;
   }
 
-  ratio_int = (ngx_uint_t)(ctx->bytes_in / ctx->bytes_out);
-  ratio_frac = (ngx_uint_t)((ctx->bytes_in * 100 / ctx->bytes_out) % 100);
+  ngx_http_brotli_ratio_parts(ctx->bytes_in, ctx->bytes_out, &ratio_int,
+                              &ratio_frac);
 
-  /* Rounding; e.g. 2.125 to 2.13 */
-  if ((ctx->bytes_in * 1000 / ctx->bytes_out) % 10 > 4) {
-    ratio_frac++;
+  /* Two decimals, rounded half-up on the exact third digit, as this
+     variable has always printed; e.g. 2.125 to 2.13. */
+  if (ratio_frac % 10 > 4) {
+    ratio_frac = ratio_frac / 10 + 1;
     if (ratio_frac > 99) {
       ratio_int++;
       ratio_frac = 0;
     }
+  } else {
+    ratio_frac /= 10;
   }
 
   v->len = ngx_sprintf(v->data, "%ui.%02ui", ratio_int, ratio_frac) - v->data;
 
   return NGX_OK;
-}
-
-static void* ngx_http_brotli_create_main_conf(ngx_conf_t* cf) {
-  /* pcalloc zeroes vary_warn_suppressed — no reset hook needed. */
-  return ngx_pcalloc(cf->pool, sizeof(ngx_http_brotli_main_conf_t));
 }
 
 static void* ngx_http_brotli_create_conf(ngx_conf_t* cf) {
@@ -1115,6 +1522,7 @@ static void* ngx_http_brotli_create_conf(ngx_conf_t* cf) {
   conf->max_length = NGX_CONF_UNSET;
   conf->bypass = NGX_CONF_UNSET_PTR;
   conf->dcb_dicts = NGX_CONF_UNSET_PTR;
+  conf->dcb_assume_secure = NGX_CONF_UNSET;
 
   return conf;
 }
@@ -1133,6 +1541,7 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
   ngx_conf_merge_value(conf->max_length, prev->max_length, NGX_CONF_UNSET);
   ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
   ngx_conf_merge_str_value(conf->bypass_vary, prev->bypass_vary, "");
+  ngx_conf_merge_value(conf->dcb_assume_secure, prev->dcb_assume_secure, 0);
 
   /* a location declaring its own brotli_dcb_dict_file list replaces the
      inherited one wholesale (standard nginx array-directive semantics) */
@@ -1156,67 +1565,51 @@ static char* ngx_http_brotli_merge_conf(ngx_conf_t* cf, void* parent,
     return NGX_CONF_ERROR;
   }
 
-  /* Whether a response here is br or identity depends on the request's
-     Accept-Encoding; without Vary: Accept-Encoding a shared cache can
-     hand the compressed variant to a client that cannot decode it.
-     nginx only emits that header when the core gzip_vary is on, so warn
-     per merged location — the same check the zstd sibling modules ship,
-     which has caught real stale "gzip_vary off" workarounds in configs
-     predating correct Vary handling in caches. When the
-     compression_vary filter module is loaded — it emits the header
-     from r->gzip_vary without needing "gzip_vary on" — the
-     per-location warning is withheld and counted instead; presence
-     alone cannot prove it is enabled here (see
-     ngx_http_brotli_vary_handled_externally()), so postconfiguration
-     reports one summary warning. */
-  if (conf->enable) {
-    ngx_http_core_loc_conf_t* clcf =
-        ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-    if (clcf != NULL && !clcf->gzip_vary) {
-      if (ngx_http_brotli_vary_handled_externally(cf)) {
-        ngx_http_brotli_main_conf_t* bmcf = ngx_http_conf_get_module_main_conf(
-            cf, ngx_http_brotli_filter_module);
-        if (bmcf != NULL) {
-          bmcf->vary_warn_suppressed++;
-        }
-      } else {
-        ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                           "brotli is enabled but \"gzip_vary\" is off; add "
-                           "\"gzip_vary on\" to emit \"Vary: Accept-Encoding\" "
-                           "so proxies and CDNs cache compressed and "
-                           "uncompressed responses separately");
-      }
-    }
-  }
+  /* No gzip_vary-off warning here anymore (parent #163): the header
+     filter emits "Vary: Accept-Encoding" itself on every
+     Accept-Encoding-dependent response (see
+     ngx_http_brotli_vary_accept_encoding()), so correctness no longer
+     depends on the operator setting "gzip_vary on", and warning about a
+     directive that no longer changes whether the header appears would be
+     actively misleading. */
 
   return NGX_CONF_OK;
 }
 
-/* Prepend to filter chain. */
+/* "brotli on|off" (zstd siblings' #182): the stock flag slot plus a
+   parse-time latch of the cycle-global any_enabled bit, so
+   ngx_http_brotli_filter_init() can skip installing the filter hooks
+   when the module is off in every location. ngx_conf_set_flag_slot()
+   accepts exactly "on" and "off", so by the time this runs value[1] is
+   one of the two; only the literal "off" leaves the bit clear. */
+static char* ngx_http_brotli_set_enable_slot(ngx_conf_t* cf,
+                                             ngx_command_t* cmd, void* conf) {
+  ngx_str_t* value;
+  char* rc;
+  ngx_http_brotli_main_conf_t* bmcf;
+
+  rc = ngx_conf_set_flag_slot(cf, cmd, conf);
+  if (rc != NGX_CONF_OK) return rc;
+
+  value = cf->args->elts;
+  if (value[1].len == 3 && ngx_strncmp(value[1].data, "off", 3) == 0) {
+    return NGX_CONF_OK;
+  }
+
+  bmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_brotli_filter_module);
+  bmcf->any_enabled = 1;
+
+  return NGX_CONF_OK;
+}
+
+/* Prepend to filter chain -- unless "brotli" is off everywhere, in which
+   case a build that carries the module pays no per-response NULL-ctx
+   pass through it (see any_enabled). */
 static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf) {
   ngx_http_brotli_main_conf_t* bmcf;
 
-  /* The per-location gzip_vary-off warnings withheld in merge_conf,
-     folded into one line. Still a warning rather than silence:
-     "compression_vary" defaults to off in that module, so its presence
-     does not prove the Vary header is actually emitted for these
-     locations — and one module cannot read another's merged
-     configuration to check (private conf struct; merge order between
-     unrelated modules is unspecified). Postconfiguration runs after
-     every merge, so the count is final. */
-  bmcf =
-      ngx_http_conf_get_module_main_conf(cf, ngx_http_brotli_filter_module);
-  if (bmcf != NULL && bmcf->vary_warn_suppressed) {
-    ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
-                       "brotli is enabled with \"gzip_vary\" off in %ui "
-                       "location(s); the per-location warnings are "
-                       "suppressed because "
-                       "ngx_http_compression_vary_filter_module is loaded, "
-                       "but its \"compression_vary\" directive defaults to "
-                       "off; verify \"compression_vary on\" covers those "
-                       "locations so \"Vary: Accept-Encoding\" is emitted",
-                       bmcf->vary_warn_suppressed);
-  }
+  bmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_brotli_filter_module);
+  if (bmcf == NULL || !bmcf->any_enabled) return NGX_OK;
 
   ngx_http_next_header_filter = ngx_http_top_header_filter;
   ngx_http_top_header_filter = ngx_http_brotli_header_filter;
@@ -1226,6 +1619,389 @@ static ngx_int_t ngx_http_brotli_filter_init(ngx_conf_t* cf) {
 
   return NGX_OK;
 }
+
+/* Read exactly `size` bytes of a dictionary into `buf`, looping until the
+   request is satisfied. Mirrors the sibling nginx-zstd-module's #195:
+   ngx_read_fd() is read(2) on POSIX, which may return a SHORT count on a
+   regular file — a signal interrupting the read after a partial transfer,
+   or a sufficiently large read — so a single read is not enough and the
+   caller would reject a valid dictionary as an incomplete read. Retry
+   EINTR, resume on a short count, and stop early only on a hard error
+   (returns -1) or an unexpected EOF (returns the partial total < size).
+   The caller's existing n < 0 / n != size handling is unchanged.
+
+   The EINTR retry is #if !(NGX_WIN32): win32's ngx_errno.h defines no
+   NGX_EINTR (ReadFile on a synchronous handle is not interruptible), so
+   guarding on the platform states the reason and keeps the MSVC build
+   compiling. */
+static ssize_t ngx_http_brotli_read_dict_file(ngx_fd_t fd, u_char* buf,
+                                              size_t size) {
+  ssize_t n;
+  size_t done;
+
+  for (done = 0; done < size; /* void */) {
+    n = ngx_read_fd(fd, buf + done, size - done);
+
+    if (n < 0) {
+#if !(NGX_WIN32)
+      if (ngx_errno == NGX_EINTR) {
+        continue;
+      }
+#endif
+      return -1;
+    }
+
+    if (n == 0) {
+      break;  /* EOF before `size`: return the partial */
+    }
+
+    done += (size_t)n;
+  }
+
+  return (ssize_t)done;
+}
+
+#if !(NGX_WIN32)
+#include <fcntl.h> /* openat(), O_DIRECTORY, O_NOFOLLOW, AT_FDCWD */
+/* AT_FDCWD is the portable signal that the POSIX.1-2008 *at() family is
+   available (zstd sibling #199). Where it is absent strict mode has no
+   way to resolve a path component-by-component, and it fails CLOSED at
+   config load rather than degrading to a leaf-only guarantee. */
+#ifdef AT_FDCWD
+#define NGX_HTTP_BROTLI_HAVE_STRICT_WALK 1
+#else
+#define NGX_HTTP_BROTLI_HAVE_STRICT_WALK 0
+#endif
+#else
+#define NGX_HTTP_BROTLI_HAVE_STRICT_WALK 0
+#endif
+
+#if (NGX_HTTP_BROTLI_HAVE_STRICT_WALK) && (NGX_HTTP_BROTLI_HAVE_DCB)
+
+/* Strict-mode component-by-component open (zstd sibling #199, M3).
+
+   O_NOFOLLOW on a whole-path open guards ONLY the leaf: the kernel
+   resolves every intermediate component normally, so a symlinked
+   directory in the path -- the classic current -> releases/7 deploy
+   layout -- is followed silently and strict mode selects whatever
+   bytes the symlink's owner points it at. Walking the path with
+   openat(O_NOFOLLOW|O_DIRECTORY) one component at a time makes an
+   intermediate symlink fail the walk (ELOOP) instead of being
+   traversed, and the leaf is opened relative to the verified parent
+   fd -- symlink-free end to end and TOCTOU-safe against a component
+   swap racing the walk. Every directory fd the walk opens (the root
+   included) is also vetted for ownership and mode before it is trusted
+   as the base of the next openat() (zstd sibling #316): an ancestor a
+   local user owns, or can write into, lets that user rename() a
+   root-owned 0644 file into the leaf position and pass both leaf
+   checks while steering what strict mode loads.
+
+   Absolute paths only: the directive handler has already run the path
+   through ngx_conf_full_name(). Returns the leaf fd, or
+   NGX_INVALID_FILE having logged the reason. */
+/* fstat() one directory fd opened during the strict walk and refuse it
+   under the rule the leaf checks apply (zstd sibling #316, A33-F2):
+   owned by neither root nor the loading principal, or writable by
+   group or other. No sticky-bit exemption: a sticky world-writable
+   ancestor (a /tmp-style directory) still lets an unprivileged user
+   create the next path component, exactly the steering this refuses.
+   `label` names the component for the diagnostic ("/" for the root
+   fd, the component bytes otherwise). */
+static ngx_int_t ngx_http_brotli_check_strict_dir(ngx_conf_t* cf, int fd,
+                                                  const char* label,
+                                                  ngx_str_t* path) {
+  struct stat st;
+
+  if (fstat(fd, &st) < 0) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                       "fstat(\"%s\") failed while resolving \"%V\" under "
+                       "\"brotli_dcb_dict_strict_path on\"",
+                       label, path);
+    return NGX_ERROR;
+  }
+
+  if (st.st_uid != 0 && st.st_uid != geteuid()) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "directory component \"%s\" of \"%V\" is owned by "
+                       "uid %uD, neither root nor the loading principal "
+                       "(uid %uD); refused by "
+                       "\"brotli_dcb_dict_strict_path on\": that owner can "
+                       "rename a different file into this directory and "
+                       "steer what a later privileged reload loads",
+                       label, path, (uint32_t)st.st_uid, (uint32_t)geteuid());
+    return NGX_ERROR;
+  }
+
+  if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "directory component \"%s\" of \"%V\" is writable "
+                       "by group or other (no sticky-bit exemption: a "
+                       "sticky world-writable directory still lets an "
+                       "unprivileged user create the next component); "
+                       "refused by \"brotli_dcb_dict_strict_path on\"",
+                       label, path);
+    return NGX_ERROR;
+  }
+
+  return NGX_OK;
+}
+
+static ngx_fd_t ngx_http_brotli_open_dict_strict(ngx_conf_t* cf,
+                                                 ngx_str_t* path, int flags) {
+  u_char* p;
+  u_char* start;
+  u_char* end;
+  int fd, next, oflags;
+
+  if (path->len == 0 || path->data[0] != '/') {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "\"%V\" is not an absolute path; refused by "
+                       "\"brotli_dcb_dict_strict_path on\", which resolves "
+                       "the path one component at a time and cannot verify "
+                       "a relative prefix",
+                       path);
+    return NGX_INVALID_FILE;
+  }
+
+  fd = open("/", O_RDONLY | O_DIRECTORY
+#ifdef O_CLOEXEC
+                     | O_CLOEXEC
+#endif
+  );
+  if (fd < 0) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                       "open(\"/\") failed while resolving \"%V\" under "
+                       "\"brotli_dcb_dict_strict_path on\"",
+                       path);
+    return NGX_INVALID_FILE;
+  }
+
+  /* The root fd is a walked component like any other: vet it before it
+     is trusted as the base of every openat() below. On most systems "/"
+     is root-owned 0755 and this is a no-op; a container or chroot base
+     that fails it is exactly the layout strict mode is meant to refuse. */
+  if (ngx_http_brotli_check_strict_dir(cf, fd, "/", path) != NGX_OK) {
+    ngx_close_file(fd);
+    return NGX_INVALID_FILE;
+  }
+
+  start = path->data + 1;
+  end = path->data + path->len;
+
+  for (;;) {
+    /* Skip any run of separators; a trailing one means no leaf. */
+    while (start < end && *start == '/') {
+      start++;
+    }
+
+    if (start >= end) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                         "\"%V\" names a directory, not a dictionary file; "
+                         "refused by \"brotli_dcb_dict_strict_path on\"",
+                         path);
+      ngx_close_file(fd);
+      return NGX_INVALID_FILE;
+    }
+
+    for (p = start; p < end && *p != '/'; p++) { /* void */
+    }
+
+    /* openat() needs a NUL-terminated component. The component is
+       COPIED into a local buffer rather than NUL-terminated in place:
+       path->data is nginx's own config string, and writing into it --
+       even a byte restored immediately afterwards -- would mutate
+       shared config memory other directives and the error log still
+       read. A component longer than the buffer cannot name a file any
+       filesystem will accept, so it is refused rather than silently
+       truncated (truncation would open a DIFFERENT name). */
+    {
+      u_char comp[NGX_MAX_PATH];
+      size_t complen = (size_t)(p - start);
+      int last;
+      u_char* q;
+
+      if (complen >= sizeof(comp)) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"%V\" has a path component longer than %uz "
+                           "bytes; refused by "
+                           "\"brotli_dcb_dict_strict_path on\"",
+                           path, sizeof(comp) - 1);
+        ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+      }
+
+      ngx_memcpy(comp, start, complen);
+      comp[complen] = '\0';
+
+      last = 1;
+      for (q = p; q < end; q++) {
+        if (*q != '/') {
+          last = 0;
+          break;
+        }
+      }
+
+      /* "." and ".." are refused rather than resolved: ".." would
+         climb back above a component already verified, which makes
+         the walk's guarantee unstatable, and neither has a legitimate
+         place in a deployed dictionary path. */
+      if (ngx_strcmp(comp, ".") == 0 || ngx_strcmp(comp, "..") == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"%V\" contains a \".\" or \"..\" component; "
+                           "refused by \"brotli_dcb_dict_strict_path on\"",
+                           path);
+        ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+      }
+
+      /* O_CLOEXEC is applied to BOTH arms deliberately: folding it
+         into the ternary via a bare "#ifdef ... | O_CLOEXEC" would
+         bind it to the else-branch alone by C's precedence rules,
+         silently leaving the leaf fd inheritable across an exec. */
+      oflags = last ? (flags | O_NOFOLLOW)
+                    : (O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+#ifdef O_CLOEXEC
+      oflags |= O_CLOEXEC;
+#endif
+
+      next = openat(fd, (char*)comp, oflags);
+
+      if (next < 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           "openat(\"%s\") failed while resolving \"%V\" "
+                           "under \"brotli_dcb_dict_strict_path on\" (a "
+                           "symlink at any component is refused, not "
+                           "followed; a release-symlink deployment needs "
+                           "\"brotli_dcb_dict_strict_path off;\", the "
+                           "default)",
+                           comp, path);
+        ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+      }
+
+      ngx_close_file(fd);
+      fd = next;
+
+      if (last) {
+        return fd;
+      }
+
+      /* A directory fd that will be trusted as the base for the next
+         openat(): vet it before it is used for anything else, same rule
+         as the root fd above. */
+      if (ngx_http_brotli_check_strict_dir(cf, fd, (char*)comp, path) !=
+          NGX_OK) {
+        ngx_close_file(fd);
+        return NGX_INVALID_FILE;
+      }
+
+      start = p;
+    }
+  }
+}
+
+#endif /* NGX_HTTP_BROTLI_HAVE_STRICT_WALK && NGX_HTTP_BROTLI_HAVE_DCB */
+
+static void* ngx_http_brotli_create_main_conf(ngx_conf_t* cf) {
+  ngx_http_brotli_main_conf_t* bmcf;
+
+  bmcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_brotli_main_conf_t));
+  if (bmcf == NULL) {
+    return NULL;
+  }
+
+  /* pcalloc zeroes the ordering records and the hashed counter;
+     cycle-owned, no reset hook. */
+  bmcf->dict_strict_path = NGX_CONF_UNSET;
+  bmcf->dcb_dict_trust_hashes = NGX_CONF_UNSET;
+
+  return bmcf;
+}
+
+static char* ngx_http_brotli_init_main_conf(ngx_conf_t* cf, void* conf) {
+  ngx_http_brotli_main_conf_t* bmcf = conf;
+
+  ngx_conf_init_value(bmcf->dict_strict_path, 0); /* off by default */
+
+  /* Reject the ordering rather than silently accept an unchecked load
+     (zstd siblings' shape): the loader records the first dictionary
+     that loaded while dict_strict_path did not yet read as the
+     explicit "on". If the flag's FINAL value is "on", that load ran
+     without the walk, the ownership check, or the writable-target
+     check -- fail the config rather than start with a dictionary the
+     operator asked to have vetted but that never was. */
+  if (bmcf->dict_strict_path == 1 && bmcf->dict_loaded_before_strict_on) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "\"brotli_dcb_dict_strict_path on\" was declared "
+                       "AFTER \"brotli_dcb_dict_file %V\", which had "
+                       "already loaded unchecked by that point. nginx "
+                       "directives are order-independent by convention, "
+                       "but this one is not: move "
+                       "\"brotli_dcb_dict_strict_path on;\" before every "
+                       "\"brotli_dcb_dict_file\" directive it must apply "
+                       "to",
+                       &bmcf->dict_loaded_before_strict_on_file);
+    return NGX_CONF_ERROR;
+  }
+
+  ngx_conf_init_value(bmcf->dcb_dict_trust_hashes, 0); /* verify default */
+
+  /* Same ordering rejection with the opposite polarity: a literal
+     that loaded before a later "trust on" was VERIFIED -- correct
+     bytes, but the hashing pass the directive exists to skip was
+     silently paid, which at hundreds of dictionaries is the entire
+     cost. Reject rather than be quietly position-dependent. */
+  if (bmcf->dcb_dict_trust_hashes == 1 &&
+      bmcf->dcb_dict_verified_before_trust_on) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "\"brotli_dcb_dict_trust_hashes on\" was declared "
+                       "AFTER \"brotli_dcb_dict_file %V\", whose hash "
+                       "literal had already been verified (hashed) by "
+                       "that point. nginx directives are "
+                       "order-independent by convention, but this one is "
+                       "not: move \"brotli_dcb_dict_trust_hashes on;\" "
+                       "before every \"brotli_dcb_dict_file\" directive "
+                       "it must apply to",
+                       &bmcf->dcb_dict_verified_before_trust_on_file);
+    return NGX_CONF_ERROR;
+  }
+
+  return NGX_CONF_OK;
+}
+
+#if (NGX_HTTP_BROTLI_HAVE_DCB) && (NGX_HTTP_BROTLI_HAVE_LIBCRYPTO)
+
+static void ngx_http_brotli_cleanup_evp_md_ctx(void* data) {
+  EVP_MD_CTX_free(data);
+}
+
+/* Lazy, one-per-config-load EVP context (the zstd sibling's #262):
+   created on the first computed hash, freed with cf->pool when parsing
+   ends. Any failure leaves the pointer NULL and every hash takes the
+   portable path -- attempted is what keeps a failed creation from
+   being retried per dictionary. */
+static void ngx_http_brotli_init_evp_md_ctx(
+    ngx_conf_t* cf, ngx_http_brotli_main_conf_t* bmcf) {
+  ngx_pool_cleanup_t* cln;
+
+  bmcf->dcb_evp_md_ctx_attempted = 1;
+  bmcf->dcb_evp_md_ctx = EVP_MD_CTX_new();
+  if (bmcf->dcb_evp_md_ctx == NULL) {
+    return;
+  }
+
+  cln = ngx_pool_cleanup_add(cf->pool, 0);
+  if (cln == NULL) {
+    EVP_MD_CTX_free(bmcf->dcb_evp_md_ctx);
+    bmcf->dcb_evp_md_ctx = NULL;
+    return;
+  }
+
+  cln->handler = ngx_http_brotli_cleanup_evp_md_ctx;
+  cln->data = bmcf->dcb_evp_md_ctx;
+}
+
+#endif
 
 /* brotli_dcb_dict_file <path> — load one RFC 9842 dictionary. The file
    is read and hashed here at config parse (nginx -t validates it), into
@@ -1255,6 +2031,8 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
   u_char hash[NGX_HTTP_BROTLI_SHA256_DIGEST_LEN];
   ngx_http_brotli_dcb_dict_t* dict;
   ngx_http_brotli_dcb_dict_t* dicts;
+  ngx_http_brotli_main_conf_t* bmcf;
+  ngx_flag_t trust;
 
   (void)cmd;
 
@@ -1265,23 +2043,26 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     return NGX_CONF_ERROR;
   }
 
-  /* Optional second argument: the dictionary's SHA-256 as 64 hex chars,
-     trusted VERBATIM in place of hashing the file here — the win is
-     skipping a full read-and-hash pass per dictionary at every config
-     parse (nginx -t, every reload), which dominates parse time at
-     hundreds of registered dictionaries. The deploy tooling that
+  /* Optional second argument: the dictionary's SHA-256 as 64 hex
+     chars. By default it is VERIFIED against the bytes read below
+     (zstd sibling #198): a declaration of what the operator believes
+     the file to be, whose mismatch fails the load -- the deploy-time
+     guard for a pipeline whose config generation and file placement
+     are decoupled. Under "brotli_dcb_dict_trust_hashes on" (sibling
+     #220) the literal is trusted verbatim as the negotiation key and
+     the hashing pass is skipped -- the config-load cost at scale is
+     the SHA-256 itself, not the read, and the deploy tooling that
      generates the directive list has typically just computed these
-     hashes anyway (deduplication). The trade, and why the argument is
-     opt-in: with a self-computed hash a file that changes on disk after
-     clients stored it simply stops matching (safe fallback to plain
-     br); a stale supplied hash instead keeps matching, and the
-     responses may fail to decode or silently decode to WRONG content
-     (a same-size stale raw dictionary yields wrong bytes — the dcb
-     stream carries no content checksum). The generator owns hash
-     correctness — content-hashed immutable assets are the intended use.
+     hashes anyway. The trade the opt-in states: a stale supplied hash
+     keeps matching, and the responses may fail to decode or silently
+     decode to WRONG content (a same-size stale raw dictionary yields
+     wrong bytes -- the dcb stream carries no content checksum). The
+     generator owns hash correctness; content-hashed immutable assets
+     are the intended use.
 
      Validated before the file is opened so a malformed literal is
-     reported as such, not shadowed by file errors. */
+     reported as such, not shadowed by file errors -- under either
+     policy. */
   have_hash = (cf->args->nelts == 3);
 
   if (have_hash) {
@@ -1328,11 +2109,72 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     }
   }
 
-  fd = ngx_open_file(path.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
-  if (fd == NGX_INVALID_FILE) {
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
-                       ngx_open_file_n " \"%V\" failed", &path);
+  bmcf =
+      ngx_http_conf_get_module_main_conf(cf, ngx_http_brotli_filter_module);
+
+  /* This load is about to run under whatever dict_strict_path reads
+     RIGHT NOW; if that is anything but the explicit "on", the strict
+     checks below are skipped -- record it so init_main_conf can
+     reject the config if a later "brotli_dcb_dict_strict_path on;"
+     was meant to cover this load. */
+  if (bmcf->dict_strict_path != 1 && !bmcf->dict_loaded_before_strict_on) {
+    bmcf->dict_loaded_before_strict_on = 1;
+    bmcf->dict_loaded_before_strict_on_file = path;
+  }
+
+  /* Same raw-read reasoning for the trust flag: a later
+     "brotli_dcb_dict_trust_hashes on;" has not been parsed yet, so a
+     literal verified here silently pays the pass the operator asked
+     to skip. Record; init_main_conf rejects the ordering if the final
+     value is "on". Only literal-carrying lines are affected. */
+  trust = (bmcf->dcb_dict_trust_hashes == 1);
+
+  if (have_hash && !trust && !bmcf->dcb_dict_verified_before_trust_on) {
+    bmcf->dcb_dict_verified_before_trust_on = 1;
+    bmcf->dcb_dict_verified_before_trust_on_file = path;
+  }
+
+  /* O_NONBLOCK always (zstd sibling #165): a FIFO at the dictionary
+     path would otherwise block the config-parsing master in open()
+     until a writer appeared -- nginx -t or a reload would just hang.
+     Win32's NGX_FILE_NONBLOCK is 0, a no-op. Under strict mode the
+     path is resolved one component at a time instead (sibling #199);
+     a strict refusal is a trust decision, so it is always fatal. */
+  if (bmcf->dict_strict_path == 1) {
+
+#if (NGX_HTTP_BROTLI_HAVE_STRICT_WALK)
+    fd = ngx_http_brotli_open_dict_strict(cf, &path,
+                                          O_RDONLY | NGX_FILE_NONBLOCK);
+    if (fd == NGX_INVALID_FILE) {
+      /* the walk has already logged the precise component */
+      return NGX_CONF_ERROR;
+    }
+#else
+    /* Fail CLOSED (sibling #199): without openat() strict mode can
+       only offer a leaf-only O_NOFOLLOW guarantee, which an
+       intermediate symlink defeats -- accepting the config here would
+       let the directive claim a protection the platform cannot
+       deliver. */
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "\"brotli_dcb_dict_strict_path on\" is not "
+                       "supported on this platform (no openat(); the "
+                       "path cannot be resolved one component at a "
+                       "time, so an intermediate symlink could not be "
+                       "refused). Refusing \"%V\" rather than loading "
+                       "it with a weaker guarantee than the directive "
+                       "states",
+                       &path);
     return NGX_CONF_ERROR;
+#endif
+
+  } else {
+    fd = ngx_open_file(path.data, NGX_FILE_RDONLY | NGX_FILE_NONBLOCK,
+                       NGX_FILE_OPEN, 0);
+    if (fd == NGX_INVALID_FILE) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                         ngx_open_file_n " \"%V\" failed", &path);
+      return NGX_CONF_ERROR;
+    }
   }
 
   if (ngx_fd_info(fd, &info) == NGX_FILE_ERROR) {
@@ -1341,19 +2183,80 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     goto failed;
   }
 
+  /* A non-regular target is rejected UNCONDITIONALLY (zstd sibling
+     #165): a FIFO/socket/directory/device was never a valid
+     dictionary, and the old behaviour against one always eventually
+     errored or hung. ngx_is_file() checks S_ISREG. */
+  if (!ngx_is_file(&info)) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "dcb dictionary \"%V\" is not a regular file", &path);
+    goto failed;
+  }
+
+#if !(NGX_WIN32)
+  /* Ownership, not just the mode bits (zstd sibling #199, M4): a
+     dictionary owned by an unprivileged account at an ordinary 0644
+     passes a group/other-writability test while a root master reads
+     it -- and that owner can rewrite the file ahead of any privileged
+     reload. Strict mode requires the loading principal's euid or
+     root. */
+  if (bmcf->dict_strict_path == 1 && info.st_uid != geteuid() &&
+      info.st_uid != 0) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "dcb dictionary \"%V\" is owned by uid %uD, neither "
+                       "the loading principal (uid %uD) nor root; refused "
+                       "by \"brotli_dcb_dict_strict_path on\", because "
+                       "that owner can rewrite the file and steer what a "
+                       "later privileged reload loads",
+                       &path, (uint32_t)info.st_uid, (uint32_t)geteuid());
+    goto failed;
+  }
+
+  /* Strict trust (zstd sibling #165): reject a dictionary writable by
+     group or other -- a lower-privileged local writer must not be
+     able to swap bytes into every worker on the next reload. Opt-in,
+     since a release-managed deployment may legitimately ship such
+     permissions. */
+  if (bmcf->dict_strict_path == 1 &&
+      (ngx_file_access(&info) & (S_IWGRP | S_IWOTH))) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "dcb dictionary \"%V\" is writable by group or "
+                       "other and \"brotli_dcb_dict_strict_path\" is on",
+                       &path);
+    goto failed;
+  }
+
+  /* The FIFO-hang risk was only in open(); the file is now confirmed
+     regular, so clear O_NONBLOCK before the read loop below -- a
+     non-blocking regular-file read can return SHORT on some
+     filesystems (observed on a 9p/drvfs mount), which the loader
+     would then reject as an incomplete read. */
+  {
+    int fl = fcntl(fd, F_GETFL);
+
+    if (fl != -1) {
+      (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+  }
+#endif
+
+  /* off_t bound BEFORE the size_t narrowing (zstd siblings' round-4
+     R3-9 twin): on ILP32 a 4 GiB file assigned to size_t loads as its
+     low 32 bits, sails under the limit, hashes clean, and serves. */
+  if (ngx_file_size(&info) > (off_t)NGX_HTTP_BROTLI_MAX_DICT_SIZE) {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "dcb dictionary \"%V\" too large: %O bytes "
+                       "(limit: %d bytes)",
+                       &path, ngx_file_size(&info),
+                       NGX_HTTP_BROTLI_MAX_DICT_SIZE);
+    goto failed;
+  }
+
   size = ngx_file_size(&info);
 
   if (size == 0) {
     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "dcb dictionary \"%V\" is empty",
                        &path);
-    goto failed;
-  }
-
-  if (size > NGX_HTTP_BROTLI_MAX_DICT_SIZE) {
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                       "dcb dictionary \"%V\" too large: %uz bytes "
-                       "(limit: %d bytes)",
-                       &path, size, NGX_HTTP_BROTLI_MAX_DICT_SIZE);
     goto failed;
   }
 
@@ -1369,7 +2272,7 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     goto failed;
   }
 
-  n = ngx_read_fd(fd, (void*)dict->bytes.data, size);
+  n = ngx_http_brotli_read_dict_file(fd, dict->bytes.data, size);
   if (n < 0) {
     ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
                        ngx_read_fd_n " \"%V\" failed", &path);
@@ -1386,17 +2289,50 @@ static char* ngx_http_brotli_dcb_dict_file(ngx_conf_t* cf, ngx_command_t* cmd,
     return NGX_CONF_ERROR;
   }
 
-  if (have_hash) {
+  if (have_hash && trust) {
+    /* Trusted verbatim: the literal IS the negotiation key, the
+       hashing pass -- including its $brotli_dcb_dicts_hashed
+       increment, which is what makes the skip observable -- does not
+       run for this line. */
     ngx_memcpy(dict->hash, hash, NGX_HTTP_BROTLI_SHA256_DIGEST_LEN);
+
   } else {
-    ngx_http_brotli_sha256(dict->bytes.data, size, dict->hash);
+#if (NGX_HTTP_BROTLI_HAVE_DCB) && (NGX_HTTP_BROTLI_HAVE_LIBCRYPTO)
+    if (!bmcf->dcb_evp_md_ctx_attempted) {
+      ngx_http_brotli_init_evp_md_ctx(cf, bmcf);
+    }
+#endif
+    ngx_http_brotli_sha256(dict->bytes.data, size, dict->hash,
+                           bmcf->dcb_evp_md_ctx);
+    bmcf->dcb_dicts_hashed++;
+
+    if (have_hash &&
+        ngx_memcmp(hash, dict->hash, NGX_HTTP_BROTLI_SHA256_DIGEST_LEN) !=
+            0) {
+      u_char hex[2 * NGX_HTTP_BROTLI_SHA256_DIGEST_LEN];
+      ngx_str_t hexstr;
+
+      hexstr.data = hex;
+      hexstr.len =
+          ngx_hex_dump(hex, dict->hash, NGX_HTTP_BROTLI_SHA256_DIGEST_LEN) -
+          hex;
+
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                         "dcb dictionary \"%V\" does not match the supplied "
+                         "hash \"%V\": the file's SHA-256 is \"%V\" (use "
+                         "\"brotli_dcb_dict_trust_hashes on\" only if your "
+                         "deploy pipeline owns hash correctness)",
+                         &path, &value[2], &hexstr);
+      return NGX_CONF_ERROR;
+    }
   }
 
   /* Two entries with the same hash make the negotiation lookup
-     ambiguous (for computed hashes that means identical content under
-     two paths — almost certainly a copy meant to be a new version;
-     supplied hashes are compared as declared). Fail loudly at load
-     rather than silently matching the first. */
+     ambiguous (for computed or verified hashes that means identical
+     content under two paths — almost certainly a copy meant to be a
+     new version; under trust_hashes a literal is compared as declared,
+     which also catches one literal pasted onto two lines). Fail loudly
+     at load rather than silently matching the first. */
   dicts = blcf->dcb_dicts->elts;
 
   for (i = 0; i + 1 < blcf->dcb_dicts->nelts; i++) {

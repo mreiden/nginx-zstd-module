@@ -1,13 +1,19 @@
 name: Build & Test
 
 # Third-party actions are pinned to commit SHAs for supply-chain safety.
-# actions/checkout@v5 -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
-# actions/cache@v4    -> 0057852bfaa89a56745cba8c7296529d2fc39830
+# actions/checkout@v5.1.0 -> fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+# actions/cache@v5.1.0    -> caa296126883cff596d87d8935842f9db880ef25
 
 env:
   # Resolved at run time by the `resolve` job; nginx.org only keeps the
   # newest mainline tarball, so a hardcoded version eventually 404s.
   NGINX_VERSION: ""
+  # Single source of truth for both cpanm sites below (the zstd
+  # sibling's #214): an unpinned `cpanm Test::Nginx::Socket` resolves
+  # to whatever CPAN serves at run time, so a cold runner can silently
+  # change test behaviour with no repository diff. 0.32 is what every
+  # site already resolved to — a reproducibility pin, not a bump.
+  TEST_NGINX_SOCKET_VERSION: "0.32"
 
 on:
   push:
@@ -59,7 +65,9 @@ jobs:
       NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
     steps:
       - name: Checkout module (no submodule — system mode must not need it)
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -70,10 +78,7 @@ jobs:
 
       - name: Build against PGP-verified nginx
         run: |
-          # WITH_CVARY_STUB additionally builds the do-nothing dynamic
-          # module that claims the compression_vary module's name, for
-          # the suppression witness below.
-          WITH_CVARY_STUB=1 bash tools/ci-build.sh system "$NGINX_VERSION"
+          bash tools/ci-build.sh system "$NGINX_VERSION"
           echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/.build/nginx-$NGINX_VERSION/objs/nginx" >> "$GITHUB_ENV"
           # This job is the accelerated-hash path: libcrypto must have
           # been detected, or dictionary hashing silently regressed to
@@ -82,26 +87,23 @@ jobs:
             ".build/nginx-$NGINX_VERSION/objs/ngx_auto_config.h"
           echo "✓ libcrypto EVP SHA-256 detected"
 
-      - name: Assert gzip_vary warning suppression witness (both directions)
-        # When a module named ngx_http_compression_vary_filter_module is
-        # loaded, the per-location gzip_vary-off warnings collapse into
-        # one summary warning per module — never full silence, because
-        # that module's compression_vary directive defaults to off and
-        # its effective value cannot be read from here (see
-        # ngx_http_brotli_common.h). The brotli modules are static in
-        # this build and the stub loads via load_module — the harder
-        # detection case — while the warn-direction control keeps the
-        # quiet-direction greps from passing vacuously if the warning
-        # text ever changes. The semantic contract against the REAL
-        # module (single Vary with compression_vary on, none with it
-        # off) is CI'd in the zstd sibling repo's cvary-interop job.
+      - name: Assert clean config load with no gzip_vary anywhere
+        # Vary: Accept-Encoding is emitted by the modules by construction
+        # (parent #163): the header no longer depends on the operator's
+        # "gzip_vary" directive, the old gzip_vary-off warnings are gone,
+        # and the compression_vary stub machinery those warnings
+        # justified went with them. The config below has NO gzip_vary
+        # anywhere and must load with no gzip_vary advice of any kind.
+        # The runtime half — a Vary header on responses from a
+        # gzip_vary-free config — is pinned by t/00-brotli.t TEST 12a
+        # and the Vary checks in tools/test_dcb.py.
         run: |
           set -euo pipefail
           cd ".build/nginx-$NGINX_VERSION"
 
           mkdir -p wprefix/logs
-          cat > wprefix/warn.conf <<EOF
-          pid warn.pid;
+          cat > wprefix/novary.conf <<EOF
+          pid novary.pid;
           events {}
           http {
               server {
@@ -115,47 +117,15 @@ jobs:
           }
           EOF
 
-          # Identical config plus the stub that claims the
-          # compression_vary module's name.
-          { echo "load_module $PWD/objs/ngx_http_compression_vary_filter_module.so;"
-            cat wprefix/warn.conf; } > wprefix/quiet.conf
-
-          # Cardinality, not just presence: one location per module in
-          # the fixture means each expected line must appear EXACTLY
-          # once — a duplicate emission (e.g. postconfiguration running
-          # twice) is a bug grep -q would wave through.
-          expect_one() {
-            local n
-            n=$(echo "$out" | grep -cF "$1" || true)
-            if [ "$n" -ne 1 ]; then
-              echo "✗ expected exactly one \"$1\" line, got $n"
-              exit 1
-            fi
-          }
-
-          # Control direction: without the stub, each module must warn
-          # once for the single affected location.
-          out=$(objs/nginx -p "$PWD/wprefix" -c warn.conf -t 2>&1)
+          out=$(objs/nginx -p "$PWD/wprefix" -c novary.conf -t 2>&1)
           echo "$out"
           echo "$out" | grep -q 'test is successful'
-          expect_one 'brotli is enabled but "gzip_vary" is off'
-          expect_one 'brotli_static is enabled but "gzip_vary" is off'
-          echo "✓ both warnings fire exactly once without the stub"
-
-          # Witness direction: with the stub loaded, the per-location
-          # lines must vanish and each per-module summary must appear
-          # exactly once (the count in the message also mutation-checks
-          # the counters).
-          out=$(objs/nginx -p "$PWD/wprefix" -c quiet.conf -t 2>&1)
-          echo "$out"
-          echo "$out" | grep -q 'test is successful'
-          if echo "$out" | grep -q 'is enabled but "gzip_vary" is off'; then
-            echo "✗ per-location warning not suppressed with stub loaded"
+          if echo "$out" | grep -qi 'gzip_vary'; then
+            echo "✗ config load still mentions gzip_vary:"
+            echo "$out" | grep -i 'gzip_vary'
             exit 1
           fi
-          expect_one 'brotli is enabled with "gzip_vary" off in 1 location'
-          expect_one 'brotli_static is enabled with "gzip_vary" off in 1 location'
-          echo "✓ per-location warnings suppressed, one summary each"
+          echo "✓ loads clean with no gzip_vary anywhere in the config"
 
       - name: Roundtrip smoke test
         run: |
@@ -164,14 +134,21 @@ jobs:
           echo "✓ system-libbrotli roundtrip passed"
 
       - name: Cache Perl modules
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/perl5
-          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket
+          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket-${{ env.TEST_NGINX_SOCKET_VERSION }}
 
       - name: Install Test::Nginx::Socket
+        # The sibling's #214 + #249 shape: the version pin alone still
+        # trusts the CPAN index at run time, so the script also asserts
+        # the version->dist resolution and diffs the resolver's
+        # dependency graph against tools/test-nginx-socket.cpan.lock
+        # before installing. Drift fails loudly HERE, cache restore or
+        # fresh install alike, not as a confusing suite failure
+        # downstream.
         run: |
-          cpanm -l ~/perl5 --notest Test::Nginx::Socket
+          bash tools/install_test_nginx_socket.sh --local-lib ~/perl5
           echo "PERL5LIB=$HOME/perl5/lib/perl5" >> "$GITHUB_ENV"
 
       - name: Run regression suite
@@ -196,6 +173,92 @@ jobs:
             --nginx-binary "$TEST_NGINX_BINARY" --port 18190
           echo "✓ dcb wire-format test passed"
 
+      - name: Dictionary read-completeness unit test (short reads / EINTR / EOF)
+        run: bash tools/test_read_dict_file_unit.sh
+
+      - name: Ratio scaling unit oracle (overflow-safe $brotli_ratio)
+        run: bash tools/test_ratio_scaling_unit.sh
+
+      - name: max_length abort diagnostics contract (declared vs unknown length)
+        run: bash tools/test_max_length_diagnostics.sh
+
+  # ── ASan+UBSan over the chain-state paths ──────────────────────────────
+  # The zstd siblings' round-4 lesson, applied here: the filter's buffer
+  # and state-machine code never ran under a sanitizer, and their job's
+  # first run caught real UB (upstream-nginx's, but caught). Both suites
+  # and both wire tools run against the sanitized binary; everything is
+  # fatal, leak checking off (LSan's ptrace-dependent exit check is the
+  # flaky machinery the zstd repo wraps in verdict scripts). Both suites
+  # run at warn log level, so nginx core's debug-log UB sites (the
+  # nonnull family nginx PRs #1671/#1672 and #1679-#1682 address) never
+  # execute and no check class needs disabling.
+  build-asan:
+    name: ASan+UBSan (suites and wire tools)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: resolve
+    env:
+      NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
+      ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1"
+      UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+    steps:
+      - name: Checkout module (no submodule — system mode must not need it)
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config wget \
+            libpcre2-dev zlib1g-dev libbrotli-dev brotli python3 \
+            libperl-dev cpanminus
+
+      - name: Build against PGP-verified nginx (sanitized)
+        run: |
+          NGX_BROTLI_SANITIZE=1 bash tools/ci-build.sh system "$NGINX_VERSION"
+          echo "TEST_NGINX_BINARY=$GITHUB_WORKSPACE/.build/nginx-$NGINX_VERSION/objs/nginx" >> "$GITHUB_ENV"
+
+      - name: Cache Perl modules
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/perl5
+          key: perl-modules-${{ runner.os }}-Test-Nginx-Socket-${{ env.TEST_NGINX_SOCKET_VERSION }}
+
+      - name: Install Test::Nginx::Socket
+        # The sibling's #214 + #249 shape: the version pin alone still
+        # trusts the CPAN index at run time, so the script also asserts
+        # the version->dist resolution and diffs the resolver's
+        # dependency graph against tools/test-nginx-socket.cpan.lock
+        # before installing. Drift fails loudly HERE, cache restore or
+        # fresh install alike, not as a confusing suite failure
+        # downstream.
+        run: |
+          bash tools/install_test_nginx_socket.sh --local-lib ~/perl5
+          echo "PERL5LIB=$HOME/perl5/lib/perl5" >> "$GITHUB_ENV"
+
+      - name: Run regression suite (sanitized)
+        run: |
+          export TEST_NGINX_SERVROOT=/tmp/nginx-servroot-brotli-asan
+          mkdir -p "$TEST_NGINX_SERVROOT"
+          perl t/00-brotli.t
+
+      - name: Run dcb negotiation suite (sanitized)
+        run: |
+          export TEST_NGINX_SERVROOT=/tmp/nginx-servroot-dcb-asan
+          mkdir -p "$TEST_NGINX_SERVROOT"
+          perl t/01-dcb.t
+
+      - name: Roundtrip smoke test (sanitized)
+        run: |
+          python3 tools/test_encoding.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18280
+
+      - name: dcb wire-format test (sanitized)
+        run: |
+          python3 tools/test_dcb.py \
+            --nginx-binary "$TEST_NGINX_BINARY" --port 18290
+
   # ── Bundled fallback path: cmake-built submodule at the pinned tag ─────
   build-bundled:
     name: Build & smoke (bundled brotli v1.2.0)
@@ -206,8 +269,9 @@ jobs:
       NGINX_VERSION: ${{ needs.resolve.outputs.nginx_version }}
     steps:
       - name: Checkout module with submodule
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
           submodules: true
 
       # no libbrotli-dev on purpose — the fallback must build without it

@@ -222,9 +222,17 @@ ngx_http_brotli_sha256_final(ngx_http_brotli_sha256_t *c,
 
 
 /* One-shot convenience for the config-load call site. */
+/*
+ * The caller may pass a reusable EVP_MD_CTX (the zstd sibling's #262):
+ * EVP_Digest() allocates and frees a context internally per call, so a
+ * config load over many dictionaries pays a transient allocation each.
+ * NULL keeps the old behavior minus the acceleration: any missing
+ * context or failed EVP stage falls through to the portable
+ * implementation, keeping this a total function.
+ */
 static ngx_inline void
 ngx_http_brotli_sha256(const u_char *data, size_t len,
-    u_char digest[NGX_HTTP_BROTLI_SHA256_DIGEST_LEN])
+    u_char digest[NGX_HTTP_BROTLI_SHA256_DIGEST_LEN], void *evp_md_ctx)
 {
     ngx_http_brotli_sha256_t  c;
 
@@ -233,14 +241,18 @@ ngx_http_brotli_sha256(const u_char *data, size_t len,
 
     mdlen = NGX_HTTP_BROTLI_SHA256_DIGEST_LEN;
 
-    if (EVP_Digest(data, len, digest, &mdlen, EVP_sha256(), NULL) == 1
+    if (evp_md_ctx != NULL
+        && EVP_DigestInit_ex(evp_md_ctx, EVP_sha256(), NULL) == 1
+        && EVP_DigestUpdate(evp_md_ctx, data, len) == 1
+        && EVP_DigestFinal_ex(evp_md_ctx, digest, &mdlen) == 1
         && mdlen == NGX_HTTP_BROTLI_SHA256_DIGEST_LEN)
     {
         return;
     }
 
-    /* EVP_Digest() allocates a context internally and can fail under
-       memory pressure; fall through to the portable implementation. */
+    /* Fall through when the context is unavailable or a stage fails. */
+#else
+    (void) evp_md_ctx;
 #endif
 
     ngx_http_brotli_sha256_init(&c);

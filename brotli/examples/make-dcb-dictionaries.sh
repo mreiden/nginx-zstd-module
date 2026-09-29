@@ -64,14 +64,31 @@ for app in "${APPS[@]}"; do
         # content-hashed immutable release files and this script is the
         # single source of the config — if you edit dictionary files in
         # place, drop the argument and let the module hash them itself.
-        printf 'brotli_dcb_dict_file %s %s;\n' "$f" "$h" >> "$CONF.tmp"
+        printf 'brotli_dcb_dict_file "%s" %s;\n' "$f" "$h" >> "$CONF.tmp"
         # Serving dcz from the same dictionaries (nginx-zstd-module) —
         # clients pick one coding:
-        #printf 'zstd_dcz_dict_file %s %s;\n'   "$f" "$h" >> "$CONF.tmp"
+        #printf 'zstd_dcz_dict_file "%s" %s;\n'   "$f" "$h" >> "$CONF.tmp"
     done
 done
 
-# Finished. Move tmp config into place and reload nginx for it to take
-# effect.
+# Finished. VALIDATE before the tmp file becomes the live include
+# (CodeRabbit on the graft): with mv-then-test, a broken include is
+# already in place when nginx -t fails -- the running nginx keeps
+# serving from its loaded config, nobody notices, and the next reboot
+# or package-upgrade restart fails to start nginx days after the
+# deploy that caused it. Roll back on failure instead.
+if [ -f "$CONF" ]; then
+    cp -p "$CONF" "$CONF.bak"
+fi
 mv "$CONF.tmp" "$CONF"
-nginx -t && nginx -s reload
+if ! nginx -t; then
+    if [ -f "$CONF.bak" ]; then
+        mv "$CONF.bak" "$CONF"
+    else
+        : > "$CONF"
+    fi
+    echo "nginx -t failed; dictionary include rolled back" >&2
+    exit 1
+fi
+rm -f "$CONF.bak"
+nginx -s reload

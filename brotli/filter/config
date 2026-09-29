@@ -127,7 +127,7 @@ fi
 # detection entirely (used by CI to keep the portable path covered;
 # also the escape hatch if a build must not link libcrypto).
 if [ "${NGX_BROTLI_NO_LIBCRYPTO:-0}" != 1 ]; then
-    if [ "$USE_OPENSSL" = YES -a "$ngx_module_link" != DYNAMIC ]; then
+    if [ "${USE_OPENSSL:-NO}" = YES ] && [ "$ngx_module_link" != DYNAMIC ]; then
         # nginx itself links OpenSSL (--with-http_ssl_module et al), so
         # for a static addon libcrypto is already on the final link line
         # and its headers are in CORE_INCS. That covers
@@ -136,8 +136,39 @@ if [ "${NGX_BROTLI_NO_LIBCRYPTO:-0}" != 1 ]; then
         # probe CANNOT succeed — and it also means the module uses the
         # same OpenSSL nginx was built with, rather than probing
         # whatever the system ships. Nothing to add to ngx_module_libs.
-        have=NGX_HTTP_BROTLI_HAVE_LIBCRYPTO . auto/have
-        echo " + brotli dcb dictionary hashing uses nginx's OpenSSL"
+        # The headers are still PROBED before the macro is asserted
+        # (zstd siblings' #286): a clean, not-yet-built --with-openssl
+        # source tree has no generated headers yet, and blindly
+        # defining HAVE_LIBCRYPTO there broke the compile — a failed
+        # probe selects the portable SHA-256 instead.
+        ngx_feature="OpenSSL EVP SHA-256 headers"
+        ngx_feature_name="NGX_HTTP_BROTLI_HAVE_LIBCRYPTO"
+        ngx_feature_run=no
+        ngx_feature_incs="#include <openssl/evp.h>"
+        ngx_feature_path="$CORE_INCS"
+        if [ -n "${OPENSSL:-}" ]; then
+            # A prepared --with-openssl source tree keeps its installed
+            # headers under .openssl/ (auto/lib/openssl/make) on Unix and
+            # under openssl/ (makefile.msvc's --prefix) on MSVC. Named
+            # explicitly because configure runs addon configs
+            # (auto/modules) BEFORE auto/lib/conf appends either directory
+            # to CORE_INCS, so at probe time CORE_INCS does not carry it
+            # yet -- on MSVC the probe could never succeed without this.
+            ngx_feature_path="$ngx_feature_path $OPENSSL/.openssl/include $OPENSSL/openssl/include"
+        fi
+        ngx_feature_test="unsigned char  md[EVP_MAX_MD_SIZE];
+                          unsigned int   n;
+                          (void) md;
+                          (void) n;
+                          (void) EVP_sha256"
+        ngx_feature_libs=
+        . auto/feature
+
+        if [ "$ngx_found" = yes ]; then
+            echo " + brotli dcb dictionary hashing uses nginx's OpenSSL"
+        else
+            echo " + brotli dcb dictionary hashing uses portable SHA-256"
+        fi
     else
         ngx_feature="OpenSSL EVP SHA-256 (libcrypto)"
         ngx_feature_name="NGX_HTTP_BROTLI_HAVE_LIBCRYPTO"
@@ -180,17 +211,39 @@ if [ "$ngx_module_link" != DYNAMIC ]; then
     # ngx_module_order doesn't work with static modules,
     # so we must re-order filters here.
 
-    if [ "$HTTP_GZIP" = YES ]; then
+    if [ "${HTTP_GZIP:-}" = YES ]; then
         next=ngx_http_gzip_filter_module
-    elif echo $HTTP_FILTER_MODULES | grep pagespeed_etag_filter >/dev/null; then
+    elif echo " $HTTP_FILTER_MODULES " | grep pagespeed_etag_filter >/dev/null; then
         next=ngx_pagespeed_etag_filter
     else
         next=ngx_http_range_header_filter_module
     fi
 
-    HTTP_FILTER_MODULES=`echo $HTTP_FILTER_MODULES \
-                         | sed "s/$ngx_module_name//" \
-                         | sed "s/$next/$next $ngx_module_name/"`
+    # Fail closed (zstd siblings' #286/#303): an absent anchor or a
+    # reorder that did not land stops the build instead of leaving this
+    # filter mis-ordered -- ahead of the transforming filters it must
+    # run after -- with no diagnostic.
+    if ! echo " $HTTP_FILTER_MODULES " | grep " $next " >/dev/null; then
+        echo "$0: error: cannot order $ngx_module_name before absent $next" >&2
+        exit 1
+    fi
+
+    # Token-exact (the compression config's hardened form,
+    # CodeRabbit on the graft): pad with spaces so a third-party filter
+    # whose name CONTAINS this module's name or $next as a substring
+    # is never silently mangled into a broken filter list.
+    HTTP_FILTER_MODULES=`echo " $HTTP_FILTER_MODULES " \
+                         | sed "s/ $ngx_module_name / /" \
+                         | sed "s/ $next / $next $ngx_module_name /" \
+                         | sed "s/^ *//;s/ *\$//"`
+
+    case " $HTTP_FILTER_MODULES " in
+        *" $next $ngx_module_name "*) ;;
+        *)
+            echo "$0: error: failed to order $ngx_module_name after $next" >&2
+            exit 1
+        ;;
+    esac
 fi
 
 # Branch on NGX_CC_NAME, not the historical NGX_MSVC_VER: nginx removed

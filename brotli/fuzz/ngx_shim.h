@@ -26,6 +26,9 @@ typedef intptr_t   ngx_int_t;
 typedef uintptr_t  ngx_uint_t;
 typedef unsigned char u_char;
 
+/* src/core/ngx_config.h: ngx_inline — plain `inline` everywhere but MSVC. */
+#define ngx_inline inline
+
 #define NGX_OK        0
 #define NGX_DECLINED -5
 

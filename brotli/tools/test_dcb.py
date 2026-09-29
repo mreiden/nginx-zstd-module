@@ -111,9 +111,9 @@ def build_fixtures(root: pathlib.Path, lines: int) -> tuple[bytes, bytes]:
     ).read_bytes()
 
 
-def fetch(port: int, headers: dict):
+def fetch(port: int, headers: dict, path: str = "/app.js"):
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/app.js", headers=headers
+        f"http://127.0.0.1:{port}{path}", headers=headers
     )
     with urllib.request.urlopen(request, timeout=10) as response:
         return response.headers, response.read()
@@ -176,14 +176,24 @@ http {{
     access_log off;
     types {{ application/javascript js; }}
     default_type application/octet-stream;
-    gzip_vary on;
     brotli on;
     brotli_min_length 64;
     brotli_types application/javascript;
     brotli_dcb_dict_file {root}/dicts/app-v1.js;
+    # This rig speaks cleartext http to localhost, which the secure-
+    # context gate refuses dcb over; the ack asserts the hop is one the
+    # operator vouches for. No gzip_vary anywhere: the Vary checks below
+    # witness by-construction emission.
+    brotli_dcb_assume_secure_transport on;
     server {{
         listen 127.0.0.1:{args.port};
         root html;
+        location = /gated.js {{
+            # ack withdrawn: the same dictionary request must fall back
+            # to plain br here (secure-context gate, cleartext hop)
+            brotli_dcb_assume_secure_transport off;
+            alias {root}/html/app.js;
+        }}
     }}
 }}
 """,
@@ -244,6 +254,22 @@ http {{
             check(
                 "dcb header embeds the dictionary SHA-256",
                 dcb_body[4:36] == dict_hash,
+            )
+
+            # -- secure-context gate: with the ack withdrawn, the same
+            #    dictionary request over this cleartext hop degrades to br
+            headers, _ = fetch(
+                args.port,
+                {
+                    "Accept-Encoding": "br, dcb",
+                    "Available-Dictionary": f":{dict_b64}:",
+                },
+                path="/gated.js",
+            )
+            check(
+                "gate refuses dcb over an unvouched cleartext hop",
+                content_encoding(headers) == "br",
+                f"(got {content_encoding(headers)})",
             )
 
             # decode: strip the 36-byte header, then brotli -d -D <dict>
@@ -318,12 +344,28 @@ http {{
                     },
                 ),
             ]
-            for name, case_headers in fallback_cases:
-                headers, _body = fetch(args.port, case_headers)
+            for index, (name, case_headers) in enumerate(fallback_cases):
+                headers, body = fetch(args.port, case_headers)
                 check(
                     f"fallback: {name} -> br",
                     content_encoding(headers) == "br",
                     f"(got {content_encoding(headers)})",
+                )
+                # the header alone is not the proof: a fallback path can
+                # label corrupt bytes "br". Decode every one, without a
+                # dictionary, and compare against the resource.
+                src = root / f"fallback-{index}.br"
+                src.write_bytes(body)
+                decoded = subprocess.run(
+                    [args.brotli_bin, "-d", "-c", str(src)],
+                    check=False,
+                    capture_output=True,
+                )
+                check(
+                    f"fallback: {name} decodes byte-exact without a dictionary",
+                    decoded.returncode == 0 and decoded.stdout == resource,
+                    f"(rc {decoded.returncode}, decoded "
+                    f"{len(decoded.stdout)} bytes, want {len(resource)})",
                 )
 
             # identity fallback still carries the Available-Dictionary

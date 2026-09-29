@@ -93,11 +93,13 @@ ngx_http_brotli_skip_quoted(u_char *p, u_char *end)
  * (the caller re-scans to the next ',').
  */
 static ngx_int_t
-ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
+ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char **pp)
 {
+    u_char     *p = *pp;
     u_char     *end = ae->data + ae->len;
     ngx_int_t   q = 1000;   /* no q parameter → q=1 */
     ngx_int_t   q_seen = 0; /* reject a second "q" parameter (RFC 9110) */
+    ngx_int_t   quoted_name = 0;    /* DQUOTE seen inside a parameter name */
 
     while (p < end && *p == ';') {
 
@@ -116,9 +118,24 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
                && *p != '=' && *p != ';' && *p != ','
                && *p != ' ' && *p != '\t')
         {
+            if (*p == '"') {
+                quoted_name = 1;
+            }
             p++;
         }
         nend = p;
+
+        /*
+         * RFC 9110 has no empty-parameter production, so "br;;q=1"
+         * (and a trailing "br;") is malformed rather than "a skipped
+         * parameter followed by q=1". Reject it instead of silently
+         * resolving the element to q=1 (the siblings' parent #142
+         * rule; this copy had drifted without it).
+         */
+        if (nend == nstart) {
+            goto malformed;
+        }
+
         is_q = (nend - nstart == 1
                 && (nstart[0] == 'q' || nstart[0] == 'Q'));
 
@@ -138,30 +155,35 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
                  * Strict qvalue grammar. Leading digit must be 0 or 1.
                  */
                 if (q_seen) {
-                    return -1;          /* repeated "q" parameter */
+                    goto malformed;     /* repeated "q" parameter */
                 }
                 q_seen = 1;
 
                 if (p >= end) {
-                    return -1;          /* "q=" with no value */
+                    goto malformed;     /* "q=" with no value */
                 }
 
                 if (*p == '0') {
-                    /* ngx_int_t (not int) so the digit*scale product widens
-                     * before the add. */
-                    ngx_int_t  scale = 100;
-
                     p++;
                     q = 0;
 
+                    /*
+                     * Up to three decimal digits, each with its literal
+                     * milli-unit scale (no loop counter to reason
+                     * about). A fourth digit stays in place for the
+                     * trailing-junk check below to reject.
+                     */
                     if (p < end && *p == '.') {
                         p++;
-                        while (p < end && *p >= '0' && *p <= '9'
-                               && scale > 0)
-                        {
-                            q += (*p - '0') * scale;
-                            scale /= 10;
-                            p++;
+
+                        if (p < end && *p >= '0' && *p <= '9') {
+                            q += (*p++ - '0') * 100;
+                        }
+                        if (p < end && *p >= '0' && *p <= '9') {
+                            q += (*p++ - '0') * 10;
+                        }
+                        if (p < end && *p >= '0' && *p <= '9') {
+                            q += *p++ - '0';
                         }
                     }
 
@@ -180,7 +202,7 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
                     }
 
                 } else {
-                    return -1;          /* leading digit not 0 or 1 */
+                    goto malformed;     /* leading digit not 0 or 1 */
                 }
 
                 /*
@@ -192,7 +214,7 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
                 if (p < end
                     && *p != ' ' && *p != '\t' && *p != ';' && *p != ',')
                 {
-                    return -1;
+                    goto malformed;
                 }
 
             } else {
@@ -214,7 +236,7 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
         } else {
             /* parameter present without a value */
             if (is_q) {
-                return -1;              /* "q" with no "=value" is malformed */
+                goto malformed;         /* "q" with no "=value" is malformed */
             }
         }
 
@@ -229,8 +251,20 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
          * element rather than silently accepting it.
          */
         if (p < end && *p != ';' && *p != ',') {
-            return -1;
+            goto malformed;
         }
+    }
+
+    goto done;
+
+malformed:
+
+    q = -1;
+
+done:
+
+    if (!quoted_name) {
+        *pp = p;
     }
 
     return q;
@@ -249,9 +283,20 @@ ngx_http_brotli_eval_qvalue(ngx_str_t *ae, u_char *p)
  * that actually holds the dictionary can decode a dictionary-compressed
  * response, so a blanket "*" must not turn it on).
  */
+/*
+ * The _ex form also reports the two accumulated weights it computed
+ * anyway (zstd sibling #315): *explicit_q is the latest explicit
+ * `coding` token's weight and *star_q_out the latest "*" weight, each
+ * -1 when that form is absent. The request walker below needs both to
+ * compose duplicate field lines, and taking them from one pass keeps it
+ * from parsing the same line a second time. The return value is exactly
+ * the precedence rule applied to them, so ngx_http_brotli_coding_weight()
+ * below stays byte-for-byte the function the fuzz oracle asserts.
+ */
 static ngx_int_t
-ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
-    size_t coding_len, ngx_uint_t allow_wildcard)
+ngx_http_brotli_coding_weight_ex(ngx_str_t *ae, const char *coding,
+    size_t coding_len, ngx_uint_t allow_wildcard, ngx_int_t *explicit_q,
+    ngx_int_t *star_q_out)
 {
     u_char     *p   = ae->data;
     u_char     *end = ae->data + ae->len;
@@ -299,9 +344,20 @@ ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
             p++;
         }
 
+        /*
+         * After the name and OWS only ';' (parameters), ',' (next
+         * element), or end may follow. Anything else ("br x") is
+         * trailing junk: the element matches nothing rather than
+         * negotiating at the implied q=1 below.
+         */
+        if (p < end && *p != ';' && *p != ',') {
+            is_coding = 0;
+            is_star = 0;
+        }
+
         q = 1000;       /* no parameters → q=1 */
         if (p < end && *p == ';') {
-            q = ngx_http_brotli_eval_qvalue(ae, p);
+            q = ngx_http_brotli_eval_qvalue(ae, &p);
         }
 
         if (q >= 0) {
@@ -327,6 +383,9 @@ ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
         }
     }
 
+    *explicit_q = coding_q;
+    *star_q_out = star_q;
+
     /*
      * An explicit token decides the result (even q=0, which then
      * overrides a permissive "*"). With no explicit token, the "*"
@@ -343,10 +402,155 @@ ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
 
 
 /*
- * br acceptance predicate over one Accept-Encoding value: NGX_OK iff the
- * effective weight for "br" (explicit token, else "*" wildcard) is > 0.
+ * Effective weight for `coding` in one field value, the per-form
+ * weights discarded. This is the signature the fuzz differential and
+ * the extracted parser link against.
  */
 static ngx_int_t
+ngx_http_brotli_coding_weight(ngx_str_t *ae, const char *coding,
+    size_t coding_len, ngx_uint_t allow_wildcard)
+{
+    ngx_int_t  explicit_q, star_q;
+
+    return ngx_http_brotli_coding_weight_ex(ae, coding, coding_len,
+                                            allow_wildcard,
+                                            &explicit_q, &star_q);
+}
+
+
+/*
+ * Whole-request weight lookup: multiple Accept-Encoding lines are
+ * semantically ONE comma-joined field (RFC 9110 section 5.3), so the
+ * lines accumulate under the same precedence the single-value walker
+ * applies within one line — the latest explicit token wins wherever it
+ * appears, and "*" stays subordinate to an explicit token on ANY line.
+ * Reading only the first line would refuse a client that advertised br
+ * on the second, and would honour an allowance a later line revoked
+ * with q=0 — divergence any comma-joining intermediary makes visible.
+ *
+ * The per-line probe runs once, through the parser's _ex form, which
+ * reports an explicit token's verdict (including q=0) and the "*"
+ * weight separately (zstd sibling #315; the earlier shape probed twice
+ * and re-scanned every line that named no explicit token).
+ *
+ * nginx >= 1.23 chains same-name headers through ngx_table_elt_t.next;
+ * older cores keep only the first line in headers_in.accept_encoding,
+ * so there the raw headers list is walked instead.
+ */
+/*
+ * One field line folded into the field-wide accumulators, and the
+ * final precedence over them. The two collections in the request
+ * walker below (the ->next chain on nginx >= 1.23, the raw header
+ * list on older cores) may differ per build; the accumulation and
+ * precedence MUST not — a private copy in each branch is how the two
+ * shapes' negotiation drifts apart with only one compiled at a time.
+ */
+static ngx_inline void
+ngx_http_brotli_fold_line_weight(ngx_str_t *value, const char *coding,
+    size_t coding_len, ngx_uint_t allow_wildcard, ngx_int_t *coding_q,
+    ngx_int_t *star_q)
+{
+    ngx_int_t  line_coding_q, line_star_q;
+
+    (void) ngx_http_brotli_coding_weight_ex(value, coding, coding_len,
+                                            allow_wildcard,
+                                            &line_coding_q, &line_star_q);
+
+    if (line_coding_q >= 0) {
+        *coding_q = line_coding_q;  /* comma-joined in received order */
+        return;
+    }
+
+    if (allow_wildcard && line_star_q >= 0) {
+        *star_q = line_star_q;
+    }
+}
+
+
+static ngx_inline ngx_int_t
+ngx_http_brotli_field_weight(ngx_int_t coding_q, ngx_int_t star_q,
+    ngx_uint_t allow_wildcard)
+{
+    if (coding_q >= 0) {
+        return coding_q;
+    }
+    if (allow_wildcard && star_q >= 0) {
+        return star_q;
+    }
+    return -1;
+}
+
+
+static ngx_int_t
+ngx_http_brotli_request_coding_weight(ngx_http_request_t *r,
+    const char *coding, size_t coding_len, ngx_uint_t allow_wildcard)
+{
+    ngx_int_t         coding_q, star_q;
+#if nginx_version >= 1023000
+    ngx_table_elt_t  *ae;
+#else
+    ngx_uint_t        i;
+    ngx_list_part_t  *part;
+    ngx_table_elt_t  *h;
+#endif
+
+    coding_q = -1;
+    star_q = -1;
+
+#if nginx_version >= 1023000
+
+    for (ae = r->headers_in.accept_encoding; ae != NULL; ae = ae->next) {
+        ngx_http_brotli_fold_line_weight(&ae->value, coding, coding_len,
+                                         allow_wildcard,
+                                         &coding_q, &star_q);
+    }
+
+#else
+
+    part = &r->headers_in.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0
+            || h[i].key.len != sizeof("Accept-Encoding") - 1
+            || ngx_strncasecmp(h[i].key.data, (u_char *) "Accept-Encoding",
+                               sizeof("Accept-Encoding") - 1)
+               != 0)
+        {
+            continue;
+        }
+
+        ngx_http_brotli_fold_line_weight(&h[i].value, coding, coding_len,
+                                         allow_wildcard,
+                                         &coding_q, &star_q);
+    }
+
+#endif
+
+    return ngx_http_brotli_field_weight(coding_q, star_q, allow_wildcard);
+}
+
+
+/*
+ * br acceptance predicate over one Accept-Encoding value: NGX_OK iff the
+ * effective weight for "br" (explicit token, else "*" wildcard) is > 0.
+ * Production callers negotiate whole-request through
+ * ngx_http_brotli_request_coding_weight(); this single-value shape is
+ * kept as the fuzz harness's entry point (fuzz/extract_parser.sh slices
+ * it out by name). ngx_inline: no in-tree TU calls it any more, and an
+ * inline definition is exempt from -Werror=unused-function.
+ */
+static ngx_inline ngx_int_t
 ngx_http_brotli_accept_encoding(ngx_str_t *ae)
 {
     ngx_int_t  q;
@@ -361,28 +565,23 @@ ngx_http_brotli_accept_encoding(ngx_str_t *ae)
  * ngx_http_brotli_accepts()
  *
  * Side-effect-free acceptance predicate: NGX_OK iff this is a main request
- * whose client advertises acceptable br support. Does NOT touch
- * r->gzip_tested / r->gzip_ok — callers that only need the decision use
- * this. In particular the static module must use THIS before it knows
- * whether a .br file exists: latching gzip off first would suppress a
- * later gzip_static fallback for a client that accepts both br and gzip
- * when only a .gz file is on disk (it previously did exactly that).
+ * whose client advertises acceptable br support across the whole
+ * Accept-Encoding field. Does NOT touch r->gzip_tested / r->gzip_ok —
+ * callers that only need the decision use this. In particular the static
+ * module must use THIS before it knows whether a .br file exists:
+ * latching gzip off first would suppress a later gzip_static fallback
+ * for a client that accepts both br and gzip when only a .gz file is on
+ * disk (it previously did exactly that).
  */
 static ngx_int_t
 ngx_http_brotli_accepts(ngx_http_request_t *r)
 {
-    ngx_table_elt_t  *ae;
-
     if (r != r->main) {
         return NGX_DECLINED;
     }
 
-    ae = r->headers_in.accept_encoding;
-    if (ae == NULL) {
-        return NGX_DECLINED;
-    }
-
-    return ngx_http_brotli_accept_encoding(&ae->value);
+    return ngx_http_brotli_request_coding_weight(r, "br", sizeof("br") - 1, 1)
+           > 0 ? NGX_OK : NGX_DECLINED;
 }
 
 
@@ -414,48 +613,118 @@ ngx_http_brotli_ok(ngx_http_request_t *r)
 
 
 /*
- * ngx_http_brotli_vary_handled_externally()
+ * ngx_http_brotli_vary_accept_encoding()
  *
- * True when a module named "ngx_http_compression_vary_filter_module"
- * (HanadaLee's Vary-flattening filter) is loaded, statically or via
- * load_module. When its "compression_vary" directive is on, that
- * module emits Vary: Accept-Encoding keyed on r->gzip_vary alone,
- * regardless of clcf->gzip_vary — replacing the "gzip_vary" directive
- * (verified empirically against all four gzip_vary x compression_vary
- * quadrants; its author explicitly recommends "gzip_vary off" when
- * "compression_vary on" is used). With it loaded, "gzip_vary off" is
- * plausibly deliberate rather than a caching hazard.
+ * Emit "Vary: Accept-Encoding" BY CONSTRUCTION (parent nginx-zstd-module
+ * #163) rather than merely requesting it through r->gzip_vary. A brotli
+ * (or dcb, or Accept-Encoding-negotiated static) response is a
+ * content-coding variant, but nginx only turns r->gzip_vary into a Vary
+ * line when the core "gzip_vary" directive is on — and its default is
+ * OFF, under which nginx clears the flag and emits nothing, so by default
+ * a negotiated response shipped with no Vary and a shared cache could
+ * hand the compressed body to a client that cannot decode it.
  *
- * PRESENCE IS NOT PROOF, though: "compression_vary" itself defaults
- * to off, and this module cannot verify the effective value — the
- * conf struct is private to that module, and merge order between
- * unrelated modules follows their position in cycle->modules, so its
- * merged values may not even exist yet when ours merge. Callers
- * therefore must not silence the gzip_vary-off warning outright on
- * this check; they withhold the per-location lines and emit one
- * summary warning from postconfiguration that tells the operator
- * exactly what to verify.
+ * When gzip_vary is on, defer to nginx (it dedups against an existing
+ * line). When it is off, scan the response headers and push the literal
+ * line only if one is not already present (another filter, or the origin,
+ * may have set it), so the field is never doubled in either state.
  *
- * Called at merge-time: every load_module directive has been processed
- * by then (core conf parses before the http block), so
- * cf->cycle->modules is complete for both linkage styles.
- *
- * ngx_inline for the same reason as ngx_http_brotli_ok() above.
+ * Shared by the filter and static modules — a header-static so each
+ * translation unit gets its own copy, exactly like the helpers above.
  */
-static ngx_inline ngx_uint_t
-ngx_http_brotli_vary_handled_externally(ngx_conf_t *cf)
+static ngx_inline ngx_int_t
+ngx_http_brotli_vary_accept_encoding(ngx_http_request_t *r)
 {
-    ngx_uint_t  i;
+    ngx_uint_t                 i;
+    ngx_table_elt_t           *v, *h;
+    ngx_list_part_t           *part;
+    ngx_http_core_loc_conf_t  *clcf;
 
-    for (i = 0; cf->cycle->modules[i]; i++) {
-        if (ngx_strcmp(cf->cycle->modules[i]->name,
-                       "ngx_http_compression_vary_filter_module") == 0)
+    r->gzip_vary = 1;
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    if (clcf != NULL && clcf->gzip_vary) {
+        /* nginx's header filter emits the line from r->gzip_vary */
+        return NGX_OK;
+    }
+
+    for (part = &r->headers_out.headers.part, h = part->elts, i = 0;
+         /* void */;
+         i++)
+    {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0) {
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("Vary") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "Vary",
+                               sizeof("Vary") - 1) == 0)
         {
-            return 1;
+            /*
+             * "Accept-Encoding" must be matched among the value's
+             * comma-separated tokens (zstd sibling #200 row n11): an
+             * exact-value compare misses an origin's
+             * "Vary: Accept-Encoding, Cookie" and doubles the token on
+             * a second line. Trim OWS per token, compare
+             * case-insensitively (the values are header names).
+             */
+            u_char* p = h[i].value.data;
+            u_char* end = h[i].value.data + h[i].value.len;
+
+            while (p < end) {
+                u_char *tstart, *tend;
+
+                while (p < end && (*p == ' ' || *p == '\t')) {
+                    p++;
+                }
+                if (p >= end) {
+                    break;
+                }
+
+                tstart = p;
+                while (p < end && *p != ',') {
+                    p++;
+                }
+                tend = p;
+
+                while (tend > tstart
+                       && (*(tend - 1) == ' ' || *(tend - 1) == '\t')) {
+                    tend--;
+                }
+
+                if (tend - tstart == sizeof("Accept-Encoding") - 1
+                    && ngx_strncasecmp(tstart, (u_char*) "Accept-Encoding",
+                                       sizeof("Accept-Encoding") - 1) == 0) {
+                    return NGX_OK;
+                }
+
+                if (p < end && *p == ',') {
+                    p++;
+                }
+            }
         }
     }
 
-    return 0;
+    v = ngx_list_push(&r->headers_out.headers);
+    if (v == NULL) {
+        return NGX_ERROR;
+    }
+    v->hash = 1;
+#if nginx_version >= 1023000
+    v->next = NULL;
+#endif
+    ngx_str_set(&v->key, "Vary");
+    ngx_str_set(&v->value, "Accept-Encoding");
+    return NGX_OK;
 }
 
 

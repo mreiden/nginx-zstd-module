@@ -28,13 +28,19 @@ against current nginx. Differences from upstream:
 - **Accept-Encoding parsing** is a shared, length-bounded RFC 9110
   walker (ported from nginx-zstd-module, where it is continuously fuzzed
   with an independent differential oracle), replacing two hand-maintained
-  copies of a substring scan. Five deliberate behaviour changes, all
+  copies of a substring scan. Eight deliberate behaviour changes, all
   toward the RFC: the `*` wildcard now matches `br`; a coding name inside
   a quoted parameter value (e.g. `gzip;x="a, br"`) no longer fabricates a
   phantom `br` token; `;Q=0` refusals are honored (the weight name is
   case-insensitive); malformed weights make an element non-matching
-  instead of defaulting to accept; and a later duplicate explicit token
-  wins (`br;q=0, br` now accepts).
+  instead of defaulting to accept; a later duplicate explicit token
+  wins (`br;q=0, br` now accepts); trailing junk after a coding name
+  (`br x`) makes its element non-matching instead of negotiating at an
+  implied q=1; an empty parameter (`br;;q=1`, or a trailing `br;`) is
+  malformed rather than a skipped one; and every `Accept-Encoding` line
+  is read as the one
+  comma-joined field RFC 9110 defines, so a `br` offered — or refused —
+  only on a later line is honored.
 - **`brotli_static` gzip fallback fix:** the old code latched gzip off
   before knowing whether a `.br` file exists, so a client accepting
   `br, gzip` with only a `.gz` file on disk got identity instead of the
@@ -47,19 +53,25 @@ against current nginx. Differences from upstream:
   `brotli_bypass` / `brotli_bypass_vary` per-request bypass predicates
   (the operator lever for BREACH-style exposures, with the cache key the
   bypass decision varies on declared explicitly);
-  `BROTLI_PARAM_SIZE_HINT` set from the declared content length; a
-  config-load warning when `brotli`/`brotli_static` is enabled in a
-  location whose effective `gzip_vary` is off (matching the zstd
-  siblings — without `Vary: Accept-Encoding` a shared cache can serve
-  the compressed variant to a client that cannot decode it;
-  `brotli_static always` is exempt since it does not vary; when
+  `BROTLI_PARAM_SIZE_HINT` set from the declared content length;
+  `Vary: Accept-Encoding` emitted by construction on every negotiated
+  response (matching the zstd siblings' #163 — without it a shared
+  cache can serve the compressed variant to a client that cannot decode
+  it; correctness no longer depends on the operator's `gzip_vary`
+  directive, whose default is off, and the old gzip_vary-off
+  config-load warnings are gone with the dependency; with `gzip_vary
+  on` the module defers to nginx's own emitter, and `r->gzip_vary` is
+  still set, so
   [ngx_http_compression_vary_filter_module](https://github.com/HanadaLee/ngx_http_compression_vary_filter_module)
-  is loaded — it emits the header from `r->gzip_vary` in place of the
-  `gzip_vary` directive wherever `compression_vary on` applies — the
-  per-location warnings collapse into one summary warning per module
-  asking you to verify `compression_vary on` covers those locations,
-  since that directive itself defaults to off and its effective value
-  cannot be read from another module).
+  — which keys on that flag and flattens Vary — folds rather than
+  doubles the line; exactly one `Vary: Accept-Encoding` in every state;
+  `brotli_static always` still sends no Vary since it does not vary).
+- **No hooks when off everywhere** (zstd siblings' #182): the filter's
+  header/body hooks and the static module's content-phase handler are
+  installed only when `brotli` / `brotli_static` is parsed as anything
+  but `off` somewhere in the config (an `if` block counts), so a build
+  that carries the modules but never enables them pays no per-response
+  pass through them. Behaviour is otherwise unchanged.
 - **Tests:** a Test::Nginx regression suite (`t/`) covering the
   negotiation matrix, bypass, caps, and the static-module fallback
   regression, run in CI alongside the roundtrip smoke tool and the fuzz
@@ -70,17 +82,26 @@ against current nginx. Differences from upstream:
   occurrence loads one dictionary — typically a previous version of the
   resource — and registers its SHA-256 as the negotiation key. An
   optional second argument supplies that SHA-256 as 64 hex characters —
-  `brotli_dcb_dict_file /path/main-AAA.js <sha256hex>;` — and is
-  trusted verbatim, skipping the load-time hashing pass entirely; deploy
-  tooling that generates the directive list has usually just computed
-  the hashes anyway (see [`examples/`](examples/)). Only supply hashes
-  for content-hashed immutable assets: a *stale* supplied hash keeps
-  matching, and the resulting responses may fail to decode or silently
-  decode to wrong content (a same-size stale dictionary yields wrong
-  bytes — the dcb stream carries no content checksum), fanned out by
-  any shared cache to every client advertising the stale hash; a
-  self-computed hash of a changed file simply stops matching (safe
-  fallback to plain `br`). A request
+  `brotli_dcb_dict_file /path/main-AAA.js <sha256hex>;` — **verified**
+  by default against the bytes read (zstd siblings' #198): a mismatch
+  fails the load, catching a dictionary replaced or truncated behind
+  the config at `nginx -t` instead of at clients.
+  `brotli_dcb_dict_trust_hashes on;` (`http` only, default `off`,
+  siblings' #220) opts out: the literal is then trusted verbatim as
+  the negotiation key and the load-time hashing pass — the config-load
+  cost at scale — is skipped; lines without a literal are hashed under
+  either policy, and `$brotli_dcb_dicts_hashed` counts the passes so
+  the skip is observable. Deploy tooling that generates the directive
+  list has usually just computed the hashes anyway (see
+  [`examples/`](examples/)). Only trust hashes for content-hashed
+  immutable assets: a *stale* trusted hash keeps matching, and the
+  resulting responses may fail to decode or silently decode to wrong
+  content (a same-size stale dictionary yields wrong bytes — the dcb
+  stream carries no content checksum), fanned out by any shared cache
+  to every client advertising the stale hash; a self-computed hash of
+  a changed file simply stops matching (safe fallback to plain `br`).
+  The trust directive must precede every `brotli_dcb_dict_file`
+  carrying a literal; declaring it after one is a config-load error. A request
   whose `Available-Dictionary` matches a loaded dictionary and whose
   `Accept-Encoding` lists `dcb` explicitly (the `*` wildcard deliberately
   does not match) gets the response compressed against that dictionary
@@ -108,9 +129,22 @@ against current nginx. Differences from upstream:
   dictionaries turns seconds of `nginx -t`/reload time into a blip
   (`NGX_BROTLI_NO_LIBCRYPTO=1` in the configure environment opts out) —
   with a portable implementation built in as the fallback. Empty,
-  oversized (>10 MB) and duplicate-hash dictionaries are config-load
-  errors (supplied hashes are compared as declared; with computed
-  hashes "duplicate" means identical content). Verify end-to-end: strip the first 36 bytes of a response and
+  oversized (>10 MB), non-regular-file and duplicate-hash dictionaries
+  are config-load errors (supplied hashes are compared as declared;
+  with computed hashes "duplicate" means identical content).
+  `brotli_dcb_dict_strict_path on;` (`http` only, default off) opts
+  into a stricter trust policy for every dictionary load: the path is
+  resolved one component at a time with `openat(O_NOFOLLOW)` so a
+  symlink **anywhere** in it — including a `current -> releases/N`
+  deploy layout, which is why the default stays off — is refused
+  rather than followed, `.`/`..` components are rejected, and the file
+  and every directory on the way to it must be owned by the loading
+  principal (or root) and not writable by group or other (no sticky-bit
+  exemption, so a dictionary under `/tmp` is refused: an ancestor a
+  local user can write into lets that user rename a file of their
+  choosing into the leaf's place). The directive must precede every
+  `brotli_dcb_dict_file` it applies to; declaring it after one is a
+  config-load error rather than a silently unvetted load. Verify end-to-end: strip the first 36 bytes of a response and
   `brotli -d -D <dict>` — byte-exact against origin.
   **Troubleshooting:** if `Vary: Available-Dictionary` appears but dcb
   never negotiates for hashes you know are right, run
@@ -150,7 +184,7 @@ Both Brotli library and nginx module are under active development.
 Checkout the latest `ngx_brotli` and build the dependencies:
 
 ```
-git clone --recurse-submodules -j8 https://github.com/google/ngx_brotli
+git clone --recurse-submodules -j8 https://github.com/mreiden/ngx_brotli
 cd ngx_brotli/deps/brotli
 mkdir out && cd out
 cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_C_FLAGS="-Ofast -m64 -march=native -mtune=native -flto -funroll-loops -ffunction-sections -fdata-sections -Wl,--gc-sections" -DCMAKE_CXX_FLAGS="-Ofast -m64 -march=native -mtune=native -flto -funroll-loops -ffunction-sections -fdata-sections -Wl,--gc-sections" -DCMAKE_INSTALL_PREFIX=./installed ..
