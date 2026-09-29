@@ -10,7 +10,9 @@ own CI (`.github/workflows/compression.yml`); deliberately NOT wired
 into this repo's root `config` — the zstd modules build exactly as
 before. The branch also carries the full ngx_brotli hardened-fork
 history under `brotli/` (subtree merge; the fork point is the merge's
-second parent).
+second parent). Nothing under `brotli/` is edited here: a finding
+against a file there is fixed in the fork and arrives with the next
+`git subtree pull --prefix=brotli`.
 
 Every place the two libraries refused to be shaped the same way is
 recorded in [WRINKLES.md](WRINKLES.md). The core directives:
