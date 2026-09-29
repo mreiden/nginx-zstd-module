@@ -35,7 +35,12 @@ our $have_walk = eval {
     die "no HOME for a vetted fixture base\n" unless defined $base && -d $base;
     $walkdir = tempdir(DIR => $base, CLEANUP => 1);
     for (my $d = $walkdir; ; $d = dirname($d)) {
-        my @st = stat($d) or die "stat $d: $!";
+        # lstat, not stat: the strict walk refuses a symlinked
+        # component, so a symlink anywhere in the HOME chain makes this
+        # host unable to run the walk blocks -- skip them, do not let
+        # stat() follow the link and vet its target instead
+        my @st = lstat($d) or die "lstat $d: $!";
+        die "ancestor $d is a symlink\n" if -l _;
         die "ancestor $d owned by uid $st[4], neither root nor uid $>\n"
             if $st[4] != 0 && $st[4] != $>;
         die sprintf("ancestor %s is mode %04o, writable by group or other\n", $d, $st[2] & oct('07777'))

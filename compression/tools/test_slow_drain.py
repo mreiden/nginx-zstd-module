@@ -239,10 +239,14 @@ def main() -> int:
     v = subprocess.run([str(nginx), "-V"], capture_output=True, text=True, check=False)
     if "compression" not in v.stderr:
         raise RuntimeError("nginx -V shows no compression module")
-    if "--with-debug" not in v.stderr:
+    # Only the debug-level witnesses need a debug build. --log-level warn
+    # is the sanitizer mode: it asserts the roundtrips alone, and a
+    # sanitizer nginx is commonly built without --with-debug.
+    if args.log_level == "debug" and "--with-debug" not in v.stderr:
         raise RuntimeError(
             "the witnesses are ngx_log_debug lines: "
-            "this tool needs an nginx built --with-debug"
+            "this tool needs an nginx built --with-debug "
+            "(or --log-level warn to assert the roundtrips alone)"
         )
 
     proxy_body = fixture_bytes(2 * PROXY_PART)
@@ -310,20 +314,28 @@ http {{
         # Popen's stdout for the whole server lifetime; a with-block
         # would close it while nginx is still writing (master's shape).
         nlog = open(nlog_path, "w", encoding="utf-8")  # noqa: SIM115
-        proc = subprocess.Popen(
-            [
-                str(nginx),
-                "-p",
-                str(root),
-                "-c",
-                str(conf),
-                "-g",
-                "daemon off; master_process off;",
-            ],
-            stdout=nlog,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                [
+                    str(nginx),
+                    "-p",
+                    str(root),
+                    "-c",
+                    str(conf),
+                    "-g",
+                    "daemon off; master_process off;",
+                ],
+                stdout=nlog,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except BaseException:
+            # the try/finally below owns the cleanup only once nginx is
+            # running; a Popen that never started must not leak the
+            # handle or leave the backend listening
+            nlog.close()
+            backend.stop()
+            raise
 
         def alive_or_die(when: str) -> None:
             """Fail with nginx's captured output if the process exited —
@@ -464,4 +476,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:  # noqa: BLE001
         print(f"ERROR: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(2) from exc

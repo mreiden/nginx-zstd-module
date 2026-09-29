@@ -2,6 +2,12 @@ use Test::Nginx::Socket;
 use Digest::SHA qw(sha256 sha256_hex);
 use MIME::Base64 qw(encode_base64);
 use File::Temp qw(tempdir);
+use File::Basename qw(dirname);
+use lib dirname(__FILE__) . '/lib';
+use CompressionRoundtrip qw(assert_decoders);
+
+# the .br sidecar fixture below is built with the brotli CLI
+assert_decoders('brotli');
 
 # Dictionary negotiation and wire format. Everything derives from the
 # dictionary constant below: its hash, the Available-Dictionary value,
@@ -85,13 +91,25 @@ our $dcb_re = qr/^\xFF\x44\x43\x42\Q$raw\E/s;
 # — every connection here is cleartext. So the negotiation blocks below,
 # which model a normal HTTPS deployment, run behind an http-level
 # compression_dict_assume_secure_transport (the TLS-terminating-proxy
-# acknowledgement) injected here. Blocks whose name contains
-# "secure-context" opt OUT of the injection: they exercise the real
+# acknowledgement) injected here. Blocks carrying a "--- secure_context"
+# section opt OUT of the injection: they exercise the real
 # fail-closed default over a genuine cleartext connection.
 add_block_preprocessor(sub {
     my $block = shift;
 
-    return if defined($block->name) && $block->name =~ /secure-context/;
+    # The opt-out is the block's own "--- secure_context" section, not
+    # its title: a renamed title must not silently move a block behind
+    # the injected acknowledgement, where dcz elects either way and the
+    # fail-closed proof is lost without any assertion going red. The
+    # title is still checked, in the other direction only: a block that
+    # names the gate and forgot the section is a mistake, said loudly.
+    if (defined $block->secure_context) {
+        return;
+    }
+
+    die $block->name . ": names secure-context but has no "
+        . "\"--- secure_context\" section\n"
+        if defined($block->name) && $block->name =~ /secure-context/;
 
     my $hc = $block->http_config;
     $hc = defined($hc) ? $hc : '';
@@ -840,8 +858,9 @@ Content-Encoding: zstd
 
 === TEST 20: secure-context default fail-closed — dcz declines over cleartext
 # No acknowledgement (this block opts out of the injected one via its
-# name), and Test::Nginx speaks cleartext, so RFC 9842 §8 refuses the
+# secure_context section), and Test::Nginx speaks cleartext, so RFC 9842 §8 refuses the
 # dictionary coding. The base coding still wins the election.
+--- secure_context: real cleartext, no injected acknowledgement
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config
@@ -866,6 +885,7 @@ Content-Encoding: zstd
 
 
 === TEST 21: secure-context explicit off is identical to the default
+--- secure_context: real cleartext, no injected acknowledgement
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config
@@ -894,6 +914,7 @@ Content-Encoding: zstd
 # The gate is transport, never a client-settable header: a forwarded
 # scheme claim on a directly reachable listener must not switch dcz back
 # on over cleartext. Same for the other three common spellings below.
+--- secure_context: real cleartext, no injected acknowledgement
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config
@@ -918,6 +939,7 @@ Content-Encoding: zstd
 
 
 === TEST 23: secure-context Forwarded proto=https does NOT re-enable dcz
+--- secure_context: real cleartext, no injected acknowledgement
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config
@@ -942,6 +964,7 @@ Content-Encoding: zstd
 
 
 === TEST 24: secure-context X-Forwarded-Scheme https does NOT re-enable dcz
+--- secure_context: real cleartext, no injected acknowledgement
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config
@@ -966,6 +989,7 @@ Content-Encoding: zstd
 
 
 === TEST 25: secure-context X-Url-Scheme https does NOT re-enable dcz
+--- secure_context: real cleartext, no injected acknowledgement
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config
@@ -993,6 +1017,7 @@ Content-Encoding: zstd
 # Proves the opt-in path itself works (not just the injected http-level
 # one): this block opts out of the injection, sets the directive in the
 # location, and dcz elects — exactly the TLS-terminating-proxy case.
+--- secure_context: real cleartext, no injected acknowledgement
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config
@@ -1022,6 +1047,7 @@ $::dcz_re
 === TEST 27: secure-context inheritance — http on, location off wins
 # Merge semantics: the acknowledgement inherits like any flag, and a
 # location-level off overrides an http-level on.
+--- secure_context: real cleartext, no injected acknowledgement
 --- user_files eval
 [ [ "app.dict" => $::dict ] ]
 --- http_config

@@ -1,7 +1,11 @@
 use Test::Nginx::Socket;
 use Test::More;
 use Digest::SHA qw(sha256_hex);
-use File::Temp qw(tempdir);
+use File::Basename qw(dirname);
+use lib dirname(__FILE__) . '/lib';
+use CompressionRoundtrip qw(cli_decode assert_decoders);
+
+assert_decoders('zstd', 'brotli');
 
 # Filter-order composition: the parent's most-recurrent bug class
 # (f4ba115, 2d2e641, cae80f9, 3f73e15, 8a6e370, 18c778d — SIX
@@ -15,33 +19,7 @@ use File::Temp qw(tempdir);
 # -- CE assertions alone cannot see this class (the pre-fix build
 # happily served CE: zstd of the wrong bytes).
 
-my $tmp = tempdir(CLEANUP => 1);
-
-sub spew {
-    my ($path, $content) = @_;
-    open my $h, '>', $path or die "$path: $!";
-    binmode $h;
-    print $h $content;
-    close $h or die "close $path: $!";
-    return;
-}
-
-sub slurp {
-    my ($path) = @_;
-    open my $h, '<', $path or die "$path: $!";
-    binmode $h;
-    local $/;
-    my $content = <$h>;
-    close $h or die "close $path: $!";
-    return $content;
-}
-
-sub cli_decode {
-    my ($cmd, $data) = @_;
-    spew("$tmp/in", $data);
-    system("$cmd < $tmp/in > $tmp/out 2>/dev/null") == 0 or return;
-    return slurp("$tmp/out");
-}
+# cli_decode comes from t/lib/CompressionRoundtrip.pm
 
 our %decoders = (
     zstd => sub { cli_decode("zstd -dq -c", $_[0]) },

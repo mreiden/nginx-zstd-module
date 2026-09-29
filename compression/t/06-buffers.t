@@ -2,7 +2,11 @@ use Test::Nginx::Socket;
 use Test::More;
 use Digest::SHA qw(sha256_hex);
 use MIME::Base64 qw(encode_base64);
-use File::Temp qw(tempdir);
+use File::Basename qw(dirname);
+use lib dirname(__FILE__) . '/lib';
+use CompressionRoundtrip qw(cli_decode assert_decoders);
+
+assert_decoders('zstd', 'brotli');
 
 # Output-buffer recycling. The deterministic witnesses are the
 # get_buf debug lines: "buffer cap N reached, awaiting drain" proves
@@ -11,8 +15,6 @@ use File::Temp qw(tempdir);
 # the output's buffer count, FINISHING the response at all requires
 # reuse, so the decode roundtrip doubles as the functional proof that
 # pause/drain/resume preserved the stream byte-exact.
-
-my $tmp = tempdir(CLEANUP => 1);
 
 # incompressible ~200 KB: compressed output ~200 KB, far above any
 # small cap x step size
@@ -30,31 +32,7 @@ our $big = '';
     $big = encode_base64($raw, "");
 }
 
-sub spew {
-    my ($path, $content) = @_;
-    open my $h, '>', $path or die "$path: $!";
-    binmode $h;
-    print $h $content;
-    close $h or die "close $path: $!";
-    return;
-}
-
-sub slurp {
-    my ($path) = @_;
-    open my $h, '<', $path or die "$path: $!";
-    binmode $h;
-    local $/;
-    my $content = <$h>;
-    close $h or die "close $path: $!";
-    return $content;
-}
-
-sub cli_decode {
-    my ($cmd, $data) = @_;
-    spew("$tmp/in", $data);
-    system("$cmd < $tmp/in > $tmp/out 2>/dev/null") == 0 or return;
-    return slurp("$tmp/out");
-}
+# cli_decode comes from t/lib/CompressionRoundtrip.pm
 
 our %decoders = (
     zstd => sub { cli_decode("zstd -dq -c", $_[0]) },

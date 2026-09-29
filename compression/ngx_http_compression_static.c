@@ -100,11 +100,19 @@ typedef struct {
      * buffer share one lifetime: a new cycle starts from a pcalloc'd
      * conf and allocates afresh (the #103-era rule — module state lives
      * in cycle-owned conf, never process-wide static variables).
+     *
+     * dio_scratch_pool is the pool this conf itself was allocated
+     * from, recorded at create_main_conf. The buffer comes from IT,
+     * not from whatever ngx_cycle points at when the first probe runs:
+     * during an in-process cycle replacement those are two different
+     * pools, and a buffer from the new cycle cached in the old cycle's
+     * conf would break the one-lifetime rule this block states.
      */
     u_char        *dio_scratch;
     size_t         dio_scratch_cap;
     size_t         dio_scratch_align;
     ngx_uint_t     dio_scratch_busy;
+    ngx_pool_t    *dio_scratch_pool;
 
     /*
      * Bounded worker-local memo of MALFORMED sidecar verdicts (parent
@@ -476,8 +484,8 @@ ngx_http_compression_static_pread(ngx_fd_t fd, u_char *buf, size_t size,
  * pread/ReadFile, never a thread pool), and `busy` still guards that
  * invariant explicitly: an overlapping caller falls back to its own
  * pool-scoped allocation rather than corrupting the shared buffer.
- * File-scope static = per OS process; reloads fork fresh workers, and
- * the cycle-pool allocation dies with the process.
+ * The buffer and its bookkeeping live in the main conf and come from
+ * the pool that owns that conf, so both die together with their cycle.
  */
 static u_char *
 ngx_http_compression_static_dio_buf(
@@ -500,7 +508,7 @@ ngx_http_compression_static_dio_buf(
     }
 
     if (smcf->dio_scratch_cap < want || smcf->dio_scratch_align < align) {
-        p = ngx_pmemalign((ngx_pool_t *) ngx_cycle->pool, want, align);
+        p = ngx_pmemalign(smcf->dio_scratch_pool, want, align);
         if (p == NULL) {
             return ngx_pmemalign(pool, want, align);
         }
@@ -1436,9 +1444,19 @@ ngx_http_compression_static_handler(ngx_http_request_t *r)
 static void *
 ngx_http_compression_static_create_main_conf(ngx_conf_t *cf)
 {
+    ngx_http_compression_static_main_conf_t  *smcf;
+
     /* pcalloc zeroes any_enabled — cycle-owned, no reset hook needed */
-    return ngx_pcalloc(cf->pool,
+    smcf = ngx_pcalloc(cf->pool,
                        sizeof(ngx_http_compression_static_main_conf_t));
+    if (smcf == NULL) {
+        return NULL;
+    }
+
+    /* the directio scratch is allocated from the pool that owns this conf */
+    smcf->dio_scratch_pool = cf->pool;
+
+    return smcf;
 }
 
 

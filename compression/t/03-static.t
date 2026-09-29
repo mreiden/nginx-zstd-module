@@ -1,10 +1,17 @@
 use Test::Nginx::Socket;
 use File::Temp qw(tempdir);
+use File::Basename qw(dirname);
+use lib dirname(__FILE__) . '/lib';
+use CompressionRoundtrip qw(slurp assert_decoders);
 
 # Static sidecar serving. Fixtures are REAL compressed files
 # built in this prelude via the reference CLIs (zstd, brotli, gzip must
 # be on PATH — the same tools the wire matrix uses), so every serve
 # assertion compares against the exact bytes on disk.
+
+# named first: a missing CLI must read as a missing CLI, not as the
+# "zstd fixture" die below or a serve mismatch further down
+assert_decoders('zstd', 'brotli', 'gzip');
 
 our $src = "static fixture body: the compressible original content\n" x 30;
 
@@ -12,16 +19,6 @@ my $dir = tempdir(CLEANUP => 1);
 my $f = "$dir/fixture";
 open my $fh, '>', $f or die $!;
 binmode $fh; print $fh $src; close $fh;
-
-sub slurp {
-    my ($path) = @_;
-    open my $h, '<', $path or die "$path: $!";
-    binmode $h;
-    local $/;
-    my $content = <$h>;
-    close $h or die "close $path: $!";
-    return $content;
-}
 
 system("zstd -q -f -o $f.zst $f") == 0        or die "zstd fixture";
 system("brotli -f -o $f.br $f") == 0          or die "brotli fixture";

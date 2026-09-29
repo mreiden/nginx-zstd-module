@@ -775,10 +775,10 @@ only reads headers and decline paths never serve, so no 8 MB fixtures
 needed): descriptor window exactly 8 MB passes vs 16 MB declines,
 single-segment exactly 8 MB passes vs 8 MB + 1 declines, the 2-byte
 FCS +256 offset, 3/4/5-byte truncation branches, and the
-skippable-lead exemption. The directio property from the parent's
-#101 review — the window check must not be skipped under O_DIRECT —
-is now witnessed in-suite (aligned-probe debug line + decline, at
-default and 16k alignment).
+skippable-lead exemption. The directio property from the review of
+the parent's #101 — the window check must not be skipped under
+O_DIRECT — is now witnessed in-suite (aligned-probe debug line +
+decline, at default and 16k alignment).
 
 Honestly NOT deterministically pinned AT THE TIME (see 27 — the
 FINISH case is now pinned by tools/test_exact_boundary.py): a
