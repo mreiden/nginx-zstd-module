@@ -372,6 +372,7 @@ max-length tool tests). The 🔜 ports below run against that tree. RFC #312
 | 331 | (ours) compress 410 Gone like 403/404 (core gzip parity, nginx/nginx#1466) | ✅ e3c78b5 (ported ahead of merge) | YES adc8a09 | merged 59cc19f + 2f34a57; t/00-election.t TESTs 20b2/20b3 |
 | 332 | (ours) 02-conf-warn TEST 23 only on an estimator build; 23b pins the release-shape refusal | ➖ N/A (compression.yml builds with -DZSTD_STATIC_LINKING_ONLY only where its suites need it; no CI Deep flavour matrix here) | ➖ | merged 089479e; the `nginx -V` build-shape probe pattern is reusable if compression ever grows a release-shape lane |
 | 333 | (ours) coverage floor recovered: hardening matrix under gcov + five unexecuted paths pinned | 🔜 partial twin worth doing: the log-phase `$compression_ratio`/`$compression_bytes_*` block (00-election has only `set`-based references, which never reach the formatted value) and a 17-dictionary block already exists (t/02 TESTs 30-34) | ➖ | merged 1bd8001; compression has no gcov job, so the floor itself is N/A — the tests are the transferable part |
+| 334 | Arch package: `packaging/arch/` (PKGBUILD, .SRCINFO, local build script) and an `arch-package.yml` pull-request check | ➖ parent packaging (no compression bearing; the compression modules are not packaged for Arch) | ➖ | merged e603d9e; the workflow half was removed again by #344, the packaging files stay for local AUR builds |
 | 335 | (ours) README: strict mode refuses a trailing separator | ✅ (this sync, README) | YES at handover (fork README) | merged 8a19b92 |
 
 ### Batch: #336 (2026-09-16) — his; synced by merge 24080cc
@@ -379,3 +380,9 @@ max-length tool tests). The 🔜 ports below run against that tree. RFC #312
 | # | subject | disposition | brotli? | notes |
 |---|---------|-------------|---------|-------|
 | 336 | config-load warning when dcz dictionaries meet an expensive profile (`zstd_comp_level` ≥ 9 or `zstd_long on`; names the count and the largest dictionary) | ✅ zstd arm, as a backend-declared `dict_advisory_level` in the vtable (zstd declares 9 with the parent's numbers; the merge warns per backend in the location's order); no long-mode arm (no `compression_long`). Brotli arm ➖ by measurement (`tools/dict_attach_cost_bench.sh`, libbrotli 1.2.0): `BrotliEncoderPrepareDictionary()` costs the same at every quality and scales with the dictionary alone (0.7 ms / 64 KB, 4.5 ms / 1 MB, ~150 ms / 8 MB at quality 1 and 11 alike), so no level can be named — the dcb lever is a prepared-dictionary cache keyed on (dictionary, quality), not an advisory | ➖ (the fork has no dictionary attach yet) | merged 58bda87; t/05-tuning.t TESTs 25-29 (level arm, default-level control, count + largest-size rendering, level-without-dicts control, zstd-not-in-order control) |
+
+### Batch: #344 (2026-09-28) — his; synced by merge f4e845a
+
+| # | subject | disposition | brotli? | notes |
+|---|---------|-------------|---------|-------|
+| 344 | the Arch packaging workflow removed as an automatic gate (it was meant for local AUR builds); `ci_topology.py` gains a negative control against reintroducing it | ➖ upstream CI topology (compression.yml is a separate workflow and never called it) | ➖ | merged ac748b2; it cleared the red Arch check every open pull request carried after Arch moved to nginx 1.30.5. Our #339 still bumps the PKGBUILD pin for the local build |

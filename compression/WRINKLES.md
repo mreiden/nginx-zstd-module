@@ -845,10 +845,12 @@ The first cut of the module took these scope cuts on purpose. None of
 them describes the module as it stands; each line says what the cut
 was and where it was closed.
 
-- **Status set was 200-only.** Now the parent filter's set: any 2xx
-  except 204, 205 and 206, plus 403, 404 and 410 (the error statuses
-  with compressible bodies). t/00-election.t pins 403, 404 and 410 as
-  eligible and 206, 302 and 500 as not; 204 and 205 have no block.
+- **Status set was 200-only.** Now this module's own eligibility set,
+  kept equal to the parent filter's: any 2xx except 204, 205 and 206,
+  plus 403, 404 and 410 (the error statuses with compressible bodies).
+  nginx/nginx#1466 proposes the 410 carve-out for core gzip.
+  t/00-election.t pins 403, 404 and 410 as eligible and 206, 302 and
+  500 as not; 204 and 205 have no block.
 - **No busy/free output-buffer recycling.** Closed by wrinkle 24;
   `compression_buffers` caps the pool.
 - **No bypass predicates.** Closed by wrinkle 25
