@@ -344,12 +344,28 @@ http {{
                     },
                 ),
             ]
-            for name, case_headers in fallback_cases:
-                headers, _body = fetch(args.port, case_headers)
+            for index, (name, case_headers) in enumerate(fallback_cases):
+                headers, body = fetch(args.port, case_headers)
                 check(
                     f"fallback: {name} -> br",
                     content_encoding(headers) == "br",
                     f"(got {content_encoding(headers)})",
+                )
+                # the header alone is not the proof: a fallback path can
+                # label corrupt bytes "br". Decode every one, without a
+                # dictionary, and compare against the resource.
+                src = root / f"fallback-{index}.br"
+                src.write_bytes(body)
+                decoded = subprocess.run(
+                    [args.brotli_bin, "-d", "-c", str(src)],
+                    check=False,
+                    capture_output=True,
+                )
+                check(
+                    f"fallback: {name} decodes byte-exact without a dictionary",
+                    decoded.returncode == 0 and decoded.stdout == resource,
+                    f"(rc {decoded.returncode}, decoded "
+                    f"{len(decoded.stdout)} bytes, want {len(resource)})",
                 )
 
             # identity fallback still carries the Available-Dictionary

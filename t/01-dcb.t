@@ -63,7 +63,7 @@ our $bad_b64  = encode_base64("\x02" x 32, "");
 # the module trusts the argument instead of hashing the file.
 our $dict_hex = unpack("H*", sha256($dict_raw));
 our $odd_hex  = "01" x 32;
-our $odd_b64  = encode_base64("\x01" x 32, "");
+our $odd_b64  = encode_base64(pack("H*", $odd_hex), "");
 
 # strict-walk fixtures (zstd siblings #165/#199/#316): an out-of-repo
 # tempdir whose ABSOLUTE path goes into the config verbatim — a real

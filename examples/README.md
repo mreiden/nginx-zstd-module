@@ -32,7 +32,7 @@ The first deploy after enabling this only *plants* dictionaries;
 
 ## Verifying
 
-```
+```bash
 curl -sk https://example.com/assets/main-AAA.js -o /dev/null \
      -w '%{header_json}' | grep -i use-as-dictionary
 ```
@@ -40,7 +40,7 @@ curl -sk https://example.com/assets/main-AAA.js -o /dev/null \
 Then, with `HASH` being `sha256sum old-main.js` in base64
 (`openssl dgst -sha256 -binary old-main.js | base64`):
 
-```
+```bash
 curl -sk https://example.com/assets/main-BBB.js \
      -H 'Accept-Encoding: dcb, br' \
      -H "Available-Dictionary: :$HASH:" \
@@ -51,7 +51,7 @@ Expect `Content-Encoding: dcb`. The payload is the 36-byte dcb header
 (magic `FF 44 43 42` + the dictionary SHA-256) followed by a brotli
 stream; brotli decoders do **not** skip that header, so strip it first:
 
-```
+```bash
 tail -c +37 body.dcb | brotli -d -D old-main.js > roundtrip.js
 diff roundtrip.js new-main.js   # byte-exact
 ```

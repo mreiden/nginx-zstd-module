@@ -100,8 +100,39 @@ for keyfile in "${keyfiles[@]}"; do
     }
 done
 
-if gpg --quiet --verify "${TARBALL}.asc" "$TARBALL"; then
-    echo "== PGP signature verified for ${DIR}.tar.gz"
+# The keyring directory alone is not the trust root: every file in it
+# is imported, so a key added there (or swapped for another) would be
+# trusted by the verify below without anyone having decided to trust
+# it. The PRIMARY-key fingerprint that made the signature must also be
+# one of these, the nginx release signers as vendored in tools/keys/
+# (arut, maxim, the three nginx signing keys, pluknet, sb, thresh).
+# Adding a signer is two deliberate edits: the key file and this list.
+NGINX_SIGNER_FPRS="
+43387825DDB1BB97EC36BA5D007C8D7C15D87369
+41DB92713D3BF4BFF3EE91069C5E7FA2F54977D4
+8540A6F18833A80E9C1653A42FD21310B49F6B46
+573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62
+9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3
+D6786CE303D9A9022998DC6CC8464D549AF75C0A
+7338973069ED3F443F4D37DFA64FD5B17ADB39A8
+13C82A63B603576156E30A4EA0EA981B66B0D967
+"
+
+if gpg_status="$(gpg --quiet --status-fd 1 --verify \
+                     "${TARBALL}.asc" "$TARBALL" 2>/dev/null)"; then
+    # VALIDSIG's last field is the primary key's fingerprint, also when
+    # a signing subkey made the signature
+    signer="$(printf '%s\n' "$gpg_status" |
+        awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print $NF; exit }')"
+    if [ -z "$signer" ] ||
+        ! printf '%s\n' "$NGINX_SIGNER_FPRS" | grep -Fxq "$signer"; then
+        echo "ERROR: ${DIR}.tar.gz is signed, but not by a pinned nginx" \
+             "release key" >&2
+        printf '%s\n' "$gpg_status" | grep -E 'VALIDSIG|GOODSIG' >&2 || true
+        rm -rf "$gnupghome" "$TARBALL" "${TARBALL}.asc"
+        exit 1
+    fi
+    echo "== PGP signature verified for ${DIR}.tar.gz (signer $signer)"
 else
     echo "ERROR: PGP signature verification FAILED for ${DIR}.tar.gz" >&2
     rm -rf "$gnupghome" "$TARBALL" "${TARBALL}.asc"

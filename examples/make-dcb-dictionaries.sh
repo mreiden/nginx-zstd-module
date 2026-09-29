@@ -64,10 +64,10 @@ for app in "${APPS[@]}"; do
         # content-hashed immutable release files and this script is the
         # single source of the config — if you edit dictionary files in
         # place, drop the argument and let the module hash them itself.
-        printf 'brotli_dcb_dict_file %s %s;\n' "$f" "$h" >> "$CONF.tmp"
+        printf 'brotli_dcb_dict_file "%s" %s;\n' "$f" "$h" >> "$CONF.tmp"
         # Serving dcz from the same dictionaries (nginx-zstd-module) —
         # clients pick one coding:
-        #printf 'zstd_dcz_dict_file %s %s;\n'   "$f" "$h" >> "$CONF.tmp"
+        #printf 'zstd_dcz_dict_file "%s" %s;\n'   "$f" "$h" >> "$CONF.tmp"
     done
 done
 
