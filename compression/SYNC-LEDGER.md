@@ -387,6 +387,12 @@ max-length tool tests). The 🔜 ports below run against that tree. RFC #312
 |---|---------|-------------|---------|-------|
 | 344 | the Arch packaging workflow removed as an automatic gate (it was meant for local AUR builds); `ci_topology.py` gains a negative control against reintroducing it | ➖ upstream CI topology (compression.yml is a separate workflow and never called it) | ➖ | merged ac748b2; it cleared the red Arch check every open pull request carried after Arch moved to nginx 1.30.5. Our #339 still bumps the PKGBUILD pin for the local build |
 
+### Batch: #343 (2026-09-30) — his; synced by merge 00c2ba4
+
+| # | subject | disposition | brotli? | notes |
+|---|---------|-------------|---------|-------|
+| 343 | `ci/tools/dcz_refprefix_profile.{c,sh}`: a warmed A/B profiler for the level-3 raw-prefix request cost (8 MiB dictionary, 1 MiB and 12 MiB bodies; measured setup cost 0.752 ms/request) | ➖ parent tooling; `compression/tools/dict_attach_cost_bench.sh` already measures the same path for both backends and got 0.61 ms at level 3 on 8 MB | ➖ | merged 79422ce; the groundwork for #345's per-configuration CDict cache |
+
 ## brotli/ subtree refreshes
 
 The subtree is the fork's tree, verbatim. It is never edited in this
