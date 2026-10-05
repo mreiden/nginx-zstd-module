@@ -393,6 +393,13 @@ max-length tool tests). The 🔜 ports below run against that tree. RFC #312
 |---|---------|-------------|---------|-------|
 | 343 | `ci/tools/dcz_refprefix_profile.{c,sh}`: a warmed A/B profiler for the level-3 raw-prefix request cost (8 MiB dictionary, 1 MiB and 12 MiB bodies; measured setup cost 0.752 ms/request) | ➖ parent tooling; `compression/tools/dict_attach_cost_bench.sh` already measures the same path for both backends and got 0.61 ms at level 3 on 8 MB | ➖ | merged 79422ce; the groundwork for #345's per-configuration CDict cache |
 
+### Batch: #342, #347 (2026-10-04) — his; synced by merge c37e0fd
+
+| # | subject | disposition | brotli? | notes |
+|---|---------|-------------|---------|-------|
+| 342 | weekly pin bump (nginx 1.30.5 sha256 in ci-build.sh, angie 1.12.2, windows-pins, ci-deep/fault-arms workflow pins) plus a hand-added `fix(arch)` commit moving the PKGBUILD/.SRCINFO to `_nginxver=1.30.5 pkgrel=2` | ➖ upstream pins (compression.yml pins its own NGINX_VERSION) | ➖ | merged d20a673; the Arch half is byte-identical to our #339, which is now an empty patch against master — only its body (who owns the pin, archive-pinned lane + bumper reading the Arch JSON) is left to act on |
+| 347 | per-configuration raw-content CDict cache for dcz: static-API builds (`ZSTD_STATIC_LINKING_ONLY`, libzstd ≥ 1.4) prepare one `ZSTD_dct_rawContent` CDict per (dictionary, level, reachable clamped window) at config load and attach it with `ZSTD_CCtx_refCDict()` after a full CCtx reset; 64 MiB aggregate budget per configuration cycle (one warning when a profile does not fit, that profile stays on refPrefix); `zstd_long` and `zstd_target_cblock_size` profiles stay on refPrefix because `ZSTD_createCDict_advanced()` bakes only `ZSTD_compressionParameters`; the #336 warning now covers only the profiles that still take the per-request path; compressed bytes may differ from refPrefix (different valid matches) | ⏳ decision pending — this is the WRINKLES "prepared dictionary cache" follow-up arriving upstream; the compression zstd backend already defines `ZSTD_STATIC_LINKING_ONLY`, so a twin would be eligible on every build; our level-9 `dict_advisory_level` keeps its meaning only for the fallback profiles once a cache exists | the brotli half is the same follow-up (`BrotliEncoderPrepareDictionary()`, keyed on dictionary + quality, measured 0.7 ms/64 KB … ~150 ms/8 MB per request) | merged d244366, superseding his #345 (closed: #345 expected a prepared CDict under `zstd_long on`, #347 keeps that profile on refPrefix) |
+
 ## brotli/ subtree refreshes
 
 The subtree is the fork's tree, verbatim. It is never edited in this

@@ -838,6 +838,16 @@ claims of coverage.
   dictionary per worker. Worth it for a site with one dictionary and
   one app; not obviously worth it for a site with hundreds. Revisit
   when a dcb deployment measures the per-request cost as a problem.
+  The parent landed the zstd side of this on 2026-10-04 (#347): one
+  `ZSTD_dct_rawContent` CDict per (dictionary, level, reachable
+  clamped window) prepared at config load and owned by the
+  configuration cycle, a 64 MiB aggregate budget per cycle with
+  refPrefix as the fallback when a profile does not fit, `zstd_long`
+  and target-block profiles kept on refPrefix because a CDict bakes
+  only the compression parameters, and the level-9 warning narrowed
+  to the profiles that still take the per-request path. Whether this
+  module takes a twin — for zstd alone, or both backends under one
+  store-level cache — is the open half of this entry.
 
 ## Phase-0 shortcuts (historical — every one has since been closed)
 
