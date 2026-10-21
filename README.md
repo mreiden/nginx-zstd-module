@@ -179,8 +179,11 @@ tree while the exported package continues to use the pinned release archive.
 
 The container intentionally updates packages from Arch's live repositories.
 The exact nginx dependency protects the dynamic-module ABI by failing closed
-after an Arch nginx update. When that happens, update `_nginxver`, bump
-`pkgrel`, regenerate `.SRCINFO`, and refresh the container image digests.
+after an Arch nginx update. The weekly version bump
+(`ci/tools/bump-versions.sh`) follows that update: it reads the nginx version
+Arch's package database carries, moves `_nginxver` to it, steps `pkgrel`, and
+rewrites the matching `.SRCINFO` lines, as a pull request like every other
+pin. The container image digests are still refreshed by hand.
 
 Build nginx with the module using `--add-dynamic-module`:
 
@@ -1455,7 +1458,8 @@ module: sources, docs and packaging.
 src/                     the module itself
   ngx_http_zstd_filter_module.c    the compression filter
   ngx_http_zstd_static_module.c    the .zst static handler
-  ngx_http_zstd_common.h           shared helpers + the Accept-Encoding parser
+  ngx_http_zstd_accept_encoding.h  the Accept-Encoding parser
+  ngx_http_zstd_common.h           shared helpers (zstd acceptance, Vary)
 ci/
   t/                     Test::Nginx::Socket suites (00-filter, 01-static, …)
   tests/unit/            unit tests over the real decision TU
@@ -1467,7 +1471,7 @@ ci/
 .githooks/pre-commit     the tracked local gate
 ```
 
-The `Accept-Encoding` parser is sliced out of `src/ngx_http_zstd_common.h`
+The `Accept-Encoding` parser is sliced out of `src/ngx_http_zstd_accept_encoding.h`
 into the fuzz and unit builds at build time by `ci/fuzz/extract_parser.sh`,
 so those targets always compile production code — there is no second copy to
 drift.
