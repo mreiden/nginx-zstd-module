@@ -105,11 +105,19 @@ struct ngx_http_request_s {
  * NGX_ZSTD_LEGACY_SHIM variant instead pins nginx 1.22.1: it removes ->next
  * and lets the request-field helper walk headers_in.headers. The dedicated
  * legacy unit test populates that list with repeated Accept-Encoding fields.
+ *
+ * The request-field helper also asks whether the build declares
+ * headers_in.accept_encoding at all (NGX_HTTP_GZIP || NGX_HTTP_HEADERS in
+ * ngx_http_request.h). The modern shim says yes, as a gzip-enabled nginx
+ * does, so the chained arm stays the one the fuzz target and the default
+ * unit suite exercise; the legacy shim leaves both undefined, which is
+ * the list-walk arm either way.
  */
 #if defined(NGX_ZSTD_LEGACY_SHIM)
 #define nginx_version  1022001
 #else
 #define nginx_version  1023000
+#define NGX_HTTP_GZIP  1
 #endif
 
 /*
