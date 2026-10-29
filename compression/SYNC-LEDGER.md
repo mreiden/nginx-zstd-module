@@ -421,3 +421,4 @@ repository; each row is one `git subtree pull --prefix=brotli`.
 | 2026-08-15 | e625e09 | 25798ed | the graft: full fork history under `brotli/` |
 | 2026-09-29 | b1e82e2 | 5aae753 | six weeks of hardening ports (hook registration skipped when off everywhere, the Accept-Encoding token-boundary and empty-parameter rules, 410 in the status set), the build script's pinned release signers, the dcb tool decoding every fallback, quoted paths in the generated dictionary include, the inherited Travis rig removed |
 | 2026-09-29 | 0d38542 | b734b9e | the dcb example config's header says the file belongs inside `http{}` |
+| 2026-10-28 | f82b8af | a1aa36a | the bundled brotli pin moved to the v1.2.1 release (2026-10-21, CVE-2026-111497 in the decoder; the fork links the encoder only, so the bump is pin policy, not an exposure here): gitlink, ci-build.sh tag/SHA pair, bundled job name, README. The compression backends link the system libbrotli and carry no pin |
