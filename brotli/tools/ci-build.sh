@@ -145,13 +145,13 @@ if [ ! -d "$SRCDIR" ]; then
     tar -xzf "$TARBALL" -C "$ROOT"
 fi
 
-# The deps/brotli pin is google/brotli's v1.2.0 RELEASE commit, and must
+# The deps/brotli pin is google/brotli's v1.2.1 RELEASE commit, and must
 # stay a release: a gitlink is an opaque SHA, so this assertion is what
 # turns "happens to be the release" into "cannot silently drift to an
 # arbitrary master commit". Bumping to a NEW release means updating BOTH
 # the gitlink and this pair, in one deliberate commit.
-BROTLI_PIN_TAG="v1.2.0"
-BROTLI_PIN_SHA="028fb5a23661f123017c060daa546b55cf4bde29"
+BROTLI_PIN_TAG="v1.2.1"
+BROTLI_PIN_SHA="db24a98aed38a16de78cc05ca15cdd8dc2a0d92d"
 
 if [ "$MODE" = "bundled" ]; then
     # The bundled path expects prebuilt static libs in deps/brotli/c/../out

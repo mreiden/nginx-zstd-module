@@ -1,5 +1,5 @@
-# Pinned at 028fb5a23661f123017c060daa546b55cf4bde29 = google/brotli's
-# v1.2.0 RELEASE tag commit (2025-10-27). The target is always the
+# Pinned at db24a98aed38a16de78cc05ca15cdd8dc2a0d92d = google/brotli's
+# v1.2.1 RELEASE tag commit (2026-10-21). The target is always the
 # latest release, never master: reproducible builds, a release-noted
 # CVE surface, and bumps as deliberate commits. A gitlink can only
 # record a commit SHA -- tools/ci-build.sh asserts the equivalence so

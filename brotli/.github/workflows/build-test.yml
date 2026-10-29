@@ -261,7 +261,7 @@ jobs:
 
   # ── Bundled fallback path: cmake-built submodule at the pinned tag ─────
   build-bundled:
-    name: Build & smoke (bundled brotli v1.2.0)
+    name: Build & smoke (bundled brotli v1.2.1)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     needs: resolve
