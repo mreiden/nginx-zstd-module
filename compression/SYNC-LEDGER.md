@@ -411,6 +411,12 @@ max-length tool tests). The 🔜 ports below run against that tree. RFC #312
 | 346 | (ours) static module: the directio probe's scratch buffer kept in the main conf, allocated from the conf's own pool, instead of four file-scope statics over `ngx_cycle->pool` | ✅ already here (compression's static module recorded `dio_scratch_pool` in create_main_conf before this was filed upstream) | ➖ | merged 4cb1d4f |
 | 352 | (ours) bump-versions.sh carries the Arch pin: archlinux.org's package JSON for nginx and nginx-src (must agree), `_nginxver` forward-only, pkgrel stepped, the three .SRCINFO lines rewritten in the same staged transaction; seven regression cases | ➖ upstream tooling | ➖ | merged 2571f4d, same day as filed |
 
+### Batch: #354 (2026-10-21) — hsw's; synced by merge d1d038b
+
+| # | subject | disposition | brotli? | notes |
+|---|---|---|---|---|
+| 354 | the filter returns its CCtx (ring loan or uncached context) when the frame ends, from the body filter's two terminal exits, instead of at request end via the pool cleanup; the cleanup stays armed as the path for requests finalized without another body-filter call, guarded on `ctx->cctx` being NULL after the first return | ➖ for now: both backends here free their context only in the request pool cleanup, so the same tail exists, but there is no shared slot ring to contend for — the cost is one per-request context held until finalization, not a loan blocking the next request. Revisit together with any shared context pool (the deferred prepared-dictionary cache would be the first) | ➖ (the fork has no ring either) | merged 28570f3, closing hsw's issue #351; third outside contributor to the parent. ci/tools/test_cctx_early_release.py is the witness (single worker, debug-log lines, every body decoded byte-exact) |
+
 ## brotli/ subtree refreshes
 
 The subtree is the fork's tree, verbatim. It is never edited in this
