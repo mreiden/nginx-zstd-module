@@ -23,7 +23,7 @@ against current nginx. Differences from upstream:
 - **Build:** system-first brotli detection via `pkg-config libbrotlienc`
   with the bundled submodule as fallback (restores pre-`63ca02a`
   packaging behaviour, by Mikel Olasagasti); the bundled submodule is
-  pinned to the released brotli v1.2.0 tag instead of floating; sh-sourced
+  pinned to the released brotli v1.2.1 tag instead of floating; sh-sourced
   files are pinned to LF so Windows checkouts build under WSL.
 - **Accept-Encoding parsing** is a shared, length-bounded RFC 9110
   walker (ported from nginx-zstd-module, where it is continuously fuzzed
